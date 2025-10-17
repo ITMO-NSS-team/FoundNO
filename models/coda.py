@@ -199,12 +199,10 @@ class CODANO(nn.Module):
             len(n_heads) == n_layers or n_heads is None
         ), "number of Attention head for all layers are not given"
         assert (
-            len(per_layer_scaling_factors) == n_layers
-            or per_layer_scaling_factors is None
+            per_layer_scaling_factors is None or len(per_layer_scaling_factors) == n_layers
         ), "scaling for all layers are not given"
         assert (
-            len(attention_scaling_factors) == n_layers
-            or attention_scaling_factors is None
+            attention_scaling_factors is None or len(attention_scaling_factors) == n_layers
         ), "attention scaling for all layers are not given"
         if use_positional_encoding:
             assert positional_encoding_dim > 0, "positional encoding dim is not given"
@@ -475,6 +473,12 @@ class CODANO(nn.Module):
         torch.Tensor
             output tensor of shape (batch_size, output_variable_codimension*num_inp_var, H, W, ...)
         """
+        if static_channel is None and self.static_channel_dim != 0:
+            static_channel = x[:, :self.static_channel_dim, ...]
+            x = x[:, self.static_channel_dim:, ...]
+        
+        # print(f'In coda forward got: sc of len {self.static_channel_dim} {static_channel.shape}, and inp {x.shape}')
+
         batch, num_inp_var, *spatial_shape = (
             x.shape
         )  # num_inp_var is the number of channels in the input

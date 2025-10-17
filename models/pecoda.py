@@ -1,7 +1,8 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-import numpy as np
+from torch.utils.checkpoint import checkpoint
+
 from neuralop.layers.channel_mlp import ChannelMLP
 from neuralop.layers.spectral_convolution import SpectralConv
 from neuralop.layers.skip_connections import skip_connection
@@ -181,7 +182,6 @@ class PeCODANO(nn.Module):
         use_horizontal_skip_connection=False,
         horizontal_skips_map=None,
         n_layers=1,
-        n_layers_fno=4,
         n_modes=None,
         per_layer_scaling_factors=None,
         n_heads=None,
@@ -198,9 +198,8 @@ class PeCODANO(nn.Module):
     ):
         super().__init__()
         self.n_layers = n_layers
-        self.n_layers_fno = n_layers_fno
         
-        assert len(n_modes) == n_layers + n_layers_fno, "number of modes for all layers are not given"
+        assert len(n_modes) == n_layers # + n_layers_fno, "number of modes for all layers are not given"
         assert (
             n_heads is None or len(n_heads) == n_layers
         ), "number of Attention head for all layers are not given"
@@ -220,7 +219,7 @@ class PeCODANO(nn.Module):
             positional_encoding_dim = 0
 
         if attention_scaling_factors is None:
-            attention_scaling_factors = [1] * (n_layers + n_layers_fno)
+            attention_scaling_factors = [1] * (n_layers)
 
         # in_channels = 1  # each channel is a variable
         if lifting_channels is None:
@@ -249,7 +248,7 @@ class PeCODANO(nn.Module):
         if n_heads is None:
             n_heads = [1] * n_layers
         if per_layer_scaling_factors is None:
-            per_layer_scaling_factors = [[1] * self.n_dim] * (n_layers + n_layers_fno)
+            per_layer_scaling_factors = [[1] * self.n_dim] * (n_layers)
         if attention_scaling_factors is None:
             attention_scaling_factors = [1] * n_layers
 
@@ -314,10 +313,11 @@ class PeCODANO(nn.Module):
         for i in range(self.n_layers):
             self.attention_layers.append(
                 PeCODALayer(
+                    in_channels=self.hidden_variable_codimension,
                     n_modes=self.n_modes[i],
                     n_heads=self.n_heads[i],
                     scale=self.attention_scalings[i],
-                    token_codimension=attention_token_dim,
+                    # token_codimension=attention_token_dim,
                     per_channel_attention=per_channel_attention,
                     nonlinear_attention=nonlinear_attention,
                     resolution_scaling_factor=self.per_layer_scale_factors[i],
@@ -327,12 +327,12 @@ class PeCODANO(nn.Module):
                 )
             )
 
-        self.fno_layers = FNOBlocks(
-                                    in_channels = self.hidden_variable_codimension,
-                                    out_channels=self.hidden_variable_codimension,
-                                    n_layers=self.n_layers_fno,
-                                    n_modes=self.n_modes[self.n_layers:]                        
-        )
+        # self.fno_layers = FNOBlocks(
+        #                             in_channels = self.hidden_variable_codimension,
+        #                             out_channels=self.hidden_variable_codimension,
+        #                             n_layers=self.n_layers_fno,
+        #                             n_modes=self.n_modes[self.n_layers:]                        
+        # ) # Implement skip connections logic and generally experiment with layers structure
 
         # self.fno_layers = nn.ModuleList([])
         # for i in range(self.n_layers_fno):
@@ -476,9 +476,8 @@ class PeCODANO(nn.Module):
     def forward(self, x: torch.Tensor, input_variable_ids=None):
         batch, num_inp_var, *spatial_shape = (
             x.shape
-        )  # num_inp_var is the number of channels in the input
+        )
 
-        # input validation
         if self.use_positional_encoding:
             assert (
                 input_variable_ids is not None
@@ -583,9 +582,10 @@ class PeCODANO(nn.Module):
                 skip_outputs[layer_idx] = x.clone()
 
 
-        output_shape_fno = [None]*self.n_layers_fno
-        for layer_idx in range(self.n_layers_fno):
-            x = self.fno_layers(x, layer_idx, output_shape=output_shape_fno[layer_idx])
+        # output_shape_fno = [None]*self.n_layers_fno
+        # for layer_idx in range(self.n_layers_fno):
+        #     print(f'layer_idx {layer_idx}, x.shape is {x.shape} with output shape of {output_shape_fno[layer_idx]}, {self.fno_layers}')
+        #     x = self.fno_layers(x, layer_idx, output_shape=output_shape_fno[layer_idx])
 
         # removing the padding
         if self.domain_padding is not None:

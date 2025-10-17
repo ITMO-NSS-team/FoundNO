@@ -15,11 +15,10 @@ class Domain():
         self._params = params
 
         self._dxs = {key : val['L'] / (val['n'] - 1) for key, val in params.items()}
-        print(self._dxs)
         self._unique_coords = {key : torch.arange(0, val['L'] + self._dxs[key], self._dxs[key]) for key, val in params.items()}
+        self.dimensions = [grid.shape[0] for key, grid in self._unique_coords.items()]
 
         coords = torch.meshgrid(*self._unique_coords.values(), indexing = 'ij')
-        print(self._unique_coords['t'])
         self._grid = torch.stack([var_coord for var_coord in coords]) # .reshape(-1)
 
     def get_step(self, dim: str = 't', device: str = 'cuda'):

@@ -109,9 +109,11 @@ class Trainer(object):
                 self.input_adapters[idx].to(device)
                 self.output_adapters[idx].to(device)
 
-    def set_logger(self, filename, logger: Logger = None, log_level = logging.INFO, logger_name: str = 'FoundationalFNO'):
+    def setLogger(self, filename, logger: Logger = None, log_level = logging.INFO, logger_name: str = 'FoundationalFNO'):
         if logger is None:
-           self._logger = Logger(filename = filename, log_level = log_level, logger_name = logger_name)
+           self._logger = Logger(filename = filename, log_level = log_level, logger_name = logger_name, 
+                                 write_every = 1e3, epochs_aggreg = 20, 
+                                 info_entries = ['avg_loss', 'train_err', 'lr']) # 'Epoch', 
         else:
             self._logger = logger
 
@@ -145,14 +147,26 @@ class Trainer(object):
         pass
 
     def train(self, train_loader: Dataset, train_epochs: int): #train_data: Dataset, train_epochs: int):
-        best_loss = np.inf        
-        best_epoch = 0
+        # best_loss = np.inf        
+        # best_epoch = 0
         best_err = np.inf
 
-        # train_loader = torch.utils.data.DataLoader(train_data, batch_size=8, shuffle=True)
-        # self._logger['best_epoch'] = best_epoch
+        if self._single_model:
+            n_params = sum(p.numel() for p in self.model.parameters())
+            init_log = 'Initializing training of model of type {} | epochs: {} | n params: {}'.format(type(self.model),
+                                                                                                      train_epochs, 
+                                                                                                      n_params)
+        else:
+            n_params = sum(p.numel() for p in self.input_adapters[0].parameters()) + \
+                       sum(p.numel() for p in self.fno_and_proj_model.parameters()) + \
+                       sum(p.numel() for p in self.output_adapters[0].parameters())
 
-        # loss_vals = 
+            init_log = 'Initializing training of model of type {}, {}, {} | epochs: {} | n params: {}'.format(type(self.input_adapters[0]),
+                                                                                                              type(self.fno_and_proj_model),
+                                                                                                              type(self.output_adapters[0]),
+                                                                                                              train_epochs, 
+                                                                                                              n_params)
+        self._logger.write(init_log)
 
         for epoch in range(train_epochs):
             train_err, avg_epoch_loss = self.train_single_epoch(epoch, train_loader, self._training_loss)
@@ -160,6 +174,8 @@ class Trainer(object):
 
             if train_err < best_err:
                 best_err = train_err
+
+        self.log_training(f'Finished model training. train_err: {train_err}, avg_epoch_loss: {avg_epoch_loss}')
 
         if self._single_model:
             return self.model
@@ -230,19 +246,15 @@ class Trainer(object):
         lr = None
         for pg in self.optimizer.param_groups:
             lr = pg["lr"]
-        if epoch % self.eval_interval == 0:
-            self.log_training(
-                epoch=epoch,
-                avg_loss=avg_epoch_loss,
-                train_err=train_err,
-                # avg_lasso_loss=avg_lasso_loss,
-                lr=lr
-            )
+        # if epoch % self.eval_interval == 0:
+        self.log_training(avg_loss=avg_epoch_loss, train_err=train_err, lr=lr)
 
         return train_err, avg_epoch_loss # , avg_lasso_loss
 
-    def log_training(self, epoch, avg_loss, train_err, lr):
-        self._logger.write('Epoch: {} | avg_loss: {} | train_err: {} | lr: {}'.format(epoch, avg_loss, train_err, lr))
+    def log_training(self, avg_loss, train_err, lr): # epoch,
+        self._logger.write({'avg_loss': avg_loss, 'train_err': train_err, 'lr': lr}) # 'Epoch': epoch, 
+        # self._logger.write('Epoch: {} | avg_loss: {} | train_err: {} | lr: {}'.format(epoch, avg_loss, train_err, lr))
+
 
     def on_epoch_start(self, *args, **kwargs):
         """

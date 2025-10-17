@@ -1,5 +1,6 @@
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Dict, Callable
 from functools import partial
+from copy import deepcopy
 
 import numpy as np
 
@@ -28,6 +29,18 @@ from utils.training_utils import merge_dicts
 SPATIAL_AXES = ["h", "w", "d", "ex1", "ex2"]
 
 MERGE_SYMB = lambda args: reduce(lambda x, y: x + ' ' + y, args)
+
+def instanceNorm(n_features: int, dim: int) -> torch.nn.Module: # torch.Tensor
+    match dim:
+        case 3:
+            return torch.nn.InstanceNorm1d(n_features)
+        case 4:
+            return torch.nn.InstanceNorm2d(n_features)
+        case 5:
+            return torch.nn.InstanceNorm3d(n_features)
+        case _:
+            raise NotImplementedError(f'Can not construct InstanceNorm for {len(dim)}-dimensional tensor')
+
 
 def is_index_in_slice(index: int, slice_obj: Union[slice, int], sequence_length: int):
     """
@@ -71,7 +84,7 @@ def get_einsymbols(tensor: Union[int, np.array, torch.Tensor], initial_axes: Lis
         raise ValueError('Too few axes in data.')
     
     spatial_axes_len = tensor - len(initial_axes)
-    einstr = initial_axes + SPATIAL_AXES[:spatial_axes_len] # MERGE_SYMB()  initial_axes + SPATIAL_AXES[:spatial_axes_len]
+    einstr = initial_axes + SPATIAL_AXES[:spatial_axes_len]
     return MERGE_SYMB(einstr), einstr
 
 def group_einsymbols(einlist: List[str], group_idxs: Tuple[Union[int, slice]], grouped_axes_pos: int = 0):
@@ -84,7 +97,7 @@ def group_einsymbols(einlist: List[str], group_idxs: Tuple[Union[int, slice]], g
 
     einstr_remaining.insert(grouped_axes_pos, einstr_merged)
 
-    return MERGE_SYMB(einstr_remaining), einstr_merging # MERGE_SYMB()
+    return MERGE_SYMB(einstr_remaining), einstr_merging
 
 class PrepareMultihead(nn.Module):
     def __init__(self, heads_dim: int = 1, n_heads: int = 1):
@@ -93,24 +106,79 @@ class PrepareMultihead(nn.Module):
         self._heads_dim = heads_dim
 
     def forward(self, x: torch.Tensor):
-        shape = [-1,] * x.ndim
-        shape[self._heads_dim] = x.shape[self._heads_dim] * self._n_heads
-        return x.expand(*shape)
+        shape = [1,] * x.ndim
+        shape[self._heads_dim] = self._n_heads
+        return x.repeat(*shape)
 
 class FeedForward(nn.Module):
     def __init__(self, dim, mult = 4):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim * mult * 2),
-            torch.nn.ReLU(),
-            nn.Linear(dim * mult, dim)
-        )
+        self.net = nn.Sequential(nn.Linear(dim, dim * mult), #  * 2
+                                 torch.nn.ReLU(),
+                                 nn.Linear(dim * mult, dim))
 
     def forward(self, x):
-        return self.net(x)
+        x = x.transpose(1, -1)
+        x = self.net(x)
+        x = x.transpose(1, -1)
+        return x
+
+def apply_operator_or_ffn(arg: torch.Tensor, model: torch.nn.Module, dims: Dict[str, Union[int, List[int]]]):
+    # out = einsum(attn, v, 'b n j, b j d -> b n d')
+    if arg.ndim > 3:
+        arg = rearrange(arg, 'bh n ... -> bh n (...)')
+    if isinstance(model, nn.Linear):
+        arg = rearrange(arg, '(b h) n d -> b d (h n)', h = dims['h'])
+    elif isinstance(model, FNOBlocks):
+        arg = arg.view(dims['b'], dims['c']*dims['h'], *dims['spatials'])
+    elif isinstance(model, PrepareMultihead):
+        pass
+    else:
+        print(f'Other to_out model of type: {type(model)}')
+
+    arg = model(arg)
+    if isinstance(model, nn.Linear):
+        arg = rearrange(arg, 'b d n -> b n d')
+    return arg
+
+def attention_vanilla(Q: torch.Tensor,
+                      K: torch.Tensor,
+                      V: torch.Tensor,
+                      mask: torch.Tensor = None,
+                      h: int = 1, scale: float = 1.):
+    Q, K, V = map(lambda t: rearrange(t, 'b (h d) n -> (b h) d n', h = h), (Q, K, V))
+
+    sim = einsum(Q, K, 'b i n, b j n -> b i j') * scale
+
+    if mask is not None:
+        mask = rearrange(mask, 'b ... -> b (...)')
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = repeat(mask, 'b j -> (b h) () j', h = h)
+        sim.masked_fill_(~mask, max_neg_value)
+
+    sim = sim.softmax(dim = -1) # calculate attention
+    return einsum(sim, V, 'b n j, b j d -> b n d')
+     
+
+def attention_fourier(Q: torch.Tensor,
+                      K: torch.Tensor,
+                      V: torch.Tensor,
+                      mask: torch.Tensor = None,
+                      h: int = 1, scale: float = 1.):
+    q, k, v = map(lambda t: rearrange(t, 'b (h d) n -> (b h) d n', h = h), (q, k, v))
+
+    sim = einsum(q, k, 'b i n, b j n -> b i j') * scale
+
+    if mask is not None:
+        mask = rearrange(mask, 'b ... -> b (...)')
+        max_neg_value = -torch.finfo(sim.dtype).max
+        mask = repeat(mask, 'b j -> (b h) () j', h = h)
+        sim.masked_fill_(~mask, max_neg_value)
+
+    return sim.softmax(dim = -1)
 
 
-class Attention(nn.Module):
+class AttentionBlock(nn.Module):
     '''
     Implemented, as in https://github.com/lucidrains/perceiver-pytorch/
     '''
@@ -125,8 +193,8 @@ class Attention(nn.Module):
                  to_kv_params: dict = None,                 
                  to_out_model: torch.nn.Module = nn.Linear,
                  to_out_params: dict = None,
-                 channel_wise: bool = True):
-        
+                 channel_wise: bool = True,
+                 attention: Callable = attention_vanilla):
         if not isinstance(to_q_model, nn.Linear) and to_q_params is None:
             raise ValueError('Custom nn.Module to get Queries should can not use default params.')
         elif isinstance(to_q_model, nn.Linear) and to_q_params is None:
@@ -157,84 +225,80 @@ class Attention(nn.Module):
         self.to_kv = to_kv_model(**to_kv_params)  # nn.Linear(context_dim, inner_dim * 2, bias = False)
         self.to_out = to_out_model(**to_out_params) # nn.Linear(inner_dim, query_dim)
         self._channel_wise = channel_wise
+        self._attention = attention
 
     def forward(self, x, context = None, mask = None, batch_size: int = -1):
+        b = x.shape[0]
         h = self.heads
+        c = x.shape[1]
+        spatial_dims = x.shape[2:]
 
-        q = self.to_q(x)
+        q = apply_operator_or_ffn(x, self.to_q, {'b': b, 'h': h, 'c': c, 'spatials': spatial_dims})
+
         if context is None:
-            # print('Context is not passed, defaulting to x')
             context = x if context is None else context
-        # else:
-        #     print(f'context shape is {context.shape}')
 
         if isinstance(self.to_kv, FNOBlocks) and self._channel_wise:
-            # print
-            context = rearrange(context, 'b t ... -> (b t) d ...', d = 1)
-        print(f'context shape after rearrange is {context.shape}')
-        temp = self.to_kv(context)
-        # print(f'temp.shape is {temp.shape} from {context.shape}')
+            context = rearrange(context, 'b n ... -> (b n) ...')
+            context = torch.unsqueeze(context, 1)
+        temp = apply_operator_or_ffn(context, self.to_kv, {'b': b, 'h': h, 'c': c, 'spatials': spatial_dims})
         temp = rearrange(temp, 'b n ... -> b n (...)')
-        # temp = self.to_kv(context).
+        q    = rearrange(q, 'b n ... -> b n (...)')
         k, v = temp.chunk(2, dim = 1)
 
-        # print('In attention forward: k shape is', k.shape, '& v shape is', v.shape, '& temp shape is', temp.shape)
+        out = self._attention(q, k, v, mask, h, self.scale)
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h = h), (q, k, v))
+        out = apply_operator_or_ffn(out, self.to_out, {'b': b, 'h': h, 'c': c, 'spatials': spatial_dims})
 
-        sim = einsum(q, k, 'b i d, b j d -> b i j') * self.scale
-
-        if mask is not None:
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h = h)
-            sim.masked_fill_(~mask, max_neg_value)
-
-        attn = sim.softmax(dim = -1)
-
-        out = einsum(attn, v, 'b i j, b j d -> b i d')
-        out = rearrange(out, '(b h) n d -> b n (h d)', h = h)
-        return self.to_out(out)
+        out = out.view(b, c, *spatial_dims)
+        return out
 
 
 class PreNorm(nn.Module):
-    def __init__(self, norm_dim, fn, context_dim = None):
+    def __init__(self, input_info: Tuple[int], fn: torch.nn.Module, context_info: Tuple[int] = None):
         super().__init__()
         self.fn = fn
-        self.norm = nn.LayerNorm(norm_dim)
-        self.norm_context = None if context_dim is None else nn.LayerNorm(context_dim)
+        self.norm = instanceNorm(n_features = input_info[0],
+                                 dim = input_info[1]) # nn.LayerNorm(norm_dim)
+        self.norm_context = None if context_info is None else instanceNorm(n_features = context_info[0],
+                                                                           dim = context_info[1])
         self._dim_labels = ['b', 'c']
 
-        self._ein_init = None
-        self._ein_norm = None
+        self._ein_init = None; self._ein_norm = None
+        self._ctx_ein_init = None; self._ctx_ein_norm = None
 
 
     def forward(self, x, **kwargs):
-        print('Before rearrange:', x.shape)
-        if 'context' in kwargs.keys():
-            print(f'context shape is {kwargs["context"].shape}') 
         original_shape = x.shape
         if self._ein_init is None:
             self._ein_init = get_einsymbols(x, self._dim_labels)
-            self._ein_norm = group_einsymbols(self._ein_init[1], (0, slice(2, None, None)), 0)
+            self._ein_norm = group_einsymbols(self._ein_init[1], (0, 1), 0) # TODO: validate normalization approach slice(2, None, None)
         
-        x = rearrange(x, self._ein_init[0] + ' -> ' + self._ein_norm[0]) # 'b c ... -> (b ...) c')
-        print('After rearrange ', self._ein_init[0] + ' -> ' + self._ein_norm[0], ':', x.shape)
-        print('b', x.shape[0], ' ', {value: original_shape[idx + len(self._dim_labels)]
-                                     for idx, value in enumerate(self._ein_norm[1][1:])})
+        # x = rearrange(x, self._ein_init[0] + ' -> ' + self._ein_norm[0]) # 'b c ... -> (b ...) c')
+        # print(f'Before normalization x shape is {x.shape}')
+        # raise NotImplementedError()
         x = self.norm(x)
-        x = rearrange(x, self._ein_norm[0] + ' -> ' + self._ein_init[0], b = original_shape[0], 
-                      **{value: original_shape[idx + len(self._dim_labels)]
-                         for idx, value in enumerate(self._ein_norm[1][1:])}) # '(b ...) c -> b c ...')
-
+        # x = rearrange(x, self._ein_norm[0] + ' -> ' + self._ein_init[0], b = original_shape[0], 
+        #               **{value: original_shape[idx + len(self._dim_labels)]
+        #                  for idx, value in enumerate(self._ein_norm[1][1:])})
+        
         if self.norm_context is not None:
             context = kwargs['context']
-            normed_context = self.norm_context(context)
-            kwargs.update(context = normed_context)
+            original_shape = context.shape
 
-        print('x.shape:', x.shape)
+            if self._ctx_ein_init is None:
+                self._ctx_ein_init = get_einsymbols(context, self._dim_labels)
+                self._ctx_ein_norm = group_einsymbols(self._ctx_ein_init[1], (0, slice(2, None, None)), 0)
+
+            # context = rearrange(context, self._ctx_ein_init[0] + ' -> ' + self._ctx_ein_norm[0])
+            context = self.norm_context(context)
+            # context = rearrange(context, self._ctx_ein_norm[0] + ' -> ' + self._ctx_ein_init[0], 
+            #                     b = original_shape[0], 
+            #                     **{value: original_shape[idx + len(self._dim_labels)]
+            #                         for idx, value in enumerate(self._ctx_ein_norm[1][1:])})
+            kwargs.update(context = context)
+
         output = self.fn(x, **kwargs)
-        print('output.shape:', output.shape)
         return output
 
 class PeCODALayer(nn.Module):
@@ -262,8 +326,6 @@ class PeCODALayer(nn.Module):
         Normalization module to be used. If 'instance_norm', instance normalization
         is applied to the token outputs of the attention module.
         Defaults to `'instance_norm'`
-    temperature : float
-        Temperature parameter for the attention mechanism.
     nonlinear_attention : bool, optional
         Whether to use non-linear activation for K, Q, V operator.
     scale : int
@@ -308,17 +370,15 @@ class PeCODALayer(nn.Module):
     """
     def __init__(
         self,
-        # in_channels: int,
+        in_channels: int,
         n_modes:List[int],
         n_heads=1,
-        token_codimension=1,
-        n_layers=4,
+        n_sublayers=6,
         head_codimension=None,
         codimension_size=None,
         per_channel_attention=True,
         permutation_eq=True,
         norm="instance_norm",
-        temperature=1.0,
         nonlinear_attention=False,
         scale=None,
         resolution_scaling_factor=None,
@@ -337,29 +397,30 @@ class PeCODALayer(nn.Module):
         fixed_rank_modes=False,
         implementation='factorized',
         decomposition_kwargs=None,
-        n_lat_perc = 16,
-        dropout_perc = 0.1,
+        neural_op_processing = False,
+        # dropout_perc = 0.1,
         **_kwargs,
     ):
         super().__init__()
 
-        self._n_layers = n_layers
+        self._n_sublayers = n_sublayers
+
+        n_lat_perc = in_channels
 
         # Co-dimension of each variable/token. The token embedding space is
         # identical to the variable space, so their dimensionalities are equal.
         if per_channel_attention:
             # for per channel attention, forcing the values of token dims
-            token_codimension = 1
+            in_channels = 1
             head_codimension = 1
 
         # codim of attention from each head
         self.head_codimension = (head_codimension
                                  if head_codimension is not None
-                                 else token_codimension)
+                                 else in_channels)
 
         self.n_heads = n_heads  # number of heads
         self.resolution_scaling_factor = resolution_scaling_factor
-        self.temperature = temperature
         self.n_dim = len(n_modes)
 
         print(f'Initializing PeCoDA with n_heads {self.n_heads} & n_dim {self.n_dim}')
@@ -384,7 +445,7 @@ class PeCODALayer(nn.Module):
         self.permutation_eq = permutation_eq
 
         self.codimension_size = codimension_size
-        self.mixer_token_codimension = token_codimension
+        self.mixer_token_codimension = in_channels
 
         mixer_modes = [int(i*scale) for i in n_modes]
 
@@ -407,25 +468,26 @@ class PeCODALayer(nn.Module):
             joint_factorization=joint_factorization,
         )
 
-        inp_arr_proc_args = dict(in_channels=token_codimension,
-                                 out_channels=self.n_heads * self.head_codimension,
+        inp_arr_proc_args = dict(in_channels = in_channels,
+                                 out_channels = 2*self.n_heads * self.head_codimension, #  2 - for k-v split
                                  n_modes=mixer_modes,
                                  non_linearity=kqv_activation,
                                  fno_skip='linear',
                                  norm=None,
-                                 n_layers=1,
-                                )
+                                 n_layers=1)
 
-        lat_proc_args = dict(in_channels=n_lat_perc,
-                             out_channels=self.n_heads * self.head_codimension,
-                             n_modes=mixer_modes,
-                             non_linearity=kqv_activation,
-                             fno_skip='linear',
-                             norm=None,
-                             n_layers=1)
+        lat_proc_args_q = dict(in_channels=n_lat_perc,
+                               out_channels=self.n_heads * self.head_codimension,
+                               n_modes=mixer_modes,
+                               non_linearity=kqv_activation,
+                               fno_skip='linear',
+                               norm=None,
+                               n_layers=1)
+        lat_proc_args_kv = deepcopy(lat_proc_args_q)
+        lat_proc_args_kv['out_channels'] = 2 * self.n_heads * self.head_codimension
 
-        kv_dec_arg = dict(in_channels=self.n_heads * self.head_codimension,
-                          out_channels=self.n_heads * self.head_codimension,
+        kv_dec_arg = dict(in_channels=self.head_codimension,
+                          out_channels=2*self.n_heads * self.head_codimension,
                           n_modes=mixer_modes,
                           non_linearity=kqv_activation,
                           fno_skip='linear',
@@ -433,7 +495,7 @@ class PeCODALayer(nn.Module):
                           n_layers=1,
                             )
 
-        q_dec_args = dict(in_channels=token_codimension, # self.
+        q_dec_args = dict(in_channels=in_channels,
                           out_channels=self.n_heads * self.head_codimension,
                           n_modes=mixer_modes,
                           non_linearity=kqv_activation,
@@ -446,81 +508,100 @@ class PeCODALayer(nn.Module):
         self._latent_queries_modes = None
         self._latent_queries_features = n_lat_perc
 
-        encoder = Attention(query_dim     = self._latent_queries_features,
-                            context_dim   = token_codimension,
-                            heads         = self.n_heads, 
-                            dim_head      = self.head_codimension,
-                            to_q_model    = PrepareMultihead,
-                            to_q_params   = {'heads_dim': 1, 'n_heads': self.n_heads},
-                            to_kv_model   = FNOBlocks,
-                            to_kv_params  = merge_dicts({'resolution_scaling_factor': 1,
-                                                         'conv_module': conv_module},
-                                                        inp_arr_proc_args,
-                                                        shared_fno_configs),
-                            to_out_model  = nn.Identity,
-                            to_out_params = {})
+        encoder = AttentionBlock(query_dim     = self._latent_queries_features,
+                                 context_dim   = in_channels,
+                                 heads         = self.n_heads, 
+                                 dim_head      = self.head_codimension,
+                                 to_q_model    = PrepareMultihead,
+                                 to_q_params   = {'heads_dim': 1, 'n_heads': self.n_heads},
+                                 to_kv_model   = FNOBlocks,
+                                 to_kv_params  = merge_dicts({'resolution_scaling_factor': 1,
+                                                             'conv_module': conv_module},
+                                                             inp_arr_proc_args,
+                                                             shared_fno_configs),
+                                 to_out_model  = nn.Linear, #nn.Identity,
+                                 to_out_params = {'in_features': int(inp_arr_proc_args['out_channels']/2.),
+                                                 'out_features': self._latent_queries_features},
+                                 channel_wise  = False)
 
-        self._cross_attend_blocks = nn.ModuleList([PreNorm(self._latent_queries_features,
-                                                           encoder),
-                                                   PreNorm(self._latent_queries_features,
-                                                           FeedForward(dim = self._latent_queries_features))])
+        self._cross_attend_blocks = nn.ModuleList([PreNorm((self._latent_queries_features, 2 + len(n_modes)),
+                                                           encoder, 
+                                                           context_info = (in_channels, 2 + len(n_modes))),# token_codimension),
+                                                   PreNorm((self._latent_queries_features, 2 + len(n_modes)), #  * self.n_heads
+                                                           FeedForward(dim = self._latent_queries_features))]) # * self.n_heads
+        
+        if neural_op_processing:
+            proc_models = FNOBlocks
+            proc_models_q_params = merge_dicts({'resolution_scaling_factor': 1,
+                                                'conv_module': conv_module},
+                                               lat_proc_args_q,
+                                               shared_fno_configs)
+            proc_models_kv_params = merge_dicts({'resolution_scaling_factor': 1,
+                                                 'conv_module': conv_module},
+                                                lat_proc_args_kv,
+                                                shared_fno_configs)
+        else:
+            proc_models = nn.Linear #(in_features=, out_features=)
+            proc_models_q_params = {'in_features' : self._latent_queries_features,
+                                    'out_features': self.n_heads * self.head_codimension}
+            proc_models_kv_params = {'in_features' : self._latent_queries_features,
+                                     'out_features': 2 * self.n_heads * self.head_codimension}
 
-        get_proc_layer = lambda: Attention(query_dim     = self.n_heads * self.head_codimension,
-                                           context_dim   = self.n_heads * self.head_codimension,
-                                           heads         = self.n_heads, 
-                                           dim_head      = self.head_codimension,
-                                           to_q_model    = FNOBlocks,
-                                           to_q_params   = merge_dicts({'resolution_scaling_factor': 1,
-                                                                       'conv_module': conv_module},
-                                                                       lat_proc_args,
-                                                                       shared_fno_configs),
-                                           to_kv_model   = FNOBlocks,
-                                           to_kv_params  = merge_dicts({'resolution_scaling_factor': 1,
-                                                                       'conv_module': conv_module},
-                                                                       lat_proc_args,
-                                                                       shared_fno_configs),
-                                           to_out_model  = nn.Identity,
-                                           to_out_params = {}) 
+        get_proc_layer = lambda: AttentionBlock(query_dim     = self.head_codimension,
+                                                context_dim   = self.head_codimension,
+                                                heads         = self.n_heads, 
+                                                dim_head      = self.head_codimension,
+                                                to_q_model    = proc_models,
+                                                to_q_params   = proc_models_q_params,
+                                                to_kv_model   = proc_models,
+                                                to_kv_params  = proc_models_kv_params,
+                                                to_out_model  = nn.Linear,
+                                                to_out_params = {'in_features': self.n_heads * self.head_codimension,
+                                                                 'out_features': self._latent_queries_features},
+                                                channel_wise  = False)
 
-        self._layers = nn.ModuleList([])
-        for idx in range(self._n_layers):
-            self._layers.append(nn.ModuleList([PreNorm(self._latent_queries_features,
-                                                       get_proc_layer()),
-                                               PreNorm(self._latent_queries_features,
-                                                       FeedForward(dim = self._latent_queries_features))]))
+        self._sublayers = nn.ModuleList([])
+        for idx in range(self._n_sublayers):
+            self._sublayers.append(nn.ModuleList([PreNorm((self._latent_queries_features, 2 + len(n_modes)),
+                                                          get_proc_layer()),
+                                                  PreNorm((self._latent_queries_features, 2 + len(n_modes)),
+                                                          FeedForward(dim = self._latent_queries_features))]))
 
         # Output model in decoder represents multi-head projection
-        output_model = FNOBlocks if self.n_heads * self.head_codimension != token_codimension else nn.Identity
-        decoder = Attention(query_dim     = token_codimension,
-                            context_dim   = self.n_heads * self.head_codimension,
-                            heads         = self.n_heads, 
-                            dim_head      = self.head_codimension,
-                            to_q_model    = FNOBlocks,
-                            to_q_params   = merge_dicts({'resolution_scaling_factor': 1,
-                                                         'conv_module': conv_module},
-                                                        q_dec_args,
-                                                        shared_fno_configs),
-                            to_kv_model   = FNOBlocks,
-                            to_kv_params  = merge_dicts({'resolution_scaling_factor': 1,
-                                                         'conv_module': conv_module},
-                                                        kv_dec_arg,
-                                                        shared_fno_configs),
-                            to_out_model  = output_model,
-                            to_out_params = merge_dicts({'in_channels': self.n_heads * self.head_codimension,
-                                                         'out_channels': token_codimension,
-                                                         'n_modes': n_modes,
-                                                         'resolution_scaling_factor': 1,
-                                                         # args below are shared with KQV blocks
-                                                         'non_linearity': torch.nn.Identity(),
-                                                         'fno_skip': 'linear',
-                                                         'norm': None,
-                                                         'conv_module': conv_module,
-                                                         'n_layers': 1},
-                                                        shared_fno_configs))
+        output_model = FNOBlocks #if self.n_heads * self.head_codimension != in_channels else nn.Identity
+        decoder = AttentionBlock(query_dim     = in_channels,
+                                 context_dim   = self.head_codimension,
+                                 heads         = self.n_heads, 
+                                 dim_head      = self.head_codimension,
+                                 to_q_model    = FNOBlocks,
+                                 to_q_params   = merge_dicts({'resolution_scaling_factor': 1,
+                                                             'conv_module': conv_module},
+                                                             q_dec_args,
+                                                             shared_fno_configs),
+                                 to_kv_model   = FNOBlocks,
+                                 to_kv_params  = merge_dicts({'resolution_scaling_factor': 1,
+                                                             'conv_module': conv_module},
+                                                             kv_dec_arg,
+                                                             shared_fno_configs),
+                                 to_out_model  = output_model,
+                                 to_out_params = merge_dicts({'in_channels': n_heads * self.head_codimension, # self.n_heads * 
+                                                             'out_channels': in_channels,
+                                                             'n_modes': n_modes,
+                                                             'resolution_scaling_factor': 1,
+                                                             # args below are shared with KQV blocks
+                                                             'non_linearity': non_linearity, # torch.nn.Identity(),
+                                                             'fno_skip': 'linear',
+                                                             'norm': None,
+                                                             'conv_module': conv_module,
+                                                             'n_layers': 1},
+                                                             shared_fno_configs),
+                                 channel_wise  = False)
 
-        self.decoder_cross_attn = PreNorm(token_codimension, decoder)
+        self.decoder_cross_attn = PreNorm((in_channels, 2 + len(n_modes)), 
+                                          decoder,
+                                          context_info = (self.head_codimension, 2 + len(n_modes)))
 
-        self.attention_normalizer = norm_module(token_codimension)
+        self.attention_normalizer = norm_module(in_channels)
 
         mixer_args = dict(n_modes=n_modes,
                           resolution_scaling_factor=1,
@@ -544,7 +625,7 @@ class PeCODALayer(nn.Module):
                 **shared_fno_configs,
             )
 
-            self.norm1 = norm_module(token_codimension)
+            self.norm1 = norm_module(in_channels)
             self.mixer_in_normalizer = norm_module(self.mixer_token_codimension)
             self.mixer_out_normalizer = norm_module(
                 self.mixer_token_codimension)
@@ -570,8 +651,9 @@ class PeCODALayer(nn.Module):
                 n_latents = self._latent_queries_features 
 
             assert len(domain_shape) == self.n_dim, 'Numbers of points does not match dimensionality'
-            self._latent_queries_modes = domain_shape
-            self._latent_queries = nn.Parameter(torch.randn(n_latents, *domain_shape).reshape((n_latents, -1)).to(device)) #.reshape((n_latents, -1)))
+            print(f'Setting latents of shape {self.n_dim} with {domain_shape}')
+            self._latent_queries_modes = domain_shape # .reshape((n_latents, -1))
+            self._latent_queries = nn.Parameter(torch.randn(n_latents, *domain_shape).to(device)) #.reshape((n_latents, -1)))
 
     def forward(self, x: torch.Tensor, output_shape=None):
         """
@@ -590,7 +672,7 @@ class PeCODALayer(nn.Module):
             Input tensor with shape (b, t * d, h, w, ...), where
             b is the batch size, t is the number of tokens, and d is the token codimension.
         """
-        print(f'x.shape in forward:', x.shape)
+        # print(f'x.shape in forward:', x.shape)
         if self.resolution_scaling_factor is not None and output_shape is None:
             output_shape = [int(i * j) for (i,j) in zip(x.shape[-self.n_dim:], self.resolution_scaling_factor)]
 
@@ -616,38 +698,36 @@ class PeCODALayer(nn.Module):
         batch_size = x.shape[0]
         input_shape = x.shape[-self.n_dim:]
 
-        # assert x.shape[1] % self.token_codimension == 0,\
-        #       "Number of channels in x should be divisible by token_codimension"
-
-        # reshape from shape b (t*d) h w ... to (b*t) d h w ...
         t = x.size(1) #// self.token_codimension
 
-        tokens = x #x.view(
-            # x.size(0),
-            # t, # Assume token codim as 1
-            # *x.shape[-self.n_dim:])
+        tokens = x #.view(x.shape[0] * x.shape[1],
+                        # 1, # Assume token codim as 1
+                        # *x.shape[-self.n_dim:])
         
         # normalization and attention mechanism
         # tokens_norm = self.norm1(tokens)
 
-        latents = repeat(self._latent_queries, 'n d -> b n d', b = batch_size)
+        latents = repeat(self._latent_queries, 'n ... -> b n ...', b = batch_size)
 
         attn, ffn = self._cross_attend_blocks
-        print(f'latents.shape {latents.shape}, x.shape {tokens.shape}')
-        x = ffn(attn(latents, context = tokens))
+        latents = attn(latents, context = tokens) + latents
+        latents = ffn(latents) + latents
+        # print(f'ffn(attn(latents, context = tokens)) {ffn(attn(latents, context = tokens)).shape}, latents {latents.shape}')
+        # latents = ffn(attn(latents, context = tokens)) + latents
 
-        for layer in self._layers:
-            attn, ffn = layer
-            x = ffn(attn(x))
+        for sublayer in self._sublayers:
+            attn, ffn = sublayer
+            latents = attn(latents) + latents
+            latents = ffn(latents)  + latents
 
         # How to best implement ouput queries: context = tokens 
-        context = tokens
+        # context = tokens
 
-        attn, ffn = layer
-        output = ffn(attn(x, context = context))
+        # tokens = torch.layer_norm(tokens)
+
+        attn = self.decoder_cross_attn
+        output = attn(latents, context = tokens) #  + latents # + tokens # + tokens # context
         
-        # output = self.compute_decoder_attention(tokens_norm, attention, batch_size)
-
         for i in range(self.mixer.n_layers):
             output = self.mixer(output, index=i, output_shape=input_shape)
         output = self.mixer_out_normalizer(output) # + attention
@@ -667,7 +747,7 @@ class PeCODALayer(nn.Module):
 
         return output
 
-    def _forward_non_equivariant(self, x, output_shape=None):
+    def _forward_non_equivariant_old(self, x, output_shape=None):
         """
         Forward pass with a non-permuatation equivariant mixer layer and normalizations.
         After attention, the tokens are stacked along the channel dimension before mixing,
@@ -679,6 +759,8 @@ class PeCODALayer(nn.Module):
             Has shape (b, t*d, h, w, ...) 
             where, t = number of tokens, d = token codimension
         """
+        raise NotImplementedError('Method has not been implemented yet')
+
         batch_size = x.shape[0]
         input_shape = x.shape[-self.n_dim:]
 
@@ -697,6 +779,7 @@ class PeCODALayer(nn.Module):
         # tokens_norm = self.norm1(tokens)
 
         latents = repeat(self._latent_queries, 'n d -> b n d', b = batch_size)
+        print(f'Context shape before all operations is {context.shape}')
 
         x = self._cross_attend_blocks(tokens, latents)
 

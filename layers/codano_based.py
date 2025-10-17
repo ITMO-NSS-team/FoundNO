@@ -438,10 +438,9 @@ class CODALayer(nn.Module):
         t = x.size(1) // self.token_codimension
         # Normalize the input first
         tokens = self.norm1(x)
-        tokens = tokens.view(
-            x.size(0) * t,
-            self.token_codimension,
-            *x.shape[-self.n_dim:])
+        tokens = tokens.view(x.size(0) * t,
+                             self.token_codimension,
+                             *x.shape[-self.n_dim:])
 
         # apply attention mechanism
         attention = self.compute_attention(tokens, batch_size)

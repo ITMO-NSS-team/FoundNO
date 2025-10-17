@@ -110,7 +110,7 @@ class FineTuner(object):
                 self.input_adapters[idx].to(device)
                 self.output_adapters[idx].to(device)
 
-    def set_logger(self, filename, logger: Logger = None, log_level = logging.INFO, logger_name: str = 'FoundationalFNO'):
+    def setLogger(self, filename, logger: Logger = None, log_level = logging.INFO, logger_name: str = 'FoundationalFNO'):
         if logger is None:
            self._logger = Logger(filename = filename, log_level = log_level, logger_name = logger_name)
         else:
