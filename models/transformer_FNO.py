@@ -12,7 +12,7 @@ from neuralop.layers.embeddings import GridEmbeddingND, GridEmbedding2D
 from neuralop.layers.fno_block import FNOBlocks
 from neuralop.layers.padding import DomainPadding
 
-from utils.YParams import YParams
+from ..utils.YParams import YParams
 
 DEFAULT_PARAMS = {
                     'n_modes': (0,), # Tuple[int],

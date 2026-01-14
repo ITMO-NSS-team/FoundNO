@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from neuralop.layers.fno_block import FNOBlocks
-from neuralop.layers.coda_blocks import CODABlocks
+# from neuralop.layers.coda_blocks import CODABlocks
 from neuralop.layers.channel_mlp import ChannelMLP
 from neuralop.layers.spectral_convolution import SpectralConv
 from neuralop.layers.skip_connections import skip_connection

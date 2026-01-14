@@ -13,7 +13,7 @@ from neuralop.layers.embeddings import GridEmbedding2D, GridEmbeddingND
 
 from neuralop.layers.fno_block import FNOBlocks
 
-from layers.pecoda import PeCODALayer
+from ..layers.pecoda import PeCODALayer
 
 
 class PeCODANO(nn.Module):
@@ -182,6 +182,7 @@ class PeCODANO(nn.Module):
         use_horizontal_skip_connection=False,
         horizontal_skips_map=None,
         n_layers=1,
+        n_sublayers=3,
         n_modes=None,
         per_layer_scaling_factors=None,
         n_heads=None,
@@ -199,7 +200,7 @@ class PeCODANO(nn.Module):
         super().__init__()
         self.n_layers = n_layers
         
-        assert len(n_modes) == n_layers # + n_layers_fno, "number of modes for all layers are not given"
+        # assert len(n_modes) == n_layers # + n_layers_fno, "number of modes for all layers are not given"
         assert (
             n_heads is None or len(n_heads) == n_layers
         ), "number of Attention head for all layers are not given"
@@ -290,7 +291,7 @@ class PeCODANO(nn.Module):
         if domain_padding is not None and domain_padding > 0:
             self.domain_padding = DomainPadding(
                 domain_padding=domain_padding,
-                padding_mode=domain_padding_mode,
+                # padding_mode=domain_padding_mode,
                 resolution_scaling_factor=self.end_to_end_scaling,
             )
         else:
@@ -310,29 +311,29 @@ class PeCODANO(nn.Module):
             self.hidden_variable_codimension = self.extended_variable_codimemsion
 
         self.attention_layers = nn.ModuleList([])
-        for i in range(self.n_layers):
-            self.attention_layers.append(
-                PeCODALayer(
-                    in_channels=self.hidden_variable_codimension,
-                    n_modes=self.n_modes[i],
-                    n_heads=self.n_heads[i],
-                    scale=self.attention_scalings[i],
-                    # token_codimension=attention_token_dim,
-                    per_channel_attention=per_channel_attention,
-                    nonlinear_attention=nonlinear_attention,
-                    resolution_scaling_factor=self.per_layer_scale_factors[i],
-                    conv_module=conv_module,
-                    non_linearity=self.non_linearity,
-                    **self.layer_kwargs,
-                )
+        # for i in range(self.n_layers):
+        self.attention_layers.append(
+            PeCODALayer(
+                in_channels=self.hidden_variable_codimension,
+                n_modes=self.n_modes[0],
+                n_heads=self.n_heads[0],
+                n_sublayers=n_sublayers,
+                scale=self.attention_scalings[0],
+                # token_codimension=attention_token_dim,
+                per_channel_attention=per_channel_attention,
+                nonlinear_attention=nonlinear_attention,
+                resolution_scaling_factor=self.per_layer_scale_factors[0],
+                conv_module=conv_module,
+                non_linearity=self.non_linearity,
+                **self.layer_kwargs,
             )
+        )
 
-        # self.fno_layers = FNOBlocks(
-        #                             in_channels = self.hidden_variable_codimension,
-        #                             out_channels=self.hidden_variable_codimension,
-        #                             n_layers=self.n_layers_fno,
-        #                             n_modes=self.n_modes[self.n_layers:]                        
-        # ) # Implement skip connections logic and generally experiment with layers structure
+        self.fno_layers = FNOBlocks(in_channels = self.hidden_variable_codimension,
+                                    out_channels=self.hidden_variable_codimension,
+                                    n_layers=self.n_layers-1,
+                                    n_modes=self.n_modes[0]                        
+        ) # Implement skip connections logic and generally experiment with layers structure
 
         # self.fno_layers = nn.ModuleList([])
         # for i in range(self.n_layers_fno):
@@ -474,6 +475,7 @@ class PeCODANO(nn.Module):
         return x
 
     def forward(self, x: torch.Tensor, input_variable_ids=None):
+        # print('In forward')
         batch, num_inp_var, *spatial_shape = (
             x.shape
         )
@@ -523,10 +525,9 @@ class PeCODANO(nn.Module):
             int(round(i * j))
             for (i, j) in zip(x.shape[-self.n_dim :], self.end_to_end_scaling)
         ]
-
         # forward pass through the Codomain Attention layers
         skip_outputs = {}
-        for layer_idx in range(self.n_layers):
+        for layer_idx in range(1): # self.n_layers
 
             if (
                 self.horizontal_skips_map is not None
@@ -583,9 +584,9 @@ class PeCODANO(nn.Module):
 
 
         # output_shape_fno = [None]*self.n_layers_fno
-        # for layer_idx in range(self.n_layers_fno):
-        #     print(f'layer_idx {layer_idx}, x.shape is {x.shape} with output shape of {output_shape_fno[layer_idx]}, {self.fno_layers}')
-        #     x = self.fno_layers(x, layer_idx, output_shape=output_shape_fno[layer_idx])
+        for layer_idx in range(self.n_layers - 1):
+            # print(f'layer_idx {layer_idx}, x.shape is {x.shape} with output shape of {output_shape_fno[layer_idx]}, {self.fno_layers}')
+            x = self.fno_layers(x, layer_idx, output_shape=None)
 
         # removing the padding
         if self.domain_padding is not None:

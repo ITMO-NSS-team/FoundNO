@@ -13,7 +13,7 @@ from einops import rearrange, repeat, einsum
 from functools import reduce
 
 from neuralop.layers.fno_block import FNOBlocks
-from neuralop.layers.coda_blocks import CODABlocks
+# from neuralop.layers.coda_blocks import CODABlocks
 from neuralop.layers.channel_mlp import ChannelMLP
 from neuralop.layers.spectral_convolution import SpectralConv
 from neuralop.layers.skip_connections import skip_connection
@@ -22,284 +22,11 @@ from neuralop.layers.padding import DomainPadding
 from neuralop.layers.resample import resample
 from neuralop.layers.embeddings import GridEmbedding2D, GridEmbeddingND
 
-from utils.training_utils import merge_dicts
+from fnofound.utils.training_utils import merge_dicts
+from fnofound.layers.transformer import AttentionBlock, PrepareMultihead, PreNorm, FeedForward
 
 # einsum_symbols = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-SPATIAL_AXES = ["h", "w", "d", "ex1", "ex2"]
-
-MERGE_SYMB = lambda args: reduce(lambda x, y: x + ' ' + y, args)
-
-def instanceNorm(n_features: int, dim: int) -> torch.nn.Module: # torch.Tensor
-    match dim:
-        case 3:
-            return torch.nn.InstanceNorm1d(n_features)
-        case 4:
-            return torch.nn.InstanceNorm2d(n_features)
-        case 5:
-            return torch.nn.InstanceNorm3d(n_features)
-        case _:
-            raise NotImplementedError(f'Can not construct InstanceNorm for {len(dim)}-dimensional tensor')
-
-
-def is_index_in_slice(index: int, slice_obj: Union[slice, int], sequence_length: int):
-    """
-    Checks if a given index is "contained" within a slice object's definition
-    for a sequence of a specific length.
-
-    Args:
-        index (int): The index to check.
-        slice_obj (slice): The slice object.
-        sequence_length (int): The length of the sequence the slice would apply to.
-
-    Returns:
-        bool: True if the index is within the slice's range, False otherwise.
-    """
-    if isinstance(slice_obj, int):
-        return index == slice_obj
-    else:
-        start, stop, step = slice_obj.indices(sequence_length)
-
-        if step > 0:
-            if not (start <= index < stop):
-                return False
-            if (index - start) % step != 0:
-                return False
-        elif step < 0:
-            if not (stop < index <= start):
-                return False
-            if (start - index) % abs(step) != 0:
-                return False
-        else:
-            return False
-        return True
-
-def unify_indexing_op(arg: list, idx: Union[int, slice]):
-    return [arg[idx],] if isinstance(idx, int) else arg[idx]
-
-def get_einsymbols(tensor: Union[int, np.array, torch.Tensor], initial_axes: List[str] = []) -> str:
-    if isinstance(tensor, torch.Tensor) or isinstance(tensor, np.ndarray):
-        tensor = tensor.ndim 
-    if tensor < len(initial_axes):
-        raise ValueError('Too few axes in data.')
-    
-    spatial_axes_len = tensor - len(initial_axes)
-    einstr = initial_axes + SPATIAL_AXES[:spatial_axes_len]
-    return MERGE_SYMB(einstr), einstr
-
-def group_einsymbols(einlist: List[str], group_idxs: Tuple[Union[int, slice]], grouped_axes_pos: int = 0):
-    einstr_merging = reduce(lambda x, y: x+y, [unify_indexing_op(einlist, c_idx) for c_idx in group_idxs])
-    
-    einstr_merged = '(' + MERGE_SYMB(einstr_merging) + ')'
-    einstr_remaining = [einlist[c_idx] for c_idx in range(len(einlist)) 
-                        if all([not is_index_in_slice(c_idx, elem, len(einlist))
-                               for elem in group_idxs])] # )
-
-    einstr_remaining.insert(grouped_axes_pos, einstr_merged)
-
-    return MERGE_SYMB(einstr_remaining), einstr_merging
-
-class PrepareMultihead(nn.Module):
-    def __init__(self, heads_dim: int = 1, n_heads: int = 1):
-        super().__init__()
-        self._n_heads  = n_heads
-        self._heads_dim = heads_dim
-
-    def forward(self, x: torch.Tensor):
-        shape = [1,] * x.ndim
-        shape[self._heads_dim] = self._n_heads
-        return x.repeat(*shape)
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, mult = 4):
-        super().__init__()
-        self.net = nn.Sequential(nn.Linear(dim, dim * mult), #  * 2
-                                 torch.nn.ReLU(),
-                                 nn.Linear(dim * mult, dim))
-
-    def forward(self, x):
-        x = x.transpose(1, -1)
-        x = self.net(x)
-        x = x.transpose(1, -1)
-        return x
-
-def apply_operator_or_ffn(arg: torch.Tensor, model: torch.nn.Module, dims: Dict[str, Union[int, List[int]]]):
-    # out = einsum(attn, v, 'b n j, b j d -> b n d')
-    if arg.ndim > 3:
-        arg = rearrange(arg, 'bh n ... -> bh n (...)')
-    if isinstance(model, nn.Linear):
-        arg = rearrange(arg, '(b h) n d -> b d (h n)', h = dims['h'])
-    elif isinstance(model, FNOBlocks):
-        arg = arg.view(dims['b'], dims['c']*dims['h'], *dims['spatials'])
-    elif isinstance(model, PrepareMultihead):
-        pass
-    else:
-        print(f'Other to_out model of type: {type(model)}')
-
-    arg = model(arg)
-    if isinstance(model, nn.Linear):
-        arg = rearrange(arg, 'b d n -> b n d')
-    return arg
-
-def attention_vanilla(Q: torch.Tensor,
-                      K: torch.Tensor,
-                      V: torch.Tensor,
-                      mask: torch.Tensor = None,
-                      h: int = 1, scale: float = 1.):
-    Q, K, V = map(lambda t: rearrange(t, 'b (h d) n -> (b h) d n', h = h), (Q, K, V))
-
-    sim = einsum(Q, K, 'b i n, b j n -> b i j') * scale
-
-    if mask is not None:
-        mask = rearrange(mask, 'b ... -> b (...)')
-        max_neg_value = -torch.finfo(sim.dtype).max
-        mask = repeat(mask, 'b j -> (b h) () j', h = h)
-        sim.masked_fill_(~mask, max_neg_value)
-
-    sim = sim.softmax(dim = -1) # calculate attention
-    return einsum(sim, V, 'b n j, b j d -> b n d')
-     
-
-def attention_fourier(Q: torch.Tensor,
-                      K: torch.Tensor,
-                      V: torch.Tensor,
-                      mask: torch.Tensor = None,
-                      h: int = 1, scale: float = 1.):
-    q, k, v = map(lambda t: rearrange(t, 'b (h d) n -> (b h) d n', h = h), (q, k, v))
-
-    sim = einsum(q, k, 'b i n, b j n -> b i j') * scale
-
-    if mask is not None:
-        mask = rearrange(mask, 'b ... -> b (...)')
-        max_neg_value = -torch.finfo(sim.dtype).max
-        mask = repeat(mask, 'b j -> (b h) () j', h = h)
-        sim.masked_fill_(~mask, max_neg_value)
-
-    return sim.softmax(dim = -1)
-
-
-class AttentionBlock(nn.Module):
-    '''
-    Implemented, as in https://github.com/lucidrains/perceiver-pytorch/
-    '''
-    def __init__(self, 
-                 query_dim: int,
-                 context_dim: int = None,
-                 heads: int = 8,
-                 dim_head: int = 64,
-                 to_q_model: torch.nn.Module = nn.Linear,
-                 to_q_params: dict = None,
-                 to_kv_model: torch.nn.Module = nn.Linear,
-                 to_kv_params: dict = None,                 
-                 to_out_model: torch.nn.Module = nn.Linear,
-                 to_out_params: dict = None,
-                 channel_wise: bool = True,
-                 attention: Callable = attention_vanilla):
-        if not isinstance(to_q_model, nn.Linear) and to_q_params is None:
-            raise ValueError('Custom nn.Module to get Queries should can not use default params.')
-        elif isinstance(to_q_model, nn.Linear) and to_q_params is None:
-            to_q_params = {'in_features': query_dim, 
-                           'out_features': inner_dim,
-                           'bias': False}
-
-        if not isinstance(to_kv_model, nn.Linear) and to_kv_params is None:
-            raise ValueError('Custom nn.Module to get Keys & Values should can not use default params.')
-        elif isinstance(to_q_model, nn.Linear) and to_q_params is None:
-            to_kv_params = {'in_features': context_dim, 
-                            'out_features': inner_dim * 2,
-                            'bias': False}
-
-        if not isinstance(to_out_model, nn.Linear) and to_out_params is None:
-            raise ValueError('Custom nn.Module to map outputs should can not use default params.')
-        elif isinstance(to_q_model, nn.Linear) and to_q_params is None:
-            to_q_params = {'in_features': inner_dim, 
-                           'out_features': query_dim,
-                           'bias': True}
-
-        super().__init__()
-        inner_dim = dim_head * heads
-        context_dim = query_dim if context_dim is None else context_dim
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        self.to_q = to_q_model(**to_q_params)    # nn.Linear(query_dim, inner_dim, bias = False)
-        self.to_kv = to_kv_model(**to_kv_params)  # nn.Linear(context_dim, inner_dim * 2, bias = False)
-        self.to_out = to_out_model(**to_out_params) # nn.Linear(inner_dim, query_dim)
-        self._channel_wise = channel_wise
-        self._attention = attention
-
-    def forward(self, x, context = None, mask = None, batch_size: int = -1):
-        b = x.shape[0]
-        h = self.heads
-        c = x.shape[1]
-        spatial_dims = x.shape[2:]
-
-        q = apply_operator_or_ffn(x, self.to_q, {'b': b, 'h': h, 'c': c, 'spatials': spatial_dims})
-
-        if context is None:
-            context = x if context is None else context
-
-        if isinstance(self.to_kv, FNOBlocks) and self._channel_wise:
-            context = rearrange(context, 'b n ... -> (b n) ...')
-            context = torch.unsqueeze(context, 1)
-        temp = apply_operator_or_ffn(context, self.to_kv, {'b': b, 'h': h, 'c': c, 'spatials': spatial_dims})
-        temp = rearrange(temp, 'b n ... -> b n (...)')
-        q    = rearrange(q, 'b n ... -> b n (...)')
-        k, v = temp.chunk(2, dim = 1)
-
-        out = self._attention(q, k, v, mask, h, self.scale)
-
-        out = apply_operator_or_ffn(out, self.to_out, {'b': b, 'h': h, 'c': c, 'spatials': spatial_dims})
-
-        out = out.view(b, c, *spatial_dims)
-        return out
-
-
-class PreNorm(nn.Module):
-    def __init__(self, input_info: Tuple[int], fn: torch.nn.Module, context_info: Tuple[int] = None):
-        super().__init__()
-        self.fn = fn
-        self.norm = instanceNorm(n_features = input_info[0],
-                                 dim = input_info[1]) # nn.LayerNorm(norm_dim)
-        self.norm_context = None if context_info is None else instanceNorm(n_features = context_info[0],
-                                                                           dim = context_info[1])
-        self._dim_labels = ['b', 'c']
-
-        self._ein_init = None; self._ein_norm = None
-        self._ctx_ein_init = None; self._ctx_ein_norm = None
-
-
-    def forward(self, x, **kwargs):
-        original_shape = x.shape
-        if self._ein_init is None:
-            self._ein_init = get_einsymbols(x, self._dim_labels)
-            self._ein_norm = group_einsymbols(self._ein_init[1], (0, 1), 0) # TODO: validate normalization approach slice(2, None, None)
-        
-        # x = rearrange(x, self._ein_init[0] + ' -> ' + self._ein_norm[0]) # 'b c ... -> (b ...) c')
-        # print(f'Before normalization x shape is {x.shape}')
-        # raise NotImplementedError()
-        x = self.norm(x)
-        # x = rearrange(x, self._ein_norm[0] + ' -> ' + self._ein_init[0], b = original_shape[0], 
-        #               **{value: original_shape[idx + len(self._dim_labels)]
-        #                  for idx, value in enumerate(self._ein_norm[1][1:])})
-        
-        if self.norm_context is not None:
-            context = kwargs['context']
-            original_shape = context.shape
-
-            if self._ctx_ein_init is None:
-                self._ctx_ein_init = get_einsymbols(context, self._dim_labels)
-                self._ctx_ein_norm = group_einsymbols(self._ctx_ein_init[1], (0, slice(2, None, None)), 0)
-
-            # context = rearrange(context, self._ctx_ein_init[0] + ' -> ' + self._ctx_ein_norm[0])
-            context = self.norm_context(context)
-            # context = rearrange(context, self._ctx_ein_norm[0] + ' -> ' + self._ctx_ein_init[0], 
-            #                     b = original_shape[0], 
-            #                     **{value: original_shape[idx + len(self._dim_labels)]
-            #                         for idx, value in enumerate(self._ctx_ein_norm[1][1:])})
-            kwargs.update(context = context)
-
-        output = self.fn(x, **kwargs)
-        return output
 
 class PeCODALayer(nn.Module):
     """Co-domain Attention Blocks (PeCODALayer) implement the transformer
@@ -373,7 +100,7 @@ class PeCODALayer(nn.Module):
         in_channels: int,
         n_modes:List[int],
         n_heads=1,
-        n_sublayers=6,
+        n_sublayers=4,
         head_codimension=None,
         codimension_size=None,
         per_channel_attention=True,
@@ -397,7 +124,7 @@ class PeCODALayer(nn.Module):
         fixed_rank_modes=False,
         implementation='factorized',
         decomposition_kwargs=None,
-        neural_op_processing = False,
+        neural_op_processing=True,
         # dropout_perc = 0.1,
         **_kwargs,
     ):
@@ -423,7 +150,7 @@ class PeCODALayer(nn.Module):
         self.resolution_scaling_factor = resolution_scaling_factor
         self.n_dim = len(n_modes)
 
-        print(f'Initializing PeCoDA with n_heads {self.n_heads} & n_dim {self.n_dim}')
+        # print(f'Initializing PeCoDA with n_heads {self.n_heads} & n_dim {self.n_dim}')
 
         if norm is None:
             norm_module = torch.nn.Identity
@@ -456,8 +183,8 @@ class PeCODALayer(nn.Module):
             use_channel_mlp=use_channel_mlp,
             preactivation=preactivation,
             channel_mlp_skip=channel_mlp_skip,
-            mlp_dropout=0,
-            incremental_n_modes=incremental_n_modes,
+            channel_mlp_dropout=0,
+            # incremental_n_modes=incremental_n_modes,
             rank=rank,
             channel_mlp_expansion=channel_mlp_expansion,
             fixed_rank_modes=fixed_rank_modes,
@@ -465,7 +192,7 @@ class PeCODALayer(nn.Module):
             separable=separable,
             factorization=factorization,
             decomposition_kwargs=decomposition_kwargs,
-            joint_factorization=joint_factorization,
+            # joint_factorization=joint_factorization,
         )
 
         inp_arr_proc_args = dict(in_channels = in_channels,
@@ -483,6 +210,7 @@ class PeCODALayer(nn.Module):
                                fno_skip='linear',
                                norm=None,
                                n_layers=1)
+        
         lat_proc_args_kv = deepcopy(lat_proc_args_q)
         lat_proc_args_kv['out_channels'] = 2 * self.n_heads * self.head_codimension
 
@@ -603,12 +331,12 @@ class PeCODALayer(nn.Module):
 
         self.attention_normalizer = norm_module(in_channels)
 
-        mixer_args = dict(n_modes=n_modes,
-                          resolution_scaling_factor=1,
-                          non_linearity=non_linearity,
-                          norm='instance_norm',
-                          fno_skip=fno_skip,
-                          conv_module=conv_module)
+        # mixer_args = dict(n_modes=n_modes,
+        #                   resolution_scaling_factor=1,
+        #                   non_linearity=non_linearity,
+        #                   norm='instance_norm',
+        #                   fno_skip=fno_skip,
+        #                   conv_module=conv_module)
         
 
         # We have an option to make the last operator (MLP in regular
@@ -617,13 +345,17 @@ class PeCODALayer(nn.Module):
         # (like regular FNO).
 
         if permutation_eq:
-            self.mixer = FNOBlocks(
-                in_channels=self.mixer_token_codimension,
-                out_channels=self.mixer_token_codimension,
-                n_layers=2,
-                **mixer_args,
-                **shared_fno_configs,
-            )
+            # self.mixer = FNOBlocks(
+            #     in_channels=self.mixer_token_codimension,
+            #     out_channels=self.mixer_token_codimension,
+            #     n_layers=1,
+            #     **mixer_args,
+            #     **shared_fno_configs,
+            # )
+
+            self.mixer = torch.nn.Linear(2 * self.mixer_token_codimension, self.mixer_token_codimension) 
+            # Reminding: self.mixer_token_codimension = in_channels
+
 
             self.norm1 = norm_module(in_channels)
             self.mixer_in_normalizer = norm_module(self.mixer_token_codimension)
@@ -631,16 +363,17 @@ class PeCODALayer(nn.Module):
                 self.mixer_token_codimension)
 
         else:
-            self.mixer = FNOBlocks(
-                in_channels=codimension_size,
-                out_channels=codimension_size,
-                n_layers=2,
-                **mixer_args,
-                **shared_fno_configs,
-            )
-            self.norm1 = norm_module(codimension_size)
-            self.mixer_in_normalizer = norm_module(codimension_size)
-            self.mixer_out_normalizer = norm_module(codimension_size)
+            raise NotImplementedError('Non-permutation equivariant methods are unneccessary!')
+            # self.mixer = FNOBlocks(
+            #     in_channels=codimension_size,
+            #     out_channels=codimension_size,
+            #     n_layers=1,
+            #     **mixer_args,
+            #     **shared_fno_configs,
+            # )
+            # self.norm1 = norm_module(codimension_size)
+            # self.mixer_in_normalizer = norm_module(codimension_size)
+            # self.mixer_out_normalizer = norm_module(codimension_size)
 
     def set_latents(self, domain_shape: Tuple[int], n_latents: int = None, device: str = 'cuda'):
         '''
@@ -651,9 +384,10 @@ class PeCODALayer(nn.Module):
                 n_latents = self._latent_queries_features 
 
             assert len(domain_shape) == self.n_dim, 'Numbers of points does not match dimensionality'
-            print(f'Setting latents of shape {self.n_dim} with {domain_shape}')
+            # print(f'Setting latents of shape {self.n_dim} with {domain_shape}')
             self._latent_queries_modes = domain_shape # .reshape((n_latents, -1))
             self._latent_queries = nn.Parameter(torch.randn(n_latents, *domain_shape).to(device)) #.reshape((n_latents, -1)))
+            # print('Set!')
 
     def forward(self, x: torch.Tensor, output_shape=None):
         """
@@ -698,22 +432,28 @@ class PeCODALayer(nn.Module):
         batch_size = x.shape[0]
         input_shape = x.shape[-self.n_dim:]
 
+        # print('In forward equivariant')
+
         t = x.size(1) #// self.token_codimension
 
-        tokens = x #.view(x.shape[0] * x.shape[1],
-                        # 1, # Assume token codim as 1
-                        # *x.shape[-self.n_dim:])
+        # tokens = x #.view(x.shape[0] * x.shape[1],
+                     # 1, # Assume token codim as 1
+                     # *x.shape[-self.n_dim:])
         
         # normalization and attention mechanism
-        # tokens_norm = self.norm1(tokens)
+        tokens = self.norm1(x) # maybe, TODO: insert separate tokens not to normalize args for decoder. 
 
         latents = repeat(self._latent_queries, 'n ... -> b n ...', b = batch_size)
+
+        # print(f'Reached encoder in pecoda')
 
         attn, ffn = self._cross_attend_blocks
         latents = attn(latents, context = tokens) + latents
         latents = ffn(latents) + latents
         # print(f'ffn(attn(latents, context = tokens)) {ffn(attn(latents, context = tokens)).shape}, latents {latents.shape}')
         # latents = ffn(attn(latents, context = tokens)) + latents
+
+        # print(f'Reached processer in pecoda')
 
         for sublayer in self._sublayers:
             attn, ffn = sublayer
@@ -725,12 +465,30 @@ class PeCODALayer(nn.Module):
 
         # tokens = torch.layer_norm(tokens)
 
-        attn = self.decoder_cross_attn
-        output = attn(latents, context = tokens) #  + latents # + tokens # + tokens # context
-        
-        for i in range(self.mixer.n_layers):
-            output = self.mixer(output, index=i, output_shape=input_shape)
-        output = self.mixer_out_normalizer(output) # + attention
+        # print(f'Reached decoder in pecoda')
+
+        # attn = self.decoder_cross_attn
+        # # output = attn(latents, context = x) #  + latents # + tokens # + tokens # context
+        # tokens = attn(tokens, context = latents)
+        # print('x:', torch.mean(x), torch.std(x), 'atten:', torch.mean(tokens), torch.std(tokens) )
+
+        output = torch.concat((tokens, latents), dim = 1)  # + x
+        # print('x.shape', x.shape, 'attn.shape', attn(x, context = latents).shape)
+        output = torch.moveaxis(output, 1, -1)
+        output = self.mixer(output)
+        output = torch.moveaxis(output, -1, 1)
+
+        # print('output.shape', output.shape, 'x.shape', x.shape)
+        # raise NotImplementedError()
+        # for i in range(self.mixer.n_layers):
+        #     # print(i, 'in_mixer of ', self.mixer.n_layers)
+        #     output = self.mixer(output, index=i, output_shape=input_shape)
+        # # print('Ready to exit mixer')
+
+        output = self.mixer_out_normalizer(output) + tokens # + attention
+
+
+        # print(f'Executed  decoder and output normalizer in pecoda')
 
         # reshape from shape (b*t) d h w... to b (t d) h w ...
         t = output.size(0) // batch_size
@@ -744,6 +502,10 @@ class PeCODALayer(nn.Module):
                               res_scale=[j/i for (i, j) in zip(output.shape[-self.n_dim:], output_shape)],
                               axis=list(range(-self.n_dim, 0)),
                               output_shape=output_shape)
+
+        # print(f'Ready to exit forward in pecoda')
+        del x, latents
+        torch.cuda.empty_cache()           
 
         return output
 

@@ -1,4 +1,6 @@
 import time
+from typing import Union
+
 import math
 import numpy as np
 import torch
@@ -7,7 +9,12 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 # Adjust this import to your neuralop package layout:
+from neuralop.layers.embeddings import GridEmbeddingND, GridEmbedding2D
+from neuralop.layers.channel_mlp import ChannelMLP
+from neuralop.layers.complex import ComplexValued
 from neuralop.models import FNO        # user had this import in latest snippet
+from neuralop.layers.padding import DomainPadding
+from neuralop.models.base_model import BaseModel
 
 # -------------------------
 # PDEBench dataset (unchanged)
@@ -165,6 +172,63 @@ class PostLiftMambaProcessor(nn.Module):
         return out
 
 
+class PostLiftMambaProcessor3D(nn.Module):
+    """
+    Apply SSM across spatial dimensions (H and W) for each time slice.
+    Input: [B, C, H, W, T] → process each (H, W) plane independently per time.
+    """
+    def __init__(self, hidden_channels, mamba_kwargs=None, fallback_kernel=9):
+        super().__init__()
+        self.C = hidden_channels
+        self.mamba_kwargs = mamba_kwargs or {}
+        self._use_mamba = False
+
+        if MAMBA_AVAILABLE and MambaClass is not None:
+            # print('HEREEEEE')
+            try:
+                self.ssm = MambaClass(d_model=self.C, d_state=self.C, d_conv=2, **self.mamba_kwargs)
+                self._use_mamba = True
+            except Exception:
+                try:
+                    self.ssm = MambaClass(self.C)
+                    self._use_mamba = True
+                except Exception:
+                    self.ssm = SimpleSSM(dim=self.C, kernel_size=fallback_kernel)
+                    self._use_mamba = False
+        else:
+            self.ssm = SimpleSSM(dim=self.C, kernel_size=fallback_kernel)
+            self._use_mamba = False
+
+        self.norm = nn.LayerNorm(self.C)
+
+    def forward(self, x_lift):
+        """
+        x_lift: [B, C, H, W, T]
+        Process each (H, W) spatial plane per time step.
+        """
+        B, C, H, W, T = x_lift.shape
+        assert C == self.C
+
+        # Flatten spatial dims: [B*T, H*W, C]
+        tokens = x_lift.permute(0, 4, 2, 3, 1).contiguous().view(B * T, H * W, C)
+
+        if self._use_mamba:
+            try:
+                out = self.ssm(tokens)
+            except Exception:
+                try:
+                    out_tmp = self.ssm(tokens.permute(0, 2, 1))
+                    out = out_tmp.permute(0, 2, 1)
+                except Exception:
+                    out = self.ssm(tokens)
+        else:
+            out = self.ssm(tokens)
+
+        out = self.norm(out)
+        out = out.view(B, T, H, W, C).permute(0, 4, 2, 3, 1).contiguous()
+        return out
+
+
 # -------------------------
 # FNO subclass: apply Mamba after lifting (post-lift)
 # -------------------------
@@ -234,6 +298,159 @@ class PostLiftMambaFNO(FNO):
 
         # 7) projection to output channels
         x = self.projection(x)
+        return x
+
+class PostLiftMambaFNO3D(FNO):
+    def __init__(self, in_channels=5, out_channels=2, modes=(32, 32, 16), width=32, n_layers=4,
+                 use_mamba_kwargs=None, mamba_fallback_kernel=9):
+        super().__init__(
+            n_modes=modes,
+            hidden_channels=width,
+            in_channels=in_channels,      # u0(2) + f(1) + x(1) + y(1)
+            out_channels=out_channels,
+            factorization='tucker',
+            rank=0.05,
+            implementation='factorized',
+            n_layers=n_layers,
+            use_channel_mlp = True,
+            channel_mlp_dropout = 0.1,
+            positional_embedding=None
+        )
+        self.post_lift_ssm = PostLiftMambaProcessor3D(
+            hidden_channels=width,
+            mamba_kwargs=use_mamba_kwargs,
+            fallback_kernel=mamba_fallback_kernel
+        )
+
+    def forward(self, x):
+        # Standard FNO pipeline
+        if self.positional_embedding is not None:
+            print(x.shape)
+            x = self.positional_embedding(x)
+        x = self.lifting(x)
+        if self.domain_padding is not None:
+            x = self.domain_padding.pad(x)
+
+        # Apply Mamba/SSM after lifting
+        x = self.post_lift_ssm(x)  # [B, C, H, W, T]
+
+        for layer_idx in range(self.n_layers):
+            x = self.fno_blocks(x, layer_idx)
+        if self.domain_padding is not None:
+            x = self.domain_padding.unpad(x)
+        x = self.projection(x)
+        return x
+
+class PostLiftMambaLifting(BaseModel):
+    def __init__(self,
+                 in_channels=3,
+                 out_channels=64,
+                 modes=None,
+                 width=None,
+                 n_dim = 3,
+                 padding=8,
+                 resolution_scaling_factor = None,
+                 use_mamba_kwargs=None,
+                 mamba_fallback_kernel=9,
+                 positional_embedding: Union[str, nn.Module] = "grid",
+                 non_linearity: nn.Module = F.gelu):
+        """
+        A compact FNO that runs the standard lifting, then a Mamba/SSM processor across spatial axis,
+        then continues with FNO spectral blocks and projection.
+        """
+        self.complex_data = False
+        super().__init__()
+
+        if width is None:
+            width = out_channels
+        else:
+            assert out_channels == width, 'out_channels != width'
+        self.n_dim = n_dim
+        self.in_channels = in_channels
+
+        ## Positional embedding
+        if positional_embedding == "grid":
+            spatial_grid_boundaries = [[0.0, 1.0]] * self.n_dim
+            self.positional_embedding = GridEmbeddingND(
+                in_channels=self.in_channels,
+                dim=self.n_dim,
+                grid_boundaries=spatial_grid_boundaries,
+            )
+        elif isinstance(positional_embedding, GridEmbedding2D):
+            if self.n_dim == 2:
+                self.positional_embedding = positional_embedding
+            else:
+                raise ValueError(f"Error: expected {self.n_dim}-d positional embeddings, got {positional_embedding}")
+        elif isinstance(positional_embedding, GridEmbeddingND):
+            self.positional_embedding = positional_embedding
+        elif positional_embedding is None:
+            self.positional_embedding = None
+        else:
+            raise ValueError(f"Error: tried to instantiate FNO positional embedding with {positional_embedding},\
+                              expected one of 'grid', GridEmbeddingND")
+
+        ## Domain padding
+        if padding is not None and (
+            (isinstance(padding, list) and sum(padding) > 0)
+            or (isinstance(padding, (float, int)) and padding > 0)
+        ):
+            self.domain_padding = DomainPadding(
+                domain_padding=padding,
+                resolution_scaling_factor=resolution_scaling_factor,
+            )
+        else:
+            self.domain_padding = None
+
+        ## Resolution scaling factor
+        if resolution_scaling_factor is not None:
+            if isinstance(resolution_scaling_factor, (float, int)):
+                resolution_scaling_factor = [resolution_scaling_factor] * self.n_layers
+        self.resolution_scaling_factor = resolution_scaling_factor
+
+        ## Lifting layer
+        # if adding a positional embedding, add those channels to lifting
+        lifting_in_channels = in_channels
+        if self.positional_embedding is not None:
+            lifting_in_channels += n_dim
+        self.lifting = ChannelMLP(
+            in_channels=lifting_in_channels,
+            out_channels=out_channels,
+            hidden_channels=out_channels,
+            n_layers=2,
+            n_dim=self.n_dim,
+            non_linearity=non_linearity,
+        )
+
+        if self.complex_data:
+            self.lifting = ComplexValued(self.lifting)
+
+        self.post_lift_ssm = PostLiftMambaProcessor3D(hidden_channels=width,
+                                                      mamba_kwargs=use_mamba_kwargs,
+                                                      fallback_kernel=mamba_fallback_kernel)
+
+
+    def forward(self, x, output_shape=None, **kwargs):
+        """
+        FNO forward with Post-lift SSM:
+         - positional embedding (optional)
+         - lifting (inherited)
+         - domain padding (optional)
+         - post-lift Mamba / SSM across spatial axis per time-slice
+         - FNO blocks, unpad, projection
+        """
+        # 1) positional embedding (if configured)
+        if self.positional_embedding is not None:
+            x = self.positional_embedding(x)
+
+        # 2) lifting -> [B, C, T, X, Y]
+        x = self.lifting(x)
+
+        # 3) domain padding (optional)
+        if self.domain_padding is not None:
+            x = self.domain_padding.pad(x)
+
+        # 4) post-lift SSM processing (Mamba or fallback)
+        x = self.post_lift_ssm(x)  # [B, C, T, X, Y]
         return x
 
 

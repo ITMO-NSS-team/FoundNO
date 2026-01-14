@@ -293,7 +293,10 @@ def validate_operator(operator_class: type, args: List[str]):
     for argument in args:
         if argument not in operator_init_signature:
             to_break = True
+            print(argument)
             warnings.warn(f'Argument {argument} is missing from the operator class __init__ signature')
 
     if to_break:
+        print('---------------------------------')
+        print(f'Args: {args}, operator args: {operator_init_signature}')
         raise TypeError('Operator class, passed in the model, is missing vital properties. Further execution is terminated.')

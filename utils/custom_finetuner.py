@@ -12,11 +12,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from utils.data_utils import Dataset
+from .data_utils import Dataset
 
-from utils.logger import Logger
-from utils.optimizer_utils import set_optimizer, set_scheduler
-from utils.training_utils import LpLoss
+from .logger import Logger
+from .optimizer_utils import set_optimizer, set_scheduler
+from .training_utils import LpLoss
 
 class FineTuner(object):
     mixed_precision = False # Load them from param json

@@ -10,7 +10,7 @@ from neuralop.layers.padding import DomainPadding
 from neuralop.layers.resample import resample
 from neuralop.layers.embeddings import GridEmbedding2D, GridEmbeddingND
 
-from layers.codano_based import CODALayer
+from fnofound.layers.codano import CODALayer
 
 class CODANO(nn.Module):
     """Codomain Attention Neural Operators (CoDA-NO) uses a specialized attention mechanism in the codomain space for data in

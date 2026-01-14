@@ -12,11 +12,29 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from utils.data_utils import Dataset
+from neuralop.data.transforms.data_processors import DataProcessor
 
-from utils.logger import Logger
-from utils.optimizer_utils import set_optimizer, set_scheduler
-from utils.training_utils import LpLoss
+from .data_utils import Dataset, Heatmap
+from torch.utils.data import DataLoader
+
+from .logger import Logger
+from .optimizer_utils import set_optimizer, set_scheduler
+from .training_utils import LpLoss
+
+def load_model(model_path: Union[str, Tuple[str]], _SAVE_LOAD_PARAMS: dict = {}):
+    if isinstance(model_path, str):   
+        # assert isinstance(model_path, str), 'Saving of a single model requires a single path str argument'
+        model = torch.load(f=model_path, **_SAVE_LOAD_PARAMS)
+    else:
+        assert isinstance(model_path, tuple) and len(model_path) == 3, \
+            'Saving lifting-main part-projection model requires tuple of str arg with len 3'
+        input_adapters  = torch.load(f = model_path[0], **_SAVE_LOAD_PARAMS)
+        main_fno        = torch.load(f = model_path[1], **_SAVE_LOAD_PARAMS)
+        output_adapters = torch.load(f = model_path[2], **_SAVE_LOAD_PARAMS)
+        model = (input_adapters, main_fno, output_adapters)
+
+    return model
+
 
 class Trainer(object):
     mixed_precision = False # Load them from param json
@@ -44,19 +62,19 @@ class Trainer(object):
             self.world_rank = 1
 
         self.input_experts = None
-        self.fno_and_proj_model = None
+        self.main_fno = None
 
     @singledispatchmethod
-    def build_model(self, model):
+    def buildModel(self, model):
         raise NotImplementedError("Cannot declare model with anything, but nn Module or tuple of nn Modules")
     
-    @build_model.register
+    @buildModel.register
     def _(self, model: torch.nn.Module):
         self._single_model = True
         self.model = model
         self.params_to_optimize = [{'params': self.model.parameters()},]
 
-    @build_model.register
+    @buildModel.register
     def _(self, model: tuple): #expect Tuple[List[torch.nn.Module], torch.nn.Module, List[torch.nn.Module]]
         assert len(model) == 3, \
             'Multiple adapter architecture requires sequence of input adapters -> single model -> output adapters'
@@ -67,7 +85,7 @@ class Trainer(object):
         assert isinstance(model[1], torch.nn.Module), \
             'Main neural operator model has to be set as a single torch nn Module'
         
-        assert isinstance(model[2], list) and isinstance(model[2][0], list), \
+        assert isinstance(model[2], list) and isinstance(model[2][0], torch.nn.Module), \
             'Projections have to be set as a list of torch nn Modules'
 
         assert len(model[0]) == len(model[2]), 'Numbers of liftings and projections have to match.'
@@ -82,14 +100,13 @@ class Trainer(object):
             self.params_to_optimize.append({'params': self.input_adapters[idx_expert_nn].parameters()})
             self.params_to_optimize.append({'params': self.output_adapters[idx_expert_nn].parameters()})
 
-    def build_optimizer(self, 
+    def buildOptimizer(self, 
                         n_dim: int,
                         params_scheduler: dict,
                         params_opt: dict,
-                        data_processor = None,
                         trainer_loss = None):
         assert self.params_to_optimize is not None, 'Optimizer has to be constructed only after model declaration.'
-        self.data_processor = data_processor
+        # self.data_processor = data_processor
 
         self.optimizer = set_optimizer(params_opt, self.params_to_optimize)
         self.scheduler = set_scheduler(params_scheduler, self.optimizer)
@@ -112,77 +129,103 @@ class Trainer(object):
     def setLogger(self, filename, logger: Logger = None, log_level = logging.INFO, logger_name: str = 'FoundationalFNO'):
         if logger is None:
            self._logger = Logger(filename = filename, log_level = log_level, logger_name = logger_name, 
-                                 write_every = 1e3, epochs_aggreg = 20, 
-                                 info_entries = ['avg_loss', 'train_err', 'lr']) # 'Epoch', 
+                                 write_every = 1e1, epochs_aggreg = 5, 
+                                 info_entries = ['val_loss', 'train_err', 'lr']) # 'Epoch', 
         else:
             self._logger = logger
 
-    def save_model(self, model_path: Union[str, Tuple[str]]):
+    def saveModel(self, model_path: Union[str, Tuple[str]]):
         if self._single_model:   
             assert isinstance(model_path, str), 'Saving of a single model requires a single path str argument'
             torch.save(obj = self.model, f = model_path, **self._SAVE_LOAD_PARAMS)
         else:
             assert isinstance(model_path, tuple) and len(model_path) == 3, \
                 'Saving lifting-main part-projection model requires tuple of str arg with len 3'
-            torch.save(obj = self.input_adapters,     f = model_path[0], **self._SAVE_LOAD_PARAMS)
-            torch.save(obj = self.fno_and_proj_model, f = model_path[1], **self._SAVE_LOAD_PARAMS)
-            torch.save(obj = self.output_adapters,    f = model_path[2], **self._SAVE_LOAD_PARAMS)
+            torch.save(obj = self.input_adapters,  f = model_path[0], **self._SAVE_LOAD_PARAMS)
+            torch.save(obj = self.main_fno,        f = model_path[1], **self._SAVE_LOAD_PARAMS)
+            torch.save(obj = self.output_adapters, f = model_path[2], **self._SAVE_LOAD_PARAMS)
 
-    def load_model(self, model_path: Union[str, Tuple[str]]):
-        if self._single_model:   
-            assert isinstance(model_path, str), 'Saving of a single model requires a single path str argument'
-            self.model = torch.load(f=model_path, **self._SAVE_LOAD_PARAMS)
+    def loadModel(self, model_path: Union[str, Tuple[str]]):
+        model = load_model(model_path, self._SAVE_LOAD_PARAMS)
+        if isinstance(model, tuple):
+            self.input_adapters = model[0]
+            self.main_fno = model[1]
+            self.output_adapters = model[2]
         else:
-            assert isinstance(model_path, tuple) and len(model_path) == 3, \
-                'Saving lifting-main part-projection model requires tuple of str arg with len 3'
-            self.input_adapters     = torch.load(f = model_path[0], **self._SAVE_LOAD_PARAMS)
-            self.fno_and_proj_model = torch.load(f = model_path[1], **self._SAVE_LOAD_PARAMS)
-            self.output_adapters    = torch.load(f = model_path[2], **self._SAVE_LOAD_PARAMS)
+            self.model = model
 
-    def load_model(self, model_path):
+        # if self._single_model:   
+        #     assert isinstance(model_path, str), 'Saving of a single model requires a single path str argument'
+        #     self.model = torch.load(f=model_path, **self._SAVE_LOAD_PARAMS)
+        # else:
+        #     assert isinstance(model_path, tuple) and len(model_path) == 3, \
+        #         'Saving lifting-main part-projection model requires tuple of str arg with len 3'
+        #     self.input_adapters     = torch.load(f = model_path[0], **self._SAVE_LOAD_PARAMS)
+        #     self.fno_and_proj_model = torch.load(f = model_path[1], **self._SAVE_LOAD_PARAMS)
+        #     self.output_adapters    = torch.load(f = model_path[2], **self._SAVE_LOAD_PARAMS)
+
+    def loadModel(self, model_path):
         # Implement loading data from pickle
         pass
 
-    def load_data(self, file):
+    def loadData(self, file):
         pass
 
-    def train(self, train_loader: Dataset, train_epochs: int): #train_data: Dataset, train_epochs: int):
-        # best_loss = np.inf        
-        # best_epoch = 0
+    def train(self, train_loader: Union[DataLoader, list], val_loader: Union[DataLoader, list], 
+              train_epochs: int, data_processor: Union[list, DataProcessor] = None):
+        if isinstance(train_loader, DataLoader):
+            train_loader = [train_loader,]
+        if isinstance(val_loader, DataLoader):
+            val_loader = [val_loader,]
+        
+        # track number of training examples in batch
+        self.n_samples = sum([len(loader) for loader in train_loader]) # .size
+        self.n_samples_val = sum([len(loader) for loader in val_loader])
+
+        if isinstance(data_processor, DataProcessor):
+            data_processor = [data_processor,]
+        elif data_processor is None:
+            data_processor = [None,]
+
         best_err = np.inf
 
         if self._single_model:
             n_params = sum(p.numel() for p in self.model.parameters())
-            init_log = 'Initializing training of model of type {} | epochs: {} | n params: {}'.format(type(self.model),
-                                                                                                      train_epochs, 
-                                                                                                      n_params)
+            init_log = 'Initializing training of model of type' + \
+                       ' {} | epochs: {} | n params: {}'.format(type(self.model),
+                                                                train_epochs,
+                                                                n_params)
         else:
             n_params = sum(p.numel() for p in self.input_adapters[0].parameters()) + \
-                       sum(p.numel() for p in self.fno_and_proj_model.parameters()) + \
+                       sum(p.numel() for p in self.main_fno.parameters()) + \
                        sum(p.numel() for p in self.output_adapters[0].parameters())
 
-            init_log = 'Initializing training of model of type {}, {}, {} | epochs: {} | n params: {}'.format(type(self.input_adapters[0]),
-                                                                                                              type(self.fno_and_proj_model),
-                                                                                                              type(self.output_adapters[0]),
-                                                                                                              train_epochs, 
-                                                                                                              n_params)
+            init_log = 'Initializing training of model of type' + \
+                       ' {}, {}, {} | epochs: {} | n params: {}'.format(type(self.input_adapters[0]),
+                                                                        type(self.main_fno),
+                                                                        type(self.output_adapters[0]),
+                                                                        train_epochs,
+                                                                        n_params)
         self._logger.write(init_log)
 
         for epoch in range(train_epochs):
-            train_err, avg_epoch_loss = self.train_single_epoch(epoch, train_loader, self._training_loss)
-            print(f'{epoch} - th epoch: train error is {train_err}')
+            train_err, val_loss = self.train_single_epoch(epoch, train_loader, val_loader, 
+                                                          self._training_loss, data_processor)
+            print(f'{epoch} - th epoch: train error is {train_err}, val error {val_loss}')
 
             if train_err < best_err:
                 best_err = train_err
 
-        self.log_training(f'Finished model training. train_err: {train_err}, avg_epoch_loss: {avg_epoch_loss}')
+            if (epoch == train_epochs-1):
+                self.log_training(train_err, val_loss, 0) # f'Finished model training. train_err: {train_err}, avg_epoch_loss: {avg_epoch_loss}')
 
         if self._single_model:
             return self.model
         else:
-            return self.input_adapters, self.fno_and_proj_model, self.output_adapters
+            return self.input_adapters, self.main_fno, self.output_adapters
 
-    def train_single_epoch(self, epoch, train_loader, training_loss):
+    def train_single_epoch(self, epoch, train_loader: List[DataLoader], val_loader: List[DataLoader], 
+                           training_loss, data_processor: List[DataProcessor] = [None,]):
         """train_single_epoch trains self.model on train_loader
         for one epoch and returns training metrics
 
@@ -200,8 +243,6 @@ class Trainer(object):
         """
         self.on_epoch_start(epoch)
 
-        avg_epoch_loss = 0
-        
         if self._single_model:
             self.model.train()
         else:
@@ -212,47 +253,80 @@ class Trainer(object):
                 self.output_adapters[idx].train()
 
 
-        if self.data_processor:
-            self.data_processor.train()
+        if data_processor[0] is not None:
+            for idx in range(len(data_processor)):
+                data_processor[idx].train()
+
+        if self._single_model:
+            self.model.train()
+        else:
+            for idx_adapter, _ in enumerate(self.input_adapters):
+                self.input_adapters[idx_adapter].train()
+                self.output_adapters[idx_adapter].train()
+            self.main_fno.train()
+
         train_err = 0.0
-        
-        # track number of training examples in batch
-        self.n_samples = len(train_loader) # .size
+        n_fine_samples = self.n_samples
+        for dataset_idx, loader in enumerate(train_loader):
+            for idx, sample in enumerate(loader):
+                
+                self.optimizer.zero_grad()
 
-        for idx, sample in enumerate(train_loader):
-            
-            loss = self.train_one_batch(idx, sample, training_loss)
-            loss.backward()
-            self.optimizer.step()
+                loss = self.train_one_batch(idx, sample, training_loss, data_processor[dataset_idx])
+                
+                if torch.isnan(loss).item():
+                    n_fine_samples -= 1
+                    continue
+                loss.backward()
+                self.optimizer.step()
 
-            train_err += loss.item()
-            with torch.no_grad():
-                avg_epoch_loss += loss.item()
-                # if self.regularizer:
-                #     avg_lasso_loss += self.regularizer.loss
+                with torch.no_grad():
+                    train_err += loss.item()
+
+        # print('n_fine_samples for training', n_fine_samples)
+        train_err /= n_fine_samples
 
         if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             self.scheduler.step(train_err)
         else:
             self.scheduler.step()
 
-        train_err /= len(train_loader)
-        avg_epoch_loss /= self.n_samples
-        # if self.regularizer:
-        #     avg_lasso_loss /= self.n_samples
-        # else:
-        #     avg_lasso_loss = None
         
         lr = None
         for pg in self.optimizer.param_groups:
             lr = pg["lr"]
-        # if epoch % self.eval_interval == 0:
-        self.log_training(avg_loss=avg_epoch_loss, train_err=train_err, lr=lr)
 
-        return train_err, avg_epoch_loss # , avg_lasso_loss
+        if self._single_model:
+            self.model.eval()
+        else:
+            for idx_adapter, _ in enumerate(self.input_adapters):
+                self.input_adapters[idx_adapter].eval()
+                self.output_adapters[idx_adapter].eval()
+            self.main_fno.eval()
 
-    def log_training(self, avg_loss, train_err, lr): # epoch,
-        self._logger.write({'avg_loss': avg_loss, 'train_err': train_err, 'lr': lr}) # 'Epoch': epoch, 
+        with torch.no_grad():
+            val_loss = 0.
+
+            n_fine_samples = self.n_samples_val
+
+            for dataset_idx, loader in enumerate(val_loader):
+                for idx, sample in enumerate(loader):
+                    loss = self.train_one_batch(idx, sample, training_loss, data_processor[dataset_idx])                    
+                    if torch.isnan(loss).item():
+                        n_fine_samples -= 1
+                        continue
+            
+                    val_loss += loss.item()
+
+            val_loss /=  n_fine_samples
+
+
+        self.log_training(val_loss=val_loss, train_err=train_err, lr=lr)
+
+        return train_err, val_loss # , avg_lasso_loss
+
+    def log_training(self, val_loss, train_err, lr): # epoch,
+        self._logger.write({'val_loss': val_loss, 'train_err': train_err, 'lr': lr}) # 'Epoch': epoch, 
         # self._logger.write('Epoch: {} | avg_loss: {} | train_err: {} | lr: {}'.format(epoch, avg_loss, train_err, lr))
 
 
@@ -262,7 +336,7 @@ class Trainer(object):
         """
         pass
 
-    def train_one_batch(self, idx, sample, training_loss):
+    def train_one_batch(self, idx, sample, training_loss, data_processor = None): # , train_mode = True
         """Run one batch of input through model
            and return training loss on outputs
 
@@ -281,11 +355,12 @@ class Trainer(object):
 
         X, Y, eq_idx = sample 
 
-        self.optimizer.zero_grad(set_to_none=True)
         # if self.regularizer:
         #     self.regularizer.reset()
-        # if self.data_processor is not None:
-        #     sample = self.data_processor.preprocess(sample)
+        
+        if data_processor is not None:
+            X = data_processor.preprocess(X)
+            
         # else:
         #     # load data to device if no preprocessor exists
             
@@ -295,46 +370,49 @@ class Trainer(object):
         #         if torch.is_tensor(v)
         #     }
 
-        if isinstance(Y, torch.Tensor):
-            self.n_samples += Y.shape[0]
-        else:
-            self.n_samples += 1
+        # if isinstance(Y, torch.Tensor):
+        #     self.n_samples += Y.shape[0]
+        # else:
+        #     self.n_samples += 1
 
         if self.mixed_precision:
             with torch.autocast(device_type=self.autocast_device_type):
                 if self._single_model:
                     out = self.model(X)
                 else:
-                    lift_out = self.input_adapters[eq_idx[0].item()](X)
-                    main_out = self.main_fno(lift_out)
-                    out = self.output_adapters[eq_idx[0].item()](main_out)
+                    out = self.input_adapters[eq_idx[0].item()](X)
+                    out = self.main_fno(out)
+                    out = self.output_adapters[eq_idx[0].item()](out)
 
         else:
             if self._single_model:
                 out = self.model(X)
             else:
-                lift_out = self.input_adapters[eq_idx[0].item()](X)
-                main_out = self.main_fno(lift_out)
-                out = self.output_adapters[eq_idx[0].item()](main_out)
+                out = self.input_adapters[eq_idx[0].item()](X)
+                out = self.main_fno(out)
+                out = self.output_adapters[eq_idx[0].item()](out)
         
         # if self.epoch == 0 and idx == 0 and self.verbose and isinstance(out, torch.Tensor):
         #     print(f"Raw outputs of shape {out.shape}")
 
-        if self.data_processor is not None:
-            out, Y = self.data_processor.postprocess(out, Y)
+        if data_processor is not None:
+            out, Y = data_processor.postprocess(out, Y)
 
-        loss = 0.0
+        # loss = 0.0
 
         # print(f'Obtained out mean - {torch.mean(out)}, ref mean - {torch.mean(X)}')
 
         if self.mixed_precision:
             with torch.autocast(device_type=self.autocast_device_type):
-                loss += training_loss(out, X) # torch.nn.functional.mse_loss(out, X) #
+                loss = training_loss(out, Y) # torch.nn.functional.mse_loss(out, X) #
         else:
             # loss += torch.nn.functional.mse_loss(out, Y) # training_loss(out, X)
 
-            loss += training_loss(out, Y)
-        
+            loss = training_loss(out, Y)
+
+        # Heatmap(out[0, 0, 10, ...].cpu().detach().numpy())
+        # del X, Y, out
+        # torch.cuda.empty_cache()           
         # Heatmap(out[0, 0, ...].cpu().detach().numpy())
         
         return loss

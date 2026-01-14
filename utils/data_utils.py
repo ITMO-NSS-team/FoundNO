@@ -5,18 +5,41 @@ import numpy as np
 
 from typing import Tuple, List, Callable
 
+import matplotlib.pyplot as plt
+
 from torch.utils.data import Dataset
 # from torch.utils.data.distributed import DistributedSampler
 
-from utils.domains import Domain
+from .domains import Domain
+
+def Heatmap(Matrix, interval = None, area = ((0, 1), (0, 1)), xlabel = '', ylabel = '', figsize=(8,6), filename = None, title = ''):
+    y, x = np.meshgrid(np.linspace(area[0][0], area[0][1], Matrix.shape[0]), np.linspace(area[1][0], area[1][1], Matrix.shape[1]))
+    fig, ax = plt.subplots(figsize = figsize)
+    plt.xlabel(xlabel)
+    ax.set(ylabel=ylabel)
+    ax.xaxis.labelpad = -10
+    if interval:
+        c = ax.pcolormesh(x, y, np.transpose(Matrix), cmap='RdBu', vmin=interval[0], vmax=interval[1])    
+    else:
+        c = ax.pcolormesh(x, y, np.transpose(Matrix), cmap='RdBu', vmin=min(-abs(np.max(Matrix)), -abs(np.min(Matrix))),
+                          vmax=max(abs(np.max(Matrix)), abs(np.min(Matrix)))) 
+    # set the limits of the plot to the limits of the data
+    ax.axis([x.min(), x.max(), y.min(), y.max()])
+    fig.colorbar(c, ax=ax)
+    plt.title(title)
+    plt.show()
+    if type(filename) != type(None): plt.savefig(filename + '.eps', format='eps')
 
 class SimpleDataset(Dataset):
     '''
     To be replaced, according to preprocessing tools
     '''
     def __init__(self, data: List[torch.Tensor], domain: Domain, inputs: List[List[torch.Tensor]] = None, # coords: List[torch.Tensor],
-                 transform_x: Callable = None, transform_y: Callable = None, ic_ord: int = 1, device: str = 'cuda'): # , is_complex: bool = False
+                 transform_x: Callable = None, transform_y: Callable = None, ic_ord: int = 1, 
+                 incl_t: bool = False, device: str = 'cuda', dataset_index: int = 0): # , is_complex: bool = False
         self._device = device
+        self._incl_t = incl_t
+        self._dataset_index = dataset_index
 
         self._data = [tensor.to(self._device) for tensor in data] # Dimensionality has to be of [N, T, X_1, ...]
         self.check_inputs(inputs)
@@ -25,6 +48,8 @@ class SimpleDataset(Dataset):
 
         self.out_channels = data[0].shape[0]
         self.in_channels = len(inputs[0]) + domain.ndim + ic_ord * self.out_channels
+        if not incl_t:
+            self.in_channels -= 1
 
         print(f'Initializing dataset with {self.in_channels} - input, and {self.out_channels} output channels.')
 
@@ -59,25 +84,25 @@ class SimpleDataset(Dataset):
     def __getitem__(self, index) -> Tuple[torch.Tensor, torch.Tensor, int]:
         outputs = self._data[index]
 
-        repeat_shape = [1, 1, outputs.shape[2],] + [1,] * (outputs.ndim - 3)
+        repeat_shape = [1, outputs.shape[1],] + [1,] * (outputs.ndim - 2)
 
-        input_tensors = [self._domain.get_grid(self._device), self._inputs[index]]
+        input_tensors = [self._domain.get_grid(self._incl_t), self._inputs[index]] # .unsqueeze(0)
 
+        # print(outputs.shape)
         if self._ic_ord > 0:
-            input_tensors.append(outputs[:, :, 0:1, ...].repeat(repeat_shape))
+            input_tensors.append(outputs[:, 0:1, ...].repeat(repeat_shape))
 
         # print('Input tensors type: ', self._domain.get_grid().type(), self._inputs[index].type(), outputs[:, :, 0:1, ...].type())
 
         if self._ic_ord > 1:
-            input_tensors.append((outputs[:, :, 1:2, ...] - outputs[:, :, 0:1, ...]) / self._domain.get_step(device = self._device)) # Move from getitem to init or separate preprocess method.
+            input_tensors.append((outputs[:, 1:2, ...] - outputs[:, 0:1, ...]) / self._domain.get_step(device = self._device)) # Move from getitem to init or separate preprocess method.
         if self._ic_ord > 2:
             warnings.warn('Equation demands more than 3 initial conditions. Their constructor has not yet benn constructed!')
             pass
 
         # Add inputs with forcing or specified boundary conditions
 
-        # for idx, tensor in enumerate(input_tensors):
-        #     print(idx, ': ', tensor.shape)
+        # print(f'Shapes: ', [tensor.shape for tensor in input_tensors])
         inputs = torch.concat(input_tensors, dim = 0) # .permute(*self._permute_ord)
         if self.x_transformer is not None:
             inputs = self.x_transformer(inputs)
@@ -86,4 +111,4 @@ class SimpleDataset(Dataset):
         if self.y_transformer is not None:
             outputs = self.y_transformer(outputs)
 
-        return inputs, outputs, 0
+        return inputs, outputs, self._dataset_index

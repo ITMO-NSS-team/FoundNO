@@ -10,7 +10,7 @@ from neuralop.layers.padding import DomainPadding
 from neuralop.layers.resample import resample
 from neuralop.layers.embeddings import GridEmbedding2D, GridEmbeddingND
 
-from layers.pecoda import PeCODALayer
+from ..layers.pecoda import PeCODALayer
 
 
 class PeCODANO(nn.Module):
