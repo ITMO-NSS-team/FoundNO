@@ -14,15 +14,15 @@ import torch
 
 from neuralop.models import FNO
 
-from utils.training_utils import load_files_hdf5, validate_operator, standartize
+from foundno.utils.training_utils import load_files_hdf5, validate_operator, standartize
 
-from utils.domains import Domain
-from utils.data_utils import SimpleDataset
-from utils.custom_trainer import Trainer, Logger
+from foundno.utils.domains import Domain
+from foundno.utils.data_utils import SimpleDataset
+from foundno.utils.custom_trainer import Trainer, Logger
 
 # from models.pecoda import PeCODANO
-from models.mamba_fno import PostLiftMambaFNO
-from models.localattn_exp import LocalAttnFNO
+from foundno.models.mamba_fno import PostLiftMambaFNO
+from foundno.models.localattn_exp import LocalAttnFNO
 PeCODANO = None
 OPTIMIZER_PARAMS = {'optimizer': "adam", 'lr': 1e-3}
 
