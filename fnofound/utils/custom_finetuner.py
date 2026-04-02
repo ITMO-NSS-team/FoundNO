@@ -47,17 +47,17 @@ class FineTuner(object):
         self.fno_and_proj_model = None
 
     @singledispatchmethod
-    def build_model(self, model):
+    def buildModel(self, model):
         raise NotImplementedError("Cannot declare model with anything, but nn Module or tuple of nn Modules")
     
-    @build_model.register
+    @buildModel.register
     def _(self, model: torch.nn.Module):
         warnings.warn('Building fine-tuning trainer with a single model is not advised.')
         self._single_model = True
         self.model = model
         self.params_to_optimize = [{'params': self.model.parameters()},]
 
-    @build_model.register
+    @buildModel.register
     def _(self, model: tuple): #expect Tuple[List[torch.nn.Module], torch.nn.Module, List[torch.nn.Module]]
         assert len(model) == 3, \
             'Multiple adapter architecture requires sequence of input adapters -> single model -> output adapters'
@@ -83,7 +83,7 @@ class FineTuner(object):
             self.params_to_optimize.append({'params': self.input_adapters[idx_expert_nn].parameters()})
             self.params_to_optimize.append({'params': self.output_adapters[idx_expert_nn].parameters()})
 
-    def build_optimizer(self, 
+    def buildOptimizer(self, 
                         n_dim: int,
                         params_scheduler: dict,
                         params_opt: dict,
@@ -116,7 +116,7 @@ class FineTuner(object):
         else:
             self._logger = logger
 
-    def save_model(self, model_path: Union[str, Tuple[str]]):
+    def saveModel(self, model_path: Union[str, Tuple[str]]):
         if self._single_model:   
             assert isinstance(model_path, str), 'Saving of a single model requires a single path str argument'
             torch.save(obj = self.model, f = model_path, **self._SAVE_LOAD_PARAMS)
@@ -130,14 +130,14 @@ class FineTuner(object):
     def load_model(self, model_path: Union[str, Tuple[str]]):
         if self._single_model:   
             assert isinstance(model_path, str), 'Saving of a single model requires a single path str argument'
-            self.build_model(torch.load(f=model_path, **self._SAVE_LOAD_PARAMS))
+            self.buildModel(torch.load(f=model_path, **self._SAVE_LOAD_PARAMS))
         else:
             assert isinstance(model_path, tuple) and len(model_path) == 3, \
                 'Saving lifting-main part-projection model requires tuple of str arg with len 3'
             self.input_adapters     = torch.load(f = model_path[0], **self._SAVE_LOAD_PARAMS)
             self.fno_and_proj_model = torch.load(f = model_path[1], **self._SAVE_LOAD_PARAMS)
             self.output_adapters    = torch.load(f = model_path[2], **self._SAVE_LOAD_PARAMS)
-            self.build_model((self.input_adapters, self.fno_and_proj_model, self.output_adapters))
+            self.buildModel((self.input_adapters, self.fno_and_proj_model, self.output_adapters))
 
     def load_data(self, file):
         pass

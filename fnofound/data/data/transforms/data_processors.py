@@ -145,6 +145,7 @@ class DefaultDataProcessor(DataProcessor):
         out, data_dict
             postprocessed outputs and data dict
         """
+        # print(self.out_normalizer, self.training)
         if self.out_normalizer and not self.training:
             output = self.out_normalizer.inverse_transform(output)
         return output, data_dict

@@ -255,10 +255,11 @@ def load_files_hdf5(filepaths: List[str], finetune: bool = False, finetune_label
     
     data_samples = []
     for path in filepaths:
-        print(path)
         with h5py.File(path, 'r') as f:
+            print('Reading ', path)
+
             for idx, subset in enumerate(f):
-                
+                print('Sample ', idx,' with f-t label ', f[subset]['info'][finetune_label][()], ' exp: ', finetune)
                 has_conv = f[subset]['info'][finetune_label][()]
                 if has_conv == finetune:
                     inp_sets = [torch.from_numpy(f[subset]['inputs'][channel][()]).view(original_shape) for channel in f[subset]['inputs']]
@@ -278,10 +279,10 @@ def load_files_hdf5(filepaths: List[str], finetune: bool = False, finetune_label
 
                     print(len(inp_sets), len(out_sets))
                     print('Shape:', [inp.shape for inp in inp_sets])
-    
+    print(f'Loaded samples: {len(data_samples)}')
     return data_samples
 
-def validate_operator(operator_class: type, args: List[str]):
+def validateOperator(operator_class: type, args: List[str]):
     if torch.nn.Module not in operator_class.__mro__:
         raise TypeError('Fourier operator has to be a subclass of torch.nn.Module.')
 

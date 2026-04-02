@@ -282,11 +282,14 @@ class UnitGaussianNormalizer(Transform):
         # print(x.shape, self.mean.shape, self.std.shape, self.eps)
         # print('in transform:', x.shape, self.std.shape, self.mean.shape)
         # print(self.std, self.mean)
+        # print('means:', torch.mean(x), torch.mean((x - self.mean) / (self.std + self.eps)))
         return (x - self.mean) / (self.std + self.eps)  # * self.mask)
 
     def inverse_transform(self, x):
         # print('in inverse_transform:', x.shape, self.std.shape, self.mean.shape)
         # print(self.std, self.mean)
+        # print('means:', torch.mean(x), torch.mean(x * (self.std + self.eps) + self.mean))
+
         return x * (self.std + self.eps) + self.mean  # * self.mask)
 
     def forward(self, x):
@@ -350,7 +353,7 @@ class UnitGaussianNormalizer(Transform):
 
         assert ('mean' in loaded_dict.keys()) and ('std' in loaded_dict.keys()), 'Missing mean and std from loaded norm. dict'
         self.mean = loaded_dict['mean']
-        self.std = loaded_dict['std']
+        self.std  = loaded_dict['std']
 
 class DictUnitGaussianNormalizer(DictTransform):
     """DictUnitGaussianNormalizer composes
