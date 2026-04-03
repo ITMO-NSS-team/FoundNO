@@ -33,7 +33,7 @@ fi
 
 pip install pandas
 pip install packaging
-pip install torch==2.4.0+cu$cuda_prime_version torchvision==0.19.0+cu$cuda_prime_version torchaudio==2.4.0+cu$cuda_prime_version --index-url https://download.pytorch.org/whl/cu$cuda_prime_version
+pip install torch==2.4.0+cu118 torchvision==0.19.0+cu118 torchaudio==2.4.0+cu118 --index-url https://download.pytorch.org/whl/cu118
 pip install neuraloperator==2.0.0
 pip install zencfg
 
