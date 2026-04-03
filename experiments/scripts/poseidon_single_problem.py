@@ -52,16 +52,16 @@ def balanced_rel_l2_loss(pred: torch.Tensor, target: torch.Tensor, zero_threshol
 
 OPTIMIZER_PARAMS = {'optimizer': "adamw", 'lr': 1e-4, "weight_decay": 1e-5, "loss": MSELoss} #balanced_rel_l2_loss} adamw
 
-SCHEDULER_PARAMS = {'scheduler': 'reducelr', 'patience': 15, 'factor': 0.5, 'min_lr': 1e-6}
+SCHEDULER_PARAMS = {'scheduler': 'reducelr', 'patience': 4, 'factor': 0.5, 'min_lr': 1e-6}
 
 ARGS = {'fno': {'model' : FNO,
                 'params' : {'hidden_channels': 44,
                             'n_layers': 5,
                             'n_modes': [6, 40, 40]}},
         'mambafno': {'model' : PostLiftMambaFNO3D,
-                     'params' : {'modes': (64,64),
-                                 'width': 32,
-                                 'n_layers': 4,
+                     'params' : {'modes': (6, 60, 60),
+                                 'width': 44,
+                                 'n_layers': 5,
                                  'use_mamba_kwargs': None,
                                  'mamba_fallback_kernel':9}},
         'localattnfno': {'model' : LocalAttnFNO,
@@ -136,6 +136,8 @@ if __name__ == "__main__":
     parser.add_argument("--model", default = 'fno') # , type = ascii
     parser.add_argument("--epochs_max", default = 1e5, type = int)
 
+    parser.add_argument("--data_location", default='')
+
     parser.add_argument("--single_model_location", default = '') # , type = ascii
     parser.add_argument("--lift_model_location",   default = '') # , type = ascii
     parser.add_argument("--main_model_location",   default = '') # , type = ascii
@@ -146,13 +148,14 @@ if __name__ == "__main__":
     # data_dir = '/media/mikemaslyaev/Data/Poseidon_data/CombinedDatasets'
     # filepaths = sorted(glob.glob(os.path.join(data_dir, '*.nc')))
 
+    # if len(args.data_location):
     filepaths = ['/media/mikemaslyaev/Data/Poseidon_data/NS_SINES/velocity_0.nc',
-                 '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_2.nc',
-                 '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_3.nc',
-                 '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_4.nc',
-                 '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_5.nc',
+                '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_2.nc',
+                '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_3.nc',
+                '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_4.nc',
+                '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_5.nc',
                 #  '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_6.nc',
-                 '/media/mikemaslyaev/Data/Poseidon_data/NS_SINES/velocity_7.nc',]
+                '/media/mikemaslyaev/Data/Poseidon_data/NS_SINES/velocity_7.nc',]
 
     print(f'Loading data from filepaths: {filepaths}')
 
@@ -176,6 +179,8 @@ if __name__ == "__main__":
         if channels == 5:
             cur_forcings = data[:, (0, 3, 4)]
             cur_solutions = data[:, (1, 2)]
+
+        del data
 
         if fidx == 0:
             solutions = cur_solutions
@@ -205,9 +210,9 @@ if __name__ == "__main__":
 
     train_max_idx = int(solutions.shape[0] * 0.8)
     train_dataset = NDDataset(solutions[:train_max_idx], extra_channels = [forcings[:train_max_idx],], 
-                                grids = None, dataset_index=0) # [X_grid, Y_grid] XX, YY
+                              grids = None, dataset_index=0) # [X_grid, Y_grid] XX, YY
     val_dataset   = NDDataset(solutions[train_max_idx:], extra_channels = [forcings[train_max_idx:],],
-                                grids = None, dataset_index=0) # [X_grid, Y_grid] XX, YY
+                              grids = None, dataset_index=0) # [X_grid, Y_grid] XX, YY
 
     for idx, sample in enumerate(train_dataset):
         sample_x = sample['x'].to('cuda')

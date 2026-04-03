@@ -1,0 +1,29 @@
+FROM nvidia/cuda:11.8.0-runtime-ubuntu20.04
+
+WORKDIR /workspace
+
+#RUN apt-get update && apt-get install -y \
+#    python3 \
+#    python3-pip \
+#    git \
+#    wget \
+#    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2
+RUN pip install netCDF4
+RUN pip install -U "huggingface_hub"
+
+RUN ln -s /usr/bin/python3 /usr/bin/python
+
+COPY install_dependencies.sh .
+COPY run_inference.sh .
+COPY multiphys_pretrain.py .
+COPY fnofound ./fnofound
+COPY experiments ./experiments
+
+RUN mkdir data/
+
+RUN chmod +x install_dependencies.sh
+RUN ./install_dependencies.sh
+
+CMD ["/bin/bash"]
