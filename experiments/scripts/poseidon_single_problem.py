@@ -7,7 +7,13 @@ from typing import List, Tuple
 import glob
 import sys
 
-sys.path.append('.')
+# sys.path.append('.')
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import torch
 
@@ -130,6 +136,37 @@ def getLoaderChannels(dataloader) -> Tuple[int, int]:
     return in_channels, out_channels
 
 
+def resolve_data_files(data_location: str) -> List[str]:
+    if not data_location:
+        return ['/media/mikemaslyaev/Data/Poseidon_data/NS_SINES/velocity_0.nc',
+                '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_2.nc',
+                '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_3.nc',
+                '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_4.nc',
+                '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_5.nc',
+                '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_6.nc',
+                '/media/mikemaslyaev/Data/Poseidon_data/NS_SINES/velocity_7.nc']
+
+    candidate_paths = []
+    for chunk in data_location.split(','):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if any(symbol in chunk for symbol in ['*', '?', '[']):
+            candidate_paths.extend(glob.glob(chunk, recursive=True))
+        elif os.path.isdir(chunk):
+            candidate_paths.extend(glob.glob(os.path.join(chunk, '**', '*.nc'), recursive=True))
+        elif os.path.isfile(chunk):
+            candidate_paths.append(chunk)
+
+    filepaths = sorted({os.path.abspath(path) for path in candidate_paths if path.endswith('.nc')})
+    if not filepaths:
+        raise FileNotFoundError(
+            f'No .nc files were found for --data_location={data_location!r}. '
+            'Pass a directory, a glob like /kaggle/input/my-dataset/**/*.nc.'
+        )
+    return filepaths
+
+
 if __name__ == "__main__":
     print(os.path.dirname(__file__))
     parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -147,17 +184,19 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # data_dir = '/media/mikemaslyaev/Data/Poseidon_data/CombinedDatasets'
-    # filepaths = sorted(glob.glob(os.path.join(data_dir, '*.nc')))
+    # # data_dir = '/media/mikemaslyaev/Data/Poseidon_data/CombinedDatasets'
+    # # filepaths = sorted(glob.glob(os.path.join(data_dir, '*.nc')))
+    #
+    # # if len(args.data_location):
+    # filepaths = ['/media/mikemaslyaev/Data/Poseidon_data/NS_SINES/velocity_0.nc',
+    #              '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_2.nc',
+    #              '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_3.nc',
+    #              '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_4.nc',
+    #              '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_5.nc',
+    #              '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_6.nc',
+    #              '/media/mikemaslyaev/Data/Poseidon_data/NS_SINES/velocity_7.nc', ]
 
-    # if len(args.data_location):
-    filepaths = ['/media/mikemaslyaev/Data/Poseidon_data/NS_SINES/velocity_0.nc',
-                 '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_2.nc',
-                 '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_3.nc',
-                 '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_4.nc',
-                 '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_5.nc',
-                 '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_6.nc',
-                 '/media/mikemaslyaev/Data/Poseidon_data/NS_SINES/velocity_7.nc', ]
+    filepaths = resolve_data_files(args.data_location)
 
     print(f'Loading data from filepaths: {filepaths}')
 
@@ -292,6 +331,8 @@ if __name__ == "__main__":
     now = datetime.now()
 
     trainer = Trainer()
+    os.makedirs(os.path.join(parent_dir, 'logs'), exist_ok=True)
+    os.makedirs(os.path.join(parent_dir, 'pretrained_models'), exist_ok=True)
     logger_filename = os.path.join(parent_dir, 'logs',
                                    f'log_{EXPNAME}_{args.model}_lift_{now.day}_{now.hour}_{now.minute}.log')
     trainer.setLogger(filename=logger_filename)
