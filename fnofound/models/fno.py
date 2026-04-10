@@ -21,11 +21,12 @@ warnings.filterwarnings("once", category=UserWarning)
 from neuralop.layers.embeddings import GridEmbeddingND, GridEmbedding2D
 from neuralop.layers.spectral_convolution import SpectralConv
 from neuralop.layers.padding import DomainPadding
-from neuralop.layers.fno_block import FNOBlocks
+
 from neuralop.layers.channel_mlp import ChannelMLP
 from neuralop.layers.complex import ComplexValued
 from neuralop.models.base_model import BaseModel
 
+from fnofound.layers.fno_block import FNOBlocks
 
 class FNO(BaseModel, name="FNO"):
     """N-Dimensional Fourier Neural Operator. The FNO learns a mapping between

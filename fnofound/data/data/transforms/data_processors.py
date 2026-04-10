@@ -92,7 +92,7 @@ class DefaultDataProcessor(DataProcessor):
         self.device = device
         return self
 
-    def preprocess(self, data_dict, batched=True):
+    def preprocess(self, data_dict, training, batched=True):
         """preprocess a batch of data into the format
         expected in model's forward call
 
@@ -117,7 +117,7 @@ class DefaultDataProcessor(DataProcessor):
 
         if self.in_normalizer is not None:
             x = self.in_normalizer.transform(x)
-        if self.out_normalizer is not None and self.training:
+        if self.out_normalizer is not None and training:
             y = self.out_normalizer.transform(y)
 
         data_dict["x"] = x
@@ -125,7 +125,7 @@ class DefaultDataProcessor(DataProcessor):
 
         return data_dict
 
-    def postprocess(self, output, data_dict):
+    def postprocess(self, output, data_dict, training):
         """postprocess model outputs and data_dict
         into format expected by training or val loss
 
@@ -146,7 +146,7 @@ class DefaultDataProcessor(DataProcessor):
             postprocessed outputs and data dict
         """
         # print(self.out_normalizer, self.training)
-        if self.out_normalizer and not self.training:
+        if self.out_normalizer and not training:
             output = self.out_normalizer.inverse_transform(output)
         return output, data_dict
 

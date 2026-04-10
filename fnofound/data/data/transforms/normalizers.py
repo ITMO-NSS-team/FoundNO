@@ -116,17 +116,17 @@ class Normalizer(Transform):
     def inverse_transform(self, data):
         return (data * (self.std + self.eps)) + self.mean
 
-    def to(self, device):
-        self.mean = self.mean.to(device)
-        self.std = self.std.to(device)
-
     def cuda(self):
         self.mean = self.mean.cuda()
-        self.std = self.std.cuda()
+        self.std  = self.std.cuda()
 
     def cpu(self):
         self.mean = self.mean.cpu()
-        self.std = self.std.cpu()
+        self.std  = self.std.cpu()
+
+    def to(self, *args, **kwargs):
+        self.mean = self.mean.to(*args, **kwargs)
+        self.std  = self.std.to(*args, **kwargs)
 
 
 class UnitGaussianNormalizer(Transform):
@@ -209,7 +209,7 @@ class UnitGaussianNormalizer(Transform):
 
         self.ndim = data_batch.ndim  # Note this includes batch-size
 
-        prev_mean = self.mean;
+        prev_mean = self.mean
         prev_numel = 0
         self.n_elements, self.mean = iterativeMean(data_batch, self.mask, self.mean, 0, dim=self.dim)
         # print(f'after iterativeMean: tensors of means {self.mean.shape} & stds {self.std.shape}')
@@ -306,11 +306,11 @@ class UnitGaussianNormalizer(Transform):
         self.std = self.std.cpu()
         return self
 
-    def to(self, device):
-        self.mask.to(device)
-        self.mean = self.mean.to(device)
-        self.std = self.std.to(device)
-        return self
+    def to(self, *args, **kwargs):
+        if self.mask is not None: 
+            self.mask = self.mask.to(*args, **kwargs)
+        self.mean = self.mean.to(*args, **kwargs)
+        self.std  = self.std.to(*args, **kwargs)
 
     @classmethod
     def from_dataset(cls, dataset, dim=None, keys=None, mask=None):

@@ -4,6 +4,12 @@ from tqdm import tqdm
 import time
 
 import torch
+try:
+    import tensordict as td
+    TENSORDICT_ON = True
+except ImportError:
+    TENSORDICT_ON = False
+
 import torch.nn.functional as F
 import numpy as np
 
@@ -33,6 +39,25 @@ def Heatmap(Matrix, interval = None, area = ((0, 1), (0, 1)), xlabel = '', ylabe
     plt.title(title)
     plt.show()
     if type(filename) != type(None): plt.savefig(filename + '.eps', format='eps')
+
+
+def syncSuffle(*input: torch.Tensor):
+    """
+    Random shuffle of tensors with reduced memory costs. 
+    """
+    n_samples = input[0].shape[0]
+    for tensor in input:
+        assert tensor.shape[0] == n_samples, f'Mismatching numbers of samples: {n_samples} vs {tensor.shape[0]}!'
+
+    for i in range(0, input[0].shape[0]):
+        j = np.random.randint(0, input[0].shape[0])
+        for tensor_idx in range(len(input)):
+            temp = input[tensor_idx][i].clone()
+            input[tensor_idx][i] = input[tensor_idx][j].clone()
+            input[tensor_idx][j] = temp
+    
+    return input
+
 
 class SimpleDataset(Dataset):
     '''
@@ -273,7 +298,8 @@ class Dataset2DAndTWithMasks(Dataset):
 
 class NDDataset(Dataset):
     def __init__(self, pred_fields: torch.Tensor, extra_channels: List[torch.Tensor], grids: List[torch.Tensor] = None,
-                 dataset_index: int = 0, device: str = 'cuda'):
+                 dataset_index: int = 0, device: str = 'cuda', use_mem_mapped: bool = False, mem_mapped_kwargs: dict = None):
+        self._use_mem_mapped = use_mem_mapped
         self._dataset_index = dataset_index
         
         self._device = device
@@ -293,8 +319,14 @@ class NDDataset(Dataset):
             case _:
                 raise ValueError("Dimensionality of data does not match problem: either less than 3, or higher than 6.")
 
-        self._pred_fields = pred_fields  # [N, C, T, H, W]
-        self._extra_channels = extra_channels
+        if self._use_mem_mapped and TENSORDICT_ON:
+            self._pred_fields = td.MemoryMappedTensor.from_tensor(pred_fields, **mem_mapped_kwargs)
+            self._extra_channels = td.MemoryMappedTensor.from_tensor(extra_channels, **mem_mapped_kwargs)
+        else:
+            self._pred_fields = pred_fields  # [N, C, T, H, W]
+            self._extra_channels = extra_channels
+
+
         if grids is None or (isinstance(grids, list) and len(grids) == 0):
             self._grids_used = False
             self._grids = []

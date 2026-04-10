@@ -3,6 +3,8 @@ import warnings
 import logging
 import json
 
+from pathlib import Path
+
 import math
 
 from functools import singledispatchmethod
@@ -61,7 +63,11 @@ class Trainer(object):
 
     _SAVE_LOAD_PARAMS = {}
 
-    def __init__(self):
+    def __init__(self, backup_loc: str = None):
+        if backup_loc is None:
+            backup_loc = os.path.join(os.getcwd(), 'backup')
+        self._backup_loc = backup_loc
+
         if not torch.cuda.is_available():
             raise RuntimeError('Due to high expected load, only cuda must be supported.')
         self.device = 'cuda' # Using NCCL backend
@@ -130,6 +136,8 @@ class Trainer(object):
 
         if trainer_loss is None:
             self._training_loss = LpLoss(d=n_dim)
+        else:
+            self._training_loss = trainer_loss
 
     def to(self, device: str = 'cuda'):
         self.device = device
@@ -181,26 +189,15 @@ class Trainer(object):
     def loadModel(self, model_path: Union[str, Tuple[None, str, Tuple[str]]]):
         model = basicLoadModel(model_path, self._SAVE_LOAD_PARAMS)
         if isinstance(model, tuple):
-            # if isinstance(model, tuple):
+            self._single_model = False
+
             self.input_adapters = model[0]
             self.main_fno = model[1]
             self.output_adapters = model[2]
         else:
             self.model = model
-
-        # if self._single_model:   
-        #     assert isinstance(model_path, str), 'Saving of a single model requires a single path str argument'
-        #     self.model = torch.load(f=model_path, **self._SAVE_LOAD_PARAMS)
-        # else:
-        #     assert isinstance(model_path, tuple) and len(model_path) == 3, \
-        #         'Saving lifting-main part-projection model requires tuple of str arg with len 3'
-        #     self.input_adapters     = torch.load(f = model_path[0], **self._SAVE_LOAD_PARAMS)
-        #     self.fno_and_proj_model = torch.load(f = model_path[1], **self._SAVE_LOAD_PARAMS)
-        #     self.output_adapters    = torch.load(f = model_path[2], **self._SAVE_LOAD_PARAMS)
-
-    # def loadModel(self, model_path):
-    #     # Implement loading data from pickle
-    #     pass
+            self.params_to_optimize = [{'params': self.model.parameters()},]
+            self._single_model = True
 
     def loadData(self, file):
         pass
@@ -259,7 +256,7 @@ class Trainer(object):
             return self.input_adapters, self.main_fno, self.output_adapters
 
     def trainSingleEpoch(self, epoch, train_loader: List[DataLoader], val_loader: List[DataLoader], 
-                           training_loss, data_processor: List[DataProcessor] = [None,]):
+                         training_loss, data_processor: List[DataProcessor] = [None,], training: bool = True):
         """trainSingleEpoch trains self.model on train_loader
         for one epoch and returns training metrics
 
@@ -286,7 +283,6 @@ class Trainer(object):
                 self.input_adapters[idx].train()
                 self.output_adapters[idx].train()
 
-
         if data_processor[0] is not None:
             for idx in range(len(data_processor)):
                 data_processor[idx].train()
@@ -305,8 +301,8 @@ class Trainer(object):
             for idx, sample in enumerate(loader):
                 self.optimizer.zero_grad()
 
-                # print('-'*10 + ' For training dataset: ' + '-'*10)
-                loss = self.trainOneBatch(epoch, sample, training_loss, data_processor[dataset_idx])
+                loss = self.trainOneBatch(epoch, sample, training_loss, 
+                                          data_processor[dataset_idx], training = True)
                 
                 if torch.isnan(loss).item():
                     print('loss is NaN')
@@ -339,18 +335,17 @@ class Trainer(object):
                 self.output_adapters[idx_adapter].eval()
             self.main_fno.eval()
 
-        # print(f'----------------------------- REACHED VAL -----------------------------')
         with torch.no_grad():
             val_loss = 0.
 
             n_fine_samples = self.n_samples_val
-            # print('-'*10 + ' For validation dataset: ' + '-'*10)
 
             for dataset_idx, loader in enumerate(val_loader):
                 if (isinstance(loader, dict)):
                     for res, resloader in loader.items():
                         for idx, sample in enumerate(resloader):
-                            loss = self.trainOneBatch(epoch, sample, training_loss, data_processor[dataset_idx])                    
+                            loss = self.trainOneBatch(epoch, sample, training_loss, 
+                                                      data_processor[dataset_idx], training=False)                    
                             if torch.isnan(loss).item():
                                 n_fine_samples -= 1
                                 continue
@@ -358,7 +353,8 @@ class Trainer(object):
                             val_loss += loss.item()                        
                 else:
                     for idx, sample in enumerate(loader):
-                        loss = self.trainOneBatch(epoch, sample, training_loss, data_processor[dataset_idx])                    
+                        loss = self.trainOneBatch(epoch, sample, training_loss,
+                                                  data_processor[dataset_idx], training=False)                    
                         if torch.isnan(loss).item():
                             n_fine_samples -= 1
                             continue
@@ -370,20 +366,31 @@ class Trainer(object):
 
         self.logTraining(val_loss=val_loss, train_err=train_err, lr=lr)
 
-        return train_err, val_loss # , avg_lasso_loss
+        return train_err, val_loss
 
-    def logTraining(self, val_loss, train_err, lr): # epoch,
-        self._logger.write({'val_loss': val_loss, 'train_err': train_err, 'lr': lr}) # 'Epoch': epoch, 
-        # self._logger.write('Epoch: {} | avg_loss: {} | train_err: {} | lr: {}'.format(epoch, avg_loss, train_err, lr))
+
+    def logTraining(self, val_loss, train_err, lr):
+        self._logger.write({'val_loss': val_loss, 'train_err': train_err, 'lr': lr})
 
 
     def onEpochStart(self, *args, **kwargs):
         """
         Stub for implementing additional logick!
         """
-        pass
+        directory = Path(self._backup_loc)
+        directory.mkdir(parents=True, exist_ok=True)
 
-    def trainOneBatch(self, idx, sample, training_loss, data_processor = None): # , train_mode = True
+        if self._single_model:
+            self.saveModel(os.path.join(self._backup_loc, 'reserve_single_model.pt'))
+        else:
+            files_adap = [os.path.join(self._backup_loc, f'reserve_adapter_{i}.pt') for i in range(len(self.model[0]))]
+            files_proj = [os.path.join(self._backup_loc, f'reserve_proj_{i}.pt') for i in range(len(self.model[2]))]
+            file_core  =  os.path.join(self._backup_loc, f'reserve_core.pt')
+
+            self.saveModel((files_adap, file_core, files_proj))
+
+
+    def trainOneBatch(self, idx, sample, training_loss, data_processor = None, training: bool = False):
         """Run one batch of input through model
            and return training loss on outputs
 
@@ -416,7 +423,7 @@ class Trainer(object):
 
         if data_processor is not None:
             if isinstance(sample, dict):
-                sample = data_processor.preprocess(sample) # X: 
+                sample = data_processor.preprocess(sample, training = training)
             else:
                 warnings.warn('Possibly, incorrect type of model input')
 
@@ -428,30 +435,9 @@ class Trainer(object):
             for channel in range(sample['y'].shape[1]):
                 Heatmap(sample['y'][0, channel, -5, ...].cpu().detach().numpy(), title=f'Reference: channel {channel}')
 
-        # X, Y, eq_idx = sample  # X: [B, CX, T, X ...], Y: [B, CY, T, X ...]
-
-        # print('X', X, 'Y', Y, 'eq_idx', eq_idx)
-        # if self.regularizer:
-        #     self.regularizer.reset()
-        
-        # if data_processor is not None:
-            # X = sample["x"] # data_processor.preprocess(X) # X: 
-            
-        # else:
-        #     # load data to device if no preprocessor exists
-            
-        #     sample = {
-        #         k: v.to(self.device)
-        #         for k, v in sample.items()
-        #         if torch.is_tensor(v)
-        #     }
-
-        # if isinstance(Y, torch.Tensor):
-        #     self.n_samples += Y.shape[0]
-        # else:
-        #     self.n_samples += 1
 
         if self.mixed_precision:
+            raise NotImplementedError('No mixed precision functionality implemented!')
             with torch.autocast(device_type=self.autocast_device_type):
                 if self._single_model:
                     out = self.model(sample["x"])
@@ -468,36 +454,29 @@ class Trainer(object):
                 out = self.main_fno(out)
                 out = self.output_adapters[sample["eq_idx"][0].item()](out)
         
-        # if self.epoch == 0 and idx == 0 and self.verbose and isinstance(out, torch.Tensor):
-        #     print(f"Raw outputs of shape {out.shape}")
-
-        # print(f'In trainOneBatch: before preprocessor {torch.mean(out), torch.std(out)}')
-        
         if idx == HMP_idx and HEATMAPS:    
             for channel in range(out.shape[1]):
                 Heatmap(out[0, channel, -5, ...].cpu().detach().numpy(), title=f'Model output: channel {channel} before norm')
 
         if data_processor is not None:
-            out, sample = data_processor.postprocess(out, sample)
-
-        # loss = 0.0
-
-        # print(f'Obtained out mean - {torch.mean(out)}, ref mean - {torch.mean(X)}')
+            out, sample = data_processor.postprocess(out, sample, training = training)
 
         if idx == HMP_idx and HEATMAPS:    
             for channel in range(out.shape[1]):
                 Heatmap(out[0, channel, -5, ...].cpu().detach().numpy(), title=f'Model output: channel {channel}')
                 Heatmap(torch.abs(out[0, channel, -5, ...] - sample["y"][0, channel, -5, ...]).cpu().detach().numpy(),
                         title = f'Diff.: channel {channel}') 
-                # torch.nn.functional.mse_loss(out, X) #
+
+        if "mask" in sample.keys():
+            mask = sample["mask"]
+        else:
+            mask = None
 
         if self.mixed_precision:
             with torch.autocast(device_type=self.autocast_device_type):
-                loss = training_loss(out, sample["y"]) # torch.nn.functional.mse_loss(out, X) #
+                loss = training_loss(out, sample["y"], mask)
         else:
-            # loss += torch.nn.functional.mse_loss(out, Y) # training_loss(out, X)
-            # print(f'shapes for loss {sample["x"].shape} -> {out.shape} & {sample["y"].shape}')
-            loss = training_loss(out, sample["y"])
+            loss = training_loss(out, sample["y"], mask)
         
         return loss
 

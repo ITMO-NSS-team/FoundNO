@@ -243,6 +243,30 @@ class LpLoss(object):
     def __call__(self, y_pred, y, **kwargs):
         return self.rel(y_pred, y)
     
+class BalancedRelL2Loss(object):
+    def __init__(self, eps: float = 1e-6, weights: np.ndarray = None):
+        self._eps = eps
+        self._weights = None
+
+    def __call__(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None, 
+                 *args, **kwargs):
+        total_loss = torch.tensor(0.0, device=pred.device); C = pred.shape[1]
+
+        if self._weights is None:
+            weights = torch.ones(C, device=pred.device)
+
+        for c in range(C):
+            p = pred[:, c:c+1]
+            t = target[:, c:c+1]
+            if mask is not None:
+                p = p * mask
+                t = t * mask
+
+            total_loss += weights[c] * torch.norm((p - t)) / (torch.norm(t) + self._eps)
+
+        return total_loss
+    
+
 def standartize(matrix: np.ndarray):
     if np.isclose(torch.std(matrix).item(), 0.):
         return matrix

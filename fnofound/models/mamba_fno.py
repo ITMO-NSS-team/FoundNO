@@ -53,6 +53,7 @@ MambaClass = None
 try:
     # common package name
     import mamba_ssm as mamba_pkg
+    print("Imported correct mamba")
     if hasattr(mamba_pkg, "Mamba"):
         MambaClass = mamba_pkg.Mamba
         MAMBA_AVAILABLE = True
@@ -324,7 +325,7 @@ class PostLiftMambaFNO(FNO):
                  use_mamba_kwargs=None,
                  mamba_fallback_kernel=9,
                  padding=8,
-                 use_mlp=False):
+                 use_mlp=True):
         """
         A compact FNO that runs the standard lifting, then a Mamba/SSM processor across spatial axis,
         then continues with FNO spectral blocks and projection.
@@ -334,7 +335,11 @@ class PostLiftMambaFNO(FNO):
                          in_channels=in_channels,
                          out_channels=out_channels,
                          padding=padding,
-                         use_mlp=use_mlp,
+                         factorization='tucker',
+                         rank=0.05,
+                         implementation='factorized',                         
+                         use_channel_mlp=use_mlp,
+                         channel_mlp_dropout = 0.1,
                          n_layers=n_layers)
 
         # post-lift processor (Mamba or fallback)
