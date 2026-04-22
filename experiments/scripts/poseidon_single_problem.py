@@ -12,7 +12,7 @@ sys.path.append('.')
 
 import torch
 
-from neuralop.models import FNO
+from neuralop.models import UNO, FNO
 # from fnofound.models.fno import FNO
 
 from fnofound.utils.training_utils import load_files_hdf5, validateOperator
@@ -20,7 +20,7 @@ from fnofound.utils.training_utils import load_files_hdf5, validateOperator
 from fnofound.utils.domains import Domain
 from fnofound.utils.data_utils import SimpleDataset, NDDataset, syncSuffle
 from fnofound.utils.custom_trainer import Trainer, Logger
-from fnofound.utils.training_utils import BalancedRelL2Loss
+from fnofound.utils.training_utils import BalancedRelL2Loss, FourierHFLoss
 
 from fnofound.models.pecoda import PeCODANO
 from fnofound.models.mamba_fno import PostLiftMambaFNO3D, PostLiftMambaLifting
@@ -33,8 +33,6 @@ from fnofound.data.data.transforms.data_processors import DefaultDataProcessor
 from neuralop.layers.channel_mlp import ChannelMLP
 
 import xarray as xr
-from torch.nn import MSELoss
-
 
 def balanced_rel_l2_loss(pred: torch.Tensor, target: torch.Tensor, zero_threshold: float = 1e-6, eps: float = 1e-6):
     total_loss = 0.0
@@ -52,24 +50,30 @@ def balanced_rel_l2_loss(pred: torch.Tensor, target: torch.Tensor, zero_threshol
     return total_loss / C if C > 0 else torch.tensor(0.0, device=pred.device)
 
 
-OPTIMIZER_PARAMS = {'optimizer': "adamw", 'lr': 1e-3, "weight_decay": 1e-5, "loss": MSELoss} #balanced_rel_l2_loss} adamw
+OPTIMIZER_PARAMS = {'optimizer': "adamw", 'lr': 1e-3, "weight_decay": 1e-5} #balanced_rel_l2_loss} adamw
 
+#OPTIMIZER_PARAMS = {'optimizer': 'lbfgs', 'lr': 1e-1}
 SCHEDULER_PARAMS = {'scheduler': 'reducelr', 'patience': 8, 'factor': 0.5, 'min_lr': 1e-6}
 
-ARGS = {'fno': {'model' : FNO,
-                'params' : {'hidden_channels': 44,
+ARGS = {'fno': {'model' : UNO,
+                'params' : {'hidden_channels': 16,
                             'n_layers': 5,
-                            'n_modes': [6, 40, 40]}},
+                            'uno_n_modes': [[20, 40, 40],]*5,
+                            'uno_out_channels': [16, 32, 32, 32, 16],
+                            'uno_scalings': [[1.0,1.0,1.0], [0.5,0.5,0.5], [1.,1.,1.], [1.,1.,1.], [2.,2.,2.]],
+                            'non_linearity': torch.nn.functional.gelu,
+                            'horizontal_skips_map':{4:0, 3:1},
+			    'channel_mlp_skip': "linear"}},
         'mambafno': {'model' : PostLiftMambaFNO3D,
-                     'params' : {'modes': (6, 40, 40),
-                                 'width': 34,
-                                 'n_layers': 3,
+                     'params' : {'modes': (20, 40, 40),
+                                 'width': 65,
+                                 'n_layers': 4,
                                  'use_mamba_kwargs': None,
                                  'mamba_fallback_kernel':9}},
         'localattnfno': {'model' : LocalAttnFNO,
                          'params' : {'width': 64,
                                      'n_local_layers': 2,
-                                     'n_heads': 4, 
+                                     'n_heads': 4,
                                      'window_size': 127}},
         'pecoda': {'model' : PeCODANO,
                    'params' : {'hidden_variable_codimension': 16,
@@ -147,10 +151,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     
-    # data_dir = '/media/mikemaslyaev/Data/Poseidon_data/CombinedDatasets'
-    # filepaths = sorted(glob.glob(os.path.join(data_dir, '*.nc')))
 
-    # if len(args.data_location):
     filepaths = ['/media/mikemaslyaev/Data/Poseidon_data/NS_SINES/velocity_0.nc',]
                 #  '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_2.nc',
                 #  '/media/mikemaslyaev/Data/Poseidon_data/NS_GAUSS/velocity_3.nc',
@@ -170,7 +171,7 @@ if __name__ == "__main__":
 
     for fidx, filepath in enumerate(filepaths):
         print(f'Loading dataset from {filepath}')
-        sample_max = 1500
+        sample_max = -1
 
         channels, data = loadNcdfData(filepath, dtype = torch.float32)
         data = data[:sample_max]
@@ -259,7 +260,6 @@ if __name__ == "__main__":
                     for data_idx, loader in enumerate(train_dataloaders):
                         in_channels, _ = getLoaderChannels(loader)
                         # in_channels = set.in_channels
-                        # key =
                         out_channels = model_selection['params'][idx]['hidden_channels']
                         liftings.append(submodel(in_channels=in_channels,
                                                 out_channels=out_channels,
@@ -312,7 +312,9 @@ if __name__ == "__main__":
     if SCHEDULER_PARAMS['scheduler'] == 'cosine':
         SCHEDULER_PARAMS['max_cosine_lr_epochs'] = args.epochs_max
 
-    loss = BalancedRelL2Loss()
+    loss1 = BalancedRelL2Loss()
+    loss2 = FourierHFLoss()
+    loss = [loss1, loss2]
     trainer.buildOptimizer(n_dim = 3,
                            params_scheduler = SCHEDULER_PARAMS,
                            params_opt = OPTIMIZER_PARAMS,

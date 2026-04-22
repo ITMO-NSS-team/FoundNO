@@ -22,7 +22,7 @@ def set_scheduler(args: dict, optimizer : torch.optim.Optimizer):
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=args['patience'], 
                                                    verbose=True, min_lr=args['min_lr'], factor=args['factor'])
     elif args['scheduler'] == 'cosine':
-        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args['max_cosine_lr_epochs'], eta_min=args['max_cosine_lr_epochs'])
+        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args['max_cosine_lr_epochs'], eta_min=0)#  args['max_cosine_lr_epochs'])
     else:
         scheduler = None
     return scheduler
@@ -46,4 +46,7 @@ def set_optimizer(args: dict, parameters: List[dict]):
         optimizer = optim.AdamW(parameters, lr=args['lr'], weight_decay=args['weight_decay'])
     elif args['optimizer'] == "galore_adamw":
         optimizer = GaLoreAdamW()
+    elif args['optimizer'] == "lbfgs":
+        optimizer = optim.LBFGS(parameters, lr=args['lr'])
+    
     return optimizer

@@ -320,12 +320,14 @@ class NDDataset(Dataset):
                 raise ValueError("Dimensionality of data does not match problem: either less than 3, or higher than 6.")
 
         if self._use_mem_mapped and TENSORDICT_ON:
-            self._pred_fields = td.MemoryMappedTensor.from_tensor(pred_fields, **mem_mapped_kwargs)
-            self._extra_channels = td.MemoryMappedTensor.from_tensor(extra_channels, **mem_mapped_kwargs)
+            self._pred_fields = td.MemoryMappedTensor.from_tensor(pred_fields) # , **mem_mapped_kwargs
+            self._extra_channels = [td.MemoryMappedTensor.from_tensor(channel) for channel in extra_channels] # , **mem_mapped_kwargs
+            self._tensor_prep_func = lambda x: x.clone()
+
         else:
             self._pred_fields = pred_fields  # [N, C, T, H, W]
             self._extra_channels = extra_channels
-
+            self._tensor_prep_func = lambda x: x
 
         if grids is None or (isinstance(grids, list) and len(grids) == 0):
             self._grids_used = False
@@ -348,9 +350,9 @@ class NDDataset(Dataset):
         return self.B
 
     def __getitem__(self, idx):
-        field = self._pred_fields[idx]   # [C, T, ...]
-        
-        extras = [channel[idx] for channel in self._extra_channels]    # all channels are like [C, T, ...]
+        field = self._tensor_prep_func(self._pred_fields[idx])   # [C, T, ...]
+
+        extras = [self._tensor_prep_func(channel[idx]) for channel in self._extra_channels]    # all channels are like [C, T, ...]
         ic_bcast = field[:, 0:1]
         # print(f'ic_bcast is {ic_bcast.shape}')
         # plt.plot(ic_bcast.squeeze().cpu().detach().numpy())
@@ -376,3 +378,6 @@ class NDDataset(Dataset):
 
         # Format for FNO: [C, T ...]
         return {'x': inp.to(self._device), 'y': out.to(self._device), 'eq_idx': self._dataset_index}
+    
+
+# class LazyNDDataset(Dataset):

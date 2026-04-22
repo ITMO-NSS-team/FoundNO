@@ -3,6 +3,8 @@ import warnings
 import logging
 import json
 
+from pathlib import Path
+
 import math
 
 from functools import singledispatchmethod
@@ -12,20 +14,63 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from .data_utils import Dataset
+from neuralop.data.transforms.data_processors import DataProcessor
+
+from .data_utils import Dataset, Heatmap
+from torch.utils.data import DataLoader
 
 from .logger import Logger
 from .optimizer_utils import set_optimizer, set_scheduler
 from .training_utils import LpLoss
 
+def coreFreezingLoadModel(model_path: Union[str, Tuple[None, str, Tuple[str]]], _SAVE_LOAD_PARAMS: dict = {}):
+    if isinstance(model_path, str):   
+        # assert isinstance(model_path, str), 'Saving of a single model requires a single path str argument'
+        model = torch.load(f=model_path, **_SAVE_LOAD_PARAMS)
+    else:
+        assert isinstance(model_path, tuple) and len(model_path) == 3, \
+            'Saving lifting-main part-projection model requires tuple of str arg with len 3.'
+        assert isinstance(model_path[1], str), 'Main core path has to be a str.'
+        main_fno        = torch.load(f = model_path[1], **_SAVE_LOAD_PARAMS)
+
+        for param in main_fno.parameters():
+            param.requires_grad = False
+
+        if model_path[0] is None:
+            assert (model_path[0] is None), 'Can not load projections without liftings.'
+            input_adapters, output_adapters = None, None
+        
+        elif isinstance(model_path[0], str):
+            assert isinstance(model_path[2], str), 'If lifting is passed as a str, proj. has to be a str too.'
+            input_adapters  = torch.load(f = model_path[0], **_SAVE_LOAD_PARAMS)
+            output_adapters = torch.load(f = model_path[2], **_SAVE_LOAD_PARAMS)
+            
+        else:
+            assert (isinstance(model_path[0], (list, tuple))), \
+                'Liftings have to be passed as list or tuple, if multiple adapters are expected.'
+            assert (len(model_path[0]) == len(model_path[2])), \
+                 f'If liftings are passed as {len(model_path[0])} elems, proj. has to be a {len(model_path[2])} elems.'
+            input_adapters, output_adapters = [], []
+            for adapter_idx in range(len(model_path[0])):
+                input_adapters.append(torch.load(f = model_path[0][adapter_idx], **_SAVE_LOAD_PARAMS))
+                output_adapters.append(torch.load(f = model_path[2][adapter_idx], **_SAVE_LOAD_PARAMS))
+
+        model = (input_adapters, main_fno, output_adapters)
+
+    return model
+
 class FineTuner(object):
     mixed_precision = False # Load them from param json
     verbose = False
     eval_interval = 1000
-    
+
     _SAVE_LOAD_PARAMS = {}
 
-    def __init__(self):
+    def __init__(self, backup_loc: str = None):
+        if backup_loc is None:
+            backup_loc = os.path.join(os.getcwd(), 'backup')
+        self._backup_loc = backup_loc
+
         if not torch.cuda.is_available():
             raise RuntimeError('Due to high expected load, only cuda must be supported.')
         self.device = 'cuda' # Using NCCL backend
@@ -43,8 +88,10 @@ class FineTuner(object):
             self.local_rank = 1
             self.world_rank = 1
 
-        self.input_experts = None
-        self.fno_and_proj_model = None
+        self.input_adapters = None
+        self.main_fno = None
+
+        self._min_val_err = torch.inf
 
     @singledispatchmethod
     def buildModel(self, model):
@@ -68,7 +115,7 @@ class FineTuner(object):
         assert isinstance(model[1], torch.nn.Module), \
             'Main neural operator model has to be set as a single torch nn Module'
         
-        assert isinstance(model[2], list) and isinstance(model[2][0], list), \
+        assert isinstance(model[2], list) and isinstance(model[2][0], torch.nn.Module), \
             'Projections have to be set as a list of torch nn Modules'
 
         assert len(model[0]) == len(model[2]), 'Numbers of liftings and projections have to match.'
@@ -97,8 +144,12 @@ class FineTuner(object):
 
         if trainer_loss is None:
             self._training_loss = LpLoss(d=n_dim)
+        else:
+            self._training_loss = trainer_loss
 
     def to(self, device: str = 'cuda'):
+        self.device = device
+
         if self._single_model:
             self.model.to(device)
         else:
@@ -112,57 +163,109 @@ class FineTuner(object):
 
     def setLogger(self, filename, logger: Logger = None, log_level = logging.INFO, logger_name: str = 'FoundationalFNO'):
         if logger is None:
-           self._logger = Logger(filename = filename, log_level = log_level, logger_name = logger_name)
+           self._logger = Logger(filename = filename, log_level = log_level, logger_name = logger_name, 
+                                 write_every = 1e1, epochs_aggreg = 5, 
+                                 info_entries = ['val_loss', 'train_err', 'lr']) # 'Epoch', 
         else:
             self._logger = logger
 
-    def saveModel(self, model_path: Union[str, Tuple[str]]):
+    def saveModel(self, model_path: Union[str, Tuple[str, List[str]]]):
         if self._single_model:   
             assert isinstance(model_path, str), 'Saving of a single model requires a single path str argument'
             torch.save(obj = self.model, f = model_path, **self._SAVE_LOAD_PARAMS)
         else:
             assert isinstance(model_path, tuple) and len(model_path) == 3, \
                 'Saving lifting-main part-projection model requires tuple of str arg with len 3'
-            torch.save(obj = self.input_adapters,     f = model_path[0], **self._SAVE_LOAD_PARAMS)
-            torch.save(obj = self.fno_and_proj_model, f = model_path[1], **self._SAVE_LOAD_PARAMS)
-            torch.save(obj = self.output_adapters,    f = model_path[2], **self._SAVE_LOAD_PARAMS)
+            torch.save(obj = self.main_fno,        f = model_path[1], **self._SAVE_LOAD_PARAMS)
 
-    def load_model(self, model_path: Union[str, Tuple[str]]):
-        if self._single_model:   
-            assert isinstance(model_path, str), 'Saving of a single model requires a single path str argument'
-            self.buildModel(torch.load(f=model_path, **self._SAVE_LOAD_PARAMS))
+            if isinstance(model_path[0], str):
+                assert isinstance(model_path[2], str), \
+                    'If a string is a path for lifting model, a string has to be a path for proj. too.'
+                warnings.warn("Saving a single lifting and projection.")
+                torch.save(obj = self.input_adapters[0],  f = model_path[0], **self._SAVE_LOAD_PARAMS)
+                torch.save(obj = self.output_adapters[0], f = model_path[2], **self._SAVE_LOAD_PARAMS)
+
+            elif isinstance(model_path[0], (list, tuple)):
+                assert (isinstance(model_path[2], (list, tuple)) and len(model_path[0]) == len(model_path[2])), \
+                    'If a list/tuple is a path for lifting model, a list/tuple has to be a path for proj. too.'
+                assert len(self.input_adapters) == len(model_path[2]), 'Mismatching numbers of filenames and submodels.'
+                for idx in range(len(model_path[0])):
+                    torch.save(obj = self.input_adapters[idx],  f = model_path[0][idx], **self._SAVE_LOAD_PARAMS)
+                    torch.save(obj = self.output_adapters[idx],  f = model_path[2][idx], **self._SAVE_LOAD_PARAMS)
+                    
+
+    def loadModel(self, model_path: Union[str, Tuple[None, str, Tuple[str]]]):
+        model = coreFreezingLoadModel(model_path, self._SAVE_LOAD_PARAMS)
+        if isinstance(model, tuple):
+            self._single_model = False
+
+            self.input_adapters = model[0]
+            self.main_fno = model[1]
+            self.output_adapters = model[2]
         else:
-            assert isinstance(model_path, tuple) and len(model_path) == 3, \
-                'Saving lifting-main part-projection model requires tuple of str arg with len 3'
-            self.input_adapters     = torch.load(f = model_path[0], **self._SAVE_LOAD_PARAMS)
-            self.fno_and_proj_model = torch.load(f = model_path[1], **self._SAVE_LOAD_PARAMS)
-            self.output_adapters    = torch.load(f = model_path[2], **self._SAVE_LOAD_PARAMS)
-            self.buildModel((self.input_adapters, self.fno_and_proj_model, self.output_adapters))
+            self.model = model
+            self.params_to_optimize = [{'params': self.model.parameters()},]
+            self._single_model = True
 
-    def load_data(self, file):
+    def loadData(self, file):
         pass
 
-    def train(self, train_loader: Dataset, train_epochs: int):
-        best_loss = np.inf        
-        best_epoch = 0
+    def train(self, train_loader: Union[DataLoader, list], val_loader: Union[DataLoader, list], 
+              train_epochs: int, data_processor: Union[list, DataProcessor] = None):
+        if isinstance(train_loader, DataLoader):
+            train_loader = [train_loader,]
+        if isinstance(val_loader, DataLoader):
+            val_loader = [val_loader,]
+        
+        # track number of training examples in batch
+        self.n_samples = sum([len(loader) for loader in train_loader]) # .size
+        self.n_samples_val = sum([len(loader) for loader in val_loader])
+
+        if isinstance(data_processor, DataProcessor):
+            data_processor = [data_processor,]
+        elif data_processor is None:
+            data_processor = [None,]
+
         best_err = np.inf
 
+        if self._single_model:
+            n_params = sum(p.numel() for p in self.model.parameters())
+            init_log = 'Initializing training of model of type' + \
+                       ' {} | epochs: {} | n params: {}'.format(type(self.model),
+                                                                train_epochs,
+                                                                n_params)
+        else:
+            n_params = sum(p.numel() for p in self.input_adapters[0].parameters()) + \
+                       sum(p.numel() for p in self.main_fno.parameters()) + \
+                       sum(p.numel() for p in self.output_adapters[0].parameters())
+
+            init_log = 'Initializing training of model of type' + \
+                       ' {}, {}, {} | epochs: {} | n params: {}'.format(type(self.input_adapters[0]),
+                                                                        type(self.main_fno),
+                                                                        type(self.output_adapters[0]),
+                                                                        train_epochs,
+                                                                        n_params)
+        self._logger.write(init_log)
+
         for epoch in range(train_epochs):
-            train_err, avg_epoch_loss = self.train_single_epoch(epoch, train_loader, self._training_loss)
-            print(f'{epoch} - th epoch: train error is {train_err}')
+            train_err, val_loss = self.trainSingleEpoch(epoch, train_loader, val_loader, 
+                                                          self._training_loss, data_processor)
+            print(f'{epoch} - th epoch: train error is {train_err}, val error {val_loss}')
 
             if train_err < best_err:
                 best_err = train_err
 
-    @property
-    def model(self):
+            if (epoch == train_epochs-1):
+                self.logTraining(train_err, val_loss, 0) # f'Finished model training. train_err: {train_err}, avg_epoch_loss: {avg_epoch_loss}')
+
         if self._single_model:
             return self.model
         else:
-            return self.input_adapters, self.fno_and_proj_model, self.output_adapters
+            return self.input_adapters, self.main_fno, self.output_adapters
 
-    def train_single_epoch(self, epoch, train_loader, training_loss):
-        """train_single_epoch trains self.model on train_loader
+    def trainSingleEpoch(self, epoch, train_loader: List[DataLoader], val_loader: List[DataLoader], 
+                         training_loss, data_processor: List[DataProcessor] = [None,], training: bool = True):
+        """trainSingleEpoch trains self.model on train_loader
         for one epoch and returns training metrics
 
         Parameters
@@ -177,11 +280,8 @@ class FineTuner(object):
         all_errors
             dict of all eval metrics for the last epoch
         """
-        self.on_epoch_start(epoch)
+        self.onEpochStart(epoch)
 
-        avg_epoch_loss = 0
-        # avg_lasso_loss = 0
-        
         if self._single_model:
             self.model.train()
         else:
@@ -191,62 +291,132 @@ class FineTuner(object):
                 self.input_adapters[idx].train()
                 self.output_adapters[idx].train()
 
+        if data_processor[0] is not None:
+            for idx in range(len(data_processor)):
+                data_processor[idx].train()
 
-        if self.data_processor:
-            self.data_processor.train()
+        if self._single_model:
+            self.model.train()
+        else:
+            for idx_adapter, _ in enumerate(self.input_adapters):
+                self.input_adapters[idx_adapter].train()
+                self.output_adapters[idx_adapter].train()
+            self.main_fno.train()
+
         train_err = 0.0
-        
-        # track number of training examples in batch
-        self.n_samples = len(train_loader) # .size
+        n_fine_samples = self.n_samples
+        for dataset_idx, loader in enumerate(train_loader):
+            for idx, sample in enumerate(loader):
+                self.optimizer.zero_grad()
 
-        for idx, sample in enumerate(train_loader):
-            
-            loss = self.train_one_batch(idx, sample, training_loss)
-            loss.backward()
-            self.optimizer.step()
+                loss = self.trainOneBatch(epoch, sample, training_loss, 
+                                          data_processor[dataset_idx], training = True)
+                
+                if torch.isnan(loss).item():
+                    print('loss is NaN')
+                    n_fine_samples -= 1
+                    # continue
+                loss.backward()
 
-            train_err += loss.item()
-            with torch.no_grad():
-                avg_epoch_loss += loss.item()
-                # if self.regularizer:
-                #     avg_lasso_loss += self.regularizer.loss
+                self.optimizer.step()
+
+                with torch.no_grad():
+                    train_err += loss.item()
+
+        # print('n_fine_samples for training', n_fine_samples)
+        train_err /= n_fine_samples
 
         if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             self.scheduler.step(train_err)
         else:
             self.scheduler.step()
 
-        train_err /= len(train_loader)
-        avg_epoch_loss /= self.n_samples
-        # if self.regularizer:
-        #     avg_lasso_loss /= self.n_samples
-        # else:
-        #     avg_lasso_loss = None
         
         lr = None
         for pg in self.optimizer.param_groups:
             lr = pg["lr"]
-        if self.verbose and epoch % self.eval_interval == 0:
-            self.log_training(
-                epoch=epoch,
-                avg_loss=avg_epoch_loss,
-                train_err=train_err,
-                # avg_lasso_loss=avg_lasso_loss,
-                lr=lr
-            )
 
-        return train_err, avg_epoch_loss # , avg_lasso_loss
+        if self._single_model:
+            self.model.eval()
+        else:
+            for idx_adapter, _ in enumerate(self.input_adapters):
+                self.input_adapters[idx_adapter].eval()
+                self.output_adapters[idx_adapter].eval()
+            self.main_fno.eval()
 
-    def log_training(self, epoch, avg_loss, train_err, lr):
-        self._logger.write('Epoch: {} | avg_loss: {} | train_err: {} | lr: {}'.format(epoch, avg_loss, train_err, lr))
+        with torch.no_grad():
+            val_loss = 0.
 
-    def on_epoch_start(self, *args, **kwargs):
+            n_fine_samples = self.n_samples_val
+
+            for dataset_idx, loader in enumerate(val_loader):
+                if (isinstance(loader, dict)):
+                    for res, resloader in loader.items():
+                        for idx, sample in enumerate(resloader):
+                            loss = self.trainOneBatch(epoch, sample, training_loss, 
+                                                      data_processor[dataset_idx], training=False)                    
+                            if torch.isnan(loss).item():
+                                n_fine_samples -= 1
+                                continue
+                    
+                            val_loss += loss.item()                        
+                else:
+                    for idx, sample in enumerate(loader):
+                        loss = self.trainOneBatch(epoch, sample, training_loss,
+                                                  data_processor[dataset_idx], training=False)                    
+                        if torch.isnan(loss).item():
+                            n_fine_samples -= 1
+                            continue
+                
+                        val_loss += loss.item()
+
+            val_loss /=  n_fine_samples
+
+
+        self.logTraining(val_loss=val_loss, train_err=train_err, lr=lr)
+
+        self.onEpochEnd(val_loss = val_loss)
+
+        return train_err, val_loss
+
+
+    def logTraining(self, val_loss, train_err, lr):
+        self._logger.write({'val_loss': val_loss, 'train_err': train_err, 'lr': lr})
+
+    def onEpochStart(self, *args, **kwargs):
         """
         Stub for implementing additional logick!
         """
         pass
 
-    def train_one_batch(self, idx, sample, training_loss):
+    def onEpochEnd(self, *args, **kwargs):
+        """
+        Stub for implementing additional logick!
+        """
+        if kwargs['val_loss'] < self._min_val_err:
+            self._min_val_err = kwargs['val_loss']
+            directory = Path(self._backup_loc)
+            directory.mkdir(parents=True, exist_ok=True)
+
+            if self._single_model:
+                assert isinstance(self._save_paths, str), 'Save paths have to be strings in case of a single model.'
+                self.saveModel(self._save_paths)# os.path.join(self._backup_loc, 'lowest_val_err_single_model.pt'))
+            else:
+                assert isinstance(self._save_paths, (tuple, list)), \
+                    'Save paths have to be strings in case of a multiple adapeter model.'
+                assert isinstance(self._save_paths[1], str), \
+                    'Save path for a core has to be a string in case of a multiple adapeter model.'                
+                assert all([isinstance(self._save_paths[idx], (tuple, list)) for idx in [0, 2]]), \
+                    'Save paths for adapters have to be passed list/tuple of strs.'
+
+                # files_adap = [os.path.join(self._backup_loc, f'lowest_val_err_adapter_{i}.pt') for i in range(len(self.model[0]))]
+                # files_proj = [os.path.join(self._backup_loc, f'lowest_val_err_proj_{i}.pt') for i in range(len(self.model[2]))]
+                # file_core  =  os.path.join(self._backup_loc, f'lowest_val_err_core.pt')
+
+                self.saveModel(self._save_paths) #  (self._save_paths[0], , files_proj))
+
+
+    def trainOneBatch(self, idx, sample, training_loss, data_processor = None, training: bool = False):
         """Run one batch of input through model
            and return training loss on outputs
 
@@ -262,64 +432,84 @@ class FineTuner(object):
         loss: float | Tensor
             float value of training loss
         """
+        HEATMAPS = False; HMP_idx = 5
 
-        X, Y, eq_idx = sample 
+        sample["x"] = sample["x"].to(self.device)
+        sample["y"] = sample["y"].to(self.device)
+        if "mask" in sample.keys():
+            sample["mask"] = sample["mask"].to(self.device)
+        
+        if idx == HMP_idx and HEATMAPS:    
+            print(f'sample.shape is {sample["x"].shape} - {sample["y"].shape}')
+            for channel in range(sample['x'].shape[1]):
+                Heatmap(sample['x'][0, channel, -5, ...].cpu().detach().numpy(), title=f'Input: channel {channel} before preprocess')
 
-        self.optimizer.zero_grad(set_to_none=True)
-        # if self.regularizer:
-        #     self.regularizer.reset()
-        # if self.data_processor is not None:
-        #     sample = self.data_processor.preprocess(sample)
-        # else:
-        #     # load data to device if no preprocessor exists
-            
-        #     sample = {
-        #         k: v.to(self.device)
-        #         for k, v in sample.items()
-        #         if torch.is_tensor(v)
-        #     }
+            for channel in range(sample['y'].shape[1]):
+                Heatmap(sample['y'][0, channel, -5, ...].cpu().detach().numpy(), title=f'Reference: channel {channel} before preprocess')
 
-        if isinstance(Y, torch.Tensor):
-            self.n_samples += Y.shape[0]
-        else:
-            self.n_samples += 1
+        if data_processor is not None:
+            if isinstance(sample, dict):
+                sample = data_processor.preprocess(sample, training = training)
+            else:
+                warnings.warn('Possibly, incorrect type of model input')
+
+        if idx == HMP_idx and HEATMAPS:    
+            print(f'sample.shape is {sample["x"].shape} - {sample["y"].shape}')
+            for channel in range(sample['x'].shape[1]):
+                Heatmap(sample['x'][0, channel, -5, ...].cpu().detach().numpy(), title=f'Input: channel {channel}')
+
+            for channel in range(sample['y'].shape[1]):
+                Heatmap(sample['y'][0, channel, -5, ...].cpu().detach().numpy(), title=f'Reference: channel {channel}')
+
 
         if self.mixed_precision:
+            raise NotImplementedError('No mixed precision functionality implemented!')
             with torch.autocast(device_type=self.autocast_device_type):
                 if self._single_model:
-                    out = self.model(X)
+                    out = self.model(sample["x"])
                 else:
-                    lift_out = self.input_adapters[eq_idx[0].item()](X)
-                    main_out = self.main_fno(lift_out)
-                    out = self.output_adapters[eq_idx[0].item()](main_out)
+                    out = self.input_adapters[sample["eq_idx"][0].item()](sample["x"])
+                    out = self.main_fno(out)
+                    out = self.output_adapters[sample["eq_idx"][0].item()](out)
 
         else:
             if self._single_model:
-                out = self.model(X)
+                out = self.model(sample["x"])
             else:
-                lift_out = self.input_adapters[eq_idx[0].item()](X)
-                main_out = self.main_fno(lift_out)
-                out = self.output_adapters[eq_idx[0].item()](main_out)
+                out = self.input_adapters[sample["eq_idx"][0].item()](sample["x"])
+                out = self.main_fno(out)
+                out = self.output_adapters[sample["eq_idx"][0].item()](out)
         
-        # if self.epoch == 0 and idx == 0 and self.verbose and isinstance(out, torch.Tensor):
-        #     print(f"Raw outputs of shape {out.shape}")
+        if idx == HMP_idx and HEATMAPS:    
+            for channel in range(out.shape[1]):
+                Heatmap(out[0, channel, -5, ...].cpu().detach().numpy(), title=f'Model output: channel {channel} before norm')
 
-        if self.data_processor is not None:
-            out, Y = self.data_processor.postprocess(out, Y)
+        if data_processor is not None:
+            out, sample = data_processor.postprocess(out, sample, training = training)
 
-        loss = 0.0
+        if idx == HMP_idx and HEATMAPS:    
+            for channel in range(out.shape[1]):
+                Heatmap(out[0, channel, -5, ...].cpu().detach().numpy(), title=f'Model output: channel {channel}')
+                Heatmap(torch.abs(out[0, channel, -5, ...] - sample["y"][0, channel, -5, ...]).cpu().detach().numpy(),
+                        title = f'Diff.: channel {channel}') 
 
-        # print(f'Obtained out mean - {torch.mean(out)}, ref mean - {torch.mean(X)}')
+        if "mask" in sample.keys():
+            mask = sample["mask"]
+        else:
+            mask = None
 
         if self.mixed_precision:
             with torch.autocast(device_type=self.autocast_device_type):
-                loss += training_loss(out, X) # torch.nn.functional.mse_loss(out, X) #
+                if isinstance(training_loss, list):
+                    loss = torch.add(*[loss_func(out, sample["y"], mask) for loss_func in training_loss])
+                else:
+                    loss = training_loss(out, sample["y"], mask)
         else:
-            # loss += torch.nn.functional.mse_loss(out, Y) # training_loss(out, X)
-
-            loss += training_loss(out, Y)
-        
-        # Heatmap(out[0, 0, ...].cpu().detach().numpy())
+            if isinstance(training_loss, list):
+                # print([loss_func(out, sample["y"], mask) for loss_func in training_loss])
+                loss = torch.add(*[loss_func(out, sample["y"], mask) for loss_func in training_loss])
+            else:
+                loss = training_loss(out, sample["y"], mask)
         
         return loss
 

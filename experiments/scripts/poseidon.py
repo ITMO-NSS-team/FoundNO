@@ -1,6 +1,7 @@
 import os
 import argparse
 from datetime import datetime
+import numpy as np
 
 from typing import List, Tuple
 
@@ -11,14 +12,15 @@ sys.path.append('.')
 
 import torch
 
-# from neuralop.models import FNO
-from fnofound.models.fno import FNO
+from neuralop.models import UNO, FNO
+# from fnofound.models.fno import FNO
 
 from fnofound.utils.training_utils import load_files_hdf5, validateOperator
 
 from fnofound.utils.domains import Domain
-from fnofound.utils.data_utils import SimpleDataset, NDDataset
+from fnofound.utils.data_utils import SimpleDataset, NDDataset, syncSuffle
 from fnofound.utils.custom_trainer import Trainer, Logger
+from fnofound.utils.training_utils import BalancedRelL2Loss, FourierHFLoss
 
 from fnofound.models.pecoda import PeCODANO
 from fnofound.models.mamba_fno import PostLiftMambaFNO3D, PostLiftMambaLifting
@@ -48,24 +50,30 @@ def balanced_rel_l2_loss(pred: torch.Tensor, target: torch.Tensor, zero_threshol
     return total_loss / C if C > 0 else torch.tensor(0.0, device=pred.device)
 
 
-OPTIMIZER_PARAMS = {'optimizer': "adamw", 'lr': 1e-2, "weight_decay": 1e-5, "loss": balanced_rel_l2_loss}
+OPTIMIZER_PARAMS = {'optimizer': "adamw", 'lr': 1e-3, "weight_decay": 1e-5} #balanced_rel_l2_loss} adamw
 
-SCHEDULER_PARAMS = {'scheduler': 'reducelr', 'patience': 15, 'factor': 0.5, 'min_lr': 1e-6}
+#OPTIMIZER_PARAMS = {'optimizer': 'lbfgs', 'lr': 1e-1}
+SCHEDULER_PARAMS = {'scheduler': 'reducelr', 'patience': 8, 'factor': 0.5, 'min_lr': 1e-6}
 
-ARGS = {'fno': {'model' : FNO,
-                'params' : {'hidden_channels': 24,
+ARGS = {'fno': {'model' : UNO,
+                'params' : {'hidden_channels': 16,
                             'n_layers': 5,
-                            'n_modes': [30, 30]}},
+                            'uno_n_modes': [[20, 40, 40],]*5,
+                            'uno_out_channels': [16, 32, 32, 32, 16],
+                            'uno_scalings': [[1.0,1.0,1.0], [0.5,0.5,0.5], [1.,1.,1.], [1.,1.,1.], [2.,2.,2.]],
+                            'non_linearity': torch.nn.functional.gelu,
+                            'horizontal_skips_map':{4:0, 3:1},
+			    'channel_mlp_skip': "linear"}},
         'mambafno': {'model' : PostLiftMambaFNO3D,
-                     'params' : {'modes': (64,64),
-                                 'width': 32,
+                     'params' : {'modes': (20, 40, 40),
+                                 'width': 65,
                                  'n_layers': 4,
                                  'use_mamba_kwargs': None,
                                  'mamba_fallback_kernel':9}},
         'localattnfno': {'model' : LocalAttnFNO,
                          'params' : {'width': 64,
                                      'n_local_layers': 2,
-                                     'n_heads': 4, 
+                                     'n_heads': 4,
                                      'window_size': 127}},
         'pecoda': {'model' : PeCODANO,
                    'params' : {'hidden_variable_codimension': 16,
@@ -85,6 +93,20 @@ ARGS = {'fno': {'model' : FNO,
                                    'disable_lifting_and_projection': True 
                                    },
                                   {'hidden_channels': 20,
+                                   'n_layers': 2,
+                                   'n_dim': 3,
+                                   'non_linearity': torch.nn.functional.gelu}]},
+        'adapted_fno_no_mamba': {'model': [ChannelMLP, FNO, ChannelMLP],
+                       'params': [{'hidden_channels': 32,
+                                   'n_layers': 2,
+                                   'n_dim': 3,
+                                   'non_linearity': torch.nn.functional.gelu},
+                                  {'hidden_channels': 32,
+                                   'n_layers': 4,
+                                   'n_modes': [20, 42, 42],  # [8, 32, 32]
+                                   'disable_lifting_and_projection': True 
+                                   },
+                                  {'hidden_channels': 32,
                                    'n_layers': 2,
                                    'n_dim': 3,
                                    'non_linearity': torch.nn.functional.gelu}]}}
@@ -120,6 +142,8 @@ if __name__ == "__main__":
     parser.add_argument("--model", default = 'fno') # , type = ascii
     parser.add_argument("--epochs_max", default = 1e5, type = int)
 
+    parser.add_argument("--data_location", default='')
+
     parser.add_argument("--single_model_location", default = '') # , type = ascii
     parser.add_argument("--lift_model_location",   default = '') # , type = ascii
     parser.add_argument("--main_model_location",   default = '') # , type = ascii
@@ -139,29 +163,59 @@ if __name__ == "__main__":
     val_loaders       = []
     data_processors   = []
 
+    channel_sizes = [3, 5]
+    forcings_train  = {3: None, 5: None}
+    solutions_train = {3: None, 5: None}
+
+    forcings_test  = {3: None, 5: None}
+    solutions_test = {3: None, 5: None}
+
     for fidx, filepath in enumerate(filepaths):
-        sample_max = 600
+        print(f'Loading dataset from {filepath}')
+        sample_max = -1
+
         channels, data = loadNcdfData(filepath, dtype = torch.float32)
         data = data[:sample_max]
 
-
         if channels == 3:
-            forcings = data[:, 2:]
-            solutions = data[:, :2]
+            cur_forcings = data[:, 2:]
+            cur_solutions = data[:, :2]
         if channels == 5:
-            forcings = data[:, (0, 3, 4)]
-            solutions = data[:, (1, 2)]
+            cur_forcings = data[:, (0, 3, 4)]
+            cur_solutions = data[:, (1, 2)]
 
-        batch_size = 1
+        del data
+
+        cur_solutions, cur_forcings = syncSuffle(cur_solutions, cur_forcings)
+    
+        train_max_idx = int(cur_solutions.shape[0] * 0.8)
+
+        if fidx == 0:
+            solutions_train[channels] = cur_solutions[:train_max_idx] # .swapaxes(-1, -2)
+            forcings_train[channels]  = cur_forcings[:train_max_idx]  # .swapaxes(-1, -2)
+        
+            solutions_test[channels]  = cur_solutions[train_max_idx:] # .swapaxes(-1, -2)
+            forcings_test[channels]   = cur_forcings[train_max_idx:]  # .swapaxes(-1, -2)
+        else:
+            solutions_train = torch.cat([solutions_train, cur_solutions[:train_max_idx],], dim = 0) # .swapaxes(-1, -2)
+            forcings_train = torch.cat([forcings_train, cur_forcings[:train_max_idx],], dim = 0) # .swapaxes(-1, -2)
+
+            solutions_test  = torch.cat([solutions_test, cur_solutions[train_max_idx:],], dim = 0) # .swapaxes(-1, -2)
+            forcings_test  = torch.cat([forcings_test, cur_forcings[train_max_idx:],], dim = 0) # .swapaxes(-1, -2)
+        print('Loaded!')
+
+    for cidx, ckey in enumerate(channel_sizes):
+        print(f'Shape of forcings {solutions_train[ckey].shape} & {solutions_test[ckey].shape} and \
+                solutions {solutions_train[ckey].shape} & {solutions_test[ckey].shape}')
+        batch_size = 7
 
         inp_normalizer = UnitGaussianNormalizer(dim = [2, 3, 4]) # 
-        out_normalizer = UnitGaussianNormalizer(dim = [2, 3, 4])#, mask = mask)
+        out_normalizer = UnitGaussianNormalizer(dim = [2, 3, 4]) #
 
-        train_max_idx = int(solutions.shape[0] * 0.8)
-        train_dataset = NDDataset(solutions[:train_max_idx], extra_channels = [forcings[:train_max_idx],], 
-                                  grids = None, dataset_index=fidx) # XX, YY
-        val_dataset   = NDDataset(solutions[train_max_idx:], extra_channels = [forcings[train_max_idx:],],
-                                  grids = None, dataset_index=fidx) # XX, YY
+        train_dataset = NDDataset(solutions_train[ckey], extra_channels = [forcings_train[ckey],], 
+                                  grids = None, dataset_index=cidx, use_mem_mapped=False) # XX, YY
+        val_dataset   = NDDataset(solutions_test[ckey], extra_channels = [forcings_test[ckey],],
+                                  grids = None, dataset_index=cidx, use_mem_mapped=False) # XX, YY
 
         for idx, sample in enumerate(train_dataset):
             sample_x = sample['x'].to('cuda')
@@ -183,51 +237,65 @@ if __name__ == "__main__":
 
     model_selection = ARGS[args.model]
 
-    if isinstance(model_selection['model'], (tuple, list)):
-        model = list()
-        for idx, submodel in enumerate(model_selection['model']):
-            if idx == 0:
-                liftings = []
-                for data_idx, loader in enumerate(train_dataloaders):
-                    in_channels, _ = getLoaderChannels(loader)
-                    # in_channels = set.in_channels
-                    out_channels = model_selection['params'][idx]['width']
-                    liftings.append(submodel(in_channels=in_channels,
-                                             out_channels=out_channels,
-                                             **model_selection['params'][idx]))
-                model.append(liftings)
-    
-            elif idx == len(model_selection['model']) - 1:
-                projections = []
-                for data_idx, set in enumerate(train_dataloaders):
-                    in_channels = model_selection['params'][idx]['hidden_channels']
-                    _, out_channels = getLoaderChannels(loader)
-                    projections.append(submodel(in_channels=in_channels,
-                                                out_channels=out_channels,
-                                                **model_selection['params'][idx]))
-                model.append(projections)
-    
-            else:
-                in_channels = model_selection['params'][idx]['hidden_channels']
-                out_channels = model_selection['params'][idx]['hidden_channels']
-                model.append(submodel(in_channels=in_channels,
-                                      out_channels=out_channels,
-                                      **model_selection['params'][idx]))
-    
-        assert len(model) == 3, 'Something went wrong!'
-        model = tuple([model[0], model[1], model[2]])
-    else:
-        assert len(train_dataloaders) == 1, 'Trying to train a single lift-proj model on multiple datasets'
-        validateOperator(model_selection['model'],
-                          ['in_channels', 'out_channels'] + list(model_selection['params'].keys()))
+    model_name = None #'/home/mikemaslyaev/Documents/FNOFound/experiments/pretrained_models/flows_mambafno_4_11_9.pt'
 
-        in_channels, out_channels = getLoaderChannels(train_dataloaders[0])
-        print(f'dataset channels: in - {in_channels}, out - {out_channels}')
-        model = model_selection['model'](in_channels  = in_channels,
-                                         out_channels = out_channels,
-                                         **model_selection['params'])
+    if model_name is None:
+        if isinstance(model_selection['model'], (tuple, list)):
+            model = list()
+            for idx, submodel in enumerate(model_selection['model']):
+                if idx == 0:
+                    liftings = []
+                    for data_idx, loader in enumerate(train_dataloaders):
+                        in_channels, _ = getLoaderChannels(loader)
+                        # in_channels = set.in_channels
+                        if 'width' in model_selection['params'][idx].keys():
+                            key = 'width'
+                        else:
+                            key = 'hidden_channels'
+                        out_channels = model_selection['params'][idx][key]
+                        liftings.append(submodel(in_channels=in_channels,
+                                                 out_channels=out_channels,
+                                                 **model_selection['params'][idx]))
+                    model.append(liftings)
+    
+                elif idx == len(model_selection['model']) - 1:
+                    projections = []
+                    for data_idx, set in enumerate(train_dataloaders):
+                        if 'width' in model_selection['params'][idx].keys():
+                            key = 'width'
+                        else:
+                            key = 'hidden_channels'
+                        in_channels = model_selection['params'][idx][key]
+                        _, out_channels = getLoaderChannels(loader)
+                        projections.append(submodel(in_channels=in_channels,
+                                                    out_channels=out_channels,
+                                                    **model_selection['params'][idx]))
+                    model.append(projections)
+    
+                else:
+                    if 'width' in model_selection['params'][idx].keys():
+                        key = 'width'
+                    else:
+                        key = 'hidden_channels'
+                    in_channels = model_selection['params'][idx][key]
+                    out_channels = model_selection['params'][idx][key]
+                    model.append(submodel(in_channels=in_channels,
+                                          out_channels=out_channels,
+                                          **model_selection['params'][idx]))
+    
+            assert len(model) == 3, 'Something went wrong!'
+            model = tuple([model[0], model[1], model[2]])
+        else:
+            assert len(train_dataloaders) == 1, 'Trying to train a single lift-proj model on multiple datasets'
+            validateOperator(model_selection['model'],
+                            ['in_channels', 'out_channels'] + list(model_selection['params'].keys()))
+
+            in_channels, out_channels = getLoaderChannels(train_dataloaders[0])
+            print(f'dataset channels: in - {in_channels}, out - {out_channels}')
+            model = model_selection['model'](in_channels  = in_channels,
+                                             out_channels = out_channels,
+                                             **model_selection['params'])
         
-    # print('len(model[0])', len(model[0]), 'len(model[2])', len(model[2]))
     now = datetime.now()
 
     trainer = Trainer()
@@ -235,12 +303,22 @@ if __name__ == "__main__":
                                    f'log_{EXPNAME}_{args.model}_lift_{now.day}_{now.hour}_{now.minute}.log')
     trainer.setLogger(filename = logger_filename)
 
-    trainer.buildModel(model)
+    if model_name is not None:
+        trainer.loadModel(model_name)
+        print('Loaded model as ...')
+    else:
+        trainer.buildModel(model)
+
     if SCHEDULER_PARAMS['scheduler'] == 'cosine':
         SCHEDULER_PARAMS['max_cosine_lr_epochs'] = args.epochs_max
+
+    loss1 = BalancedRelL2Loss()
+    loss2 = FourierHFLoss()
+    loss = [loss1, loss2]
     trainer.buildOptimizer(n_dim = 3,
                            params_scheduler = SCHEDULER_PARAMS,
-                           params_opt = OPTIMIZER_PARAMS)
+                           params_opt = OPTIMIZER_PARAMS,
+                           trainer_loss = loss)
 
     trainer.to('cuda')
     trainer.train(train_loader=train_dataloaders, val_loader=val_loaders, train_epochs=int(args.epochs_max), 

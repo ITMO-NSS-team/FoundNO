@@ -264,8 +264,38 @@ class BalancedRelL2Loss(object):
 
             total_loss += weights[c] * torch.norm((p - t)) / (torch.norm(t) + self._eps)
 
+        if torch.isinf(total_loss).any().item():
+            print('NAN in BalancedRelL2Loss!')
         return total_loss
     
+class FourierHFLoss(object):
+    def __init__(self, dims: List[int] = [3, 4]):
+        self._dims = dims
+        self._fourier_dim = len(dims)
+        
+    def __call__(self, pred: torch.Tensor, target: torch.Tensor, *args, **kwargs):
+        error = target - pred
+        
+        error = torch.fft.fftn(error, dim = [pred.ndim - i for i in range(self._fourier_dim, 0, -1)])
+        error = torch.pow(error, 2)
+
+        hf_lim = min(15, int(pred.shape[-1]//2))
+        
+        Nxs = pred.shape[-self._fourier_dim:]
+        Lxs = [1.] * self._fourier_dim
+        xs = [torch.arange(Nx//2) for Nx in Nxs]
+        XXs = torch.meshgrid(*xs, indexing = 'ij')
+        mask = (torch.sqrt(torch.add(*[torch.pow(xx, 2) for xx in XXs])) >= hf_lim).to(int).to(pred.device)
+
+        for ax_idx, dim in enumerate(self._dims):
+            error = torch.swapaxes(error, axis0 = 0, axis1 = dim)
+            error = error[:int(Nxs[ax_idx]//2), ...]
+            error = torch.swapaxes(error, axis0 = 0, axis1 = dim)
+
+        total_loss = torch.norm(error * mask) / (pred.shape[0] * pred.shape[1] * pred.shape[2] * torch.count_nonzero(mask))
+        if torch.isinf(total_loss).any().item():
+            print('NAN in FourierHFLoss!')
+        return total_loss
 
 def standartize(matrix: np.ndarray):
     if np.isclose(torch.std(matrix).item(), 0.):

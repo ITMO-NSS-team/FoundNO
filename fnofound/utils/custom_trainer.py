@@ -85,8 +85,10 @@ class Trainer(object):
             self.local_rank = 1
             self.world_rank = 1
 
-        self.input_experts = None
+        self.input_adapters = None
         self.main_fno = None
+
+        self._min_val_err = torch.inf
 
     @singledispatchmethod
     def buildModel(self, model):
@@ -307,8 +309,9 @@ class Trainer(object):
                 if torch.isnan(loss).item():
                     print('loss is NaN')
                     n_fine_samples -= 1
-                    continue
+                    # continue
                 loss.backward()
+
                 self.optimizer.step()
 
                 with torch.no_grad():
@@ -366,28 +369,45 @@ class Trainer(object):
 
         self.logTraining(val_loss=val_loss, train_err=train_err, lr=lr)
 
+        self.onEpochEnd(val_loss = val_loss)
+
         return train_err, val_loss
 
 
     def logTraining(self, val_loss, train_err, lr):
         self._logger.write({'val_loss': val_loss, 'train_err': train_err, 'lr': lr})
 
-
     def onEpochStart(self, *args, **kwargs):
         """
         Stub for implementing additional logick!
         """
-        directory = Path(self._backup_loc)
-        directory.mkdir(parents=True, exist_ok=True)
+        pass
 
-        if self._single_model:
-            self.saveModel(os.path.join(self._backup_loc, 'reserve_single_model.pt'))
-        else:
-            files_adap = [os.path.join(self._backup_loc, f'reserve_adapter_{i}.pt') for i in range(len(self.model[0]))]
-            files_proj = [os.path.join(self._backup_loc, f'reserve_proj_{i}.pt') for i in range(len(self.model[2]))]
-            file_core  =  os.path.join(self._backup_loc, f'reserve_core.pt')
+    def onEpochEnd(self, *args, **kwargs):
+        """
+        Stub for implementing additional logick!
+        """
+        if kwargs['val_loss'] < self._min_val_err:
+            self._min_val_err = kwargs['val_loss']
+            directory = Path(self._backup_loc)
+            directory.mkdir(parents=True, exist_ok=True)
 
-            self.saveModel((files_adap, file_core, files_proj))
+            if self._single_model:
+                assert isinstance(self._save_paths, str), 'Save paths have to be strings in case of a single model.'
+                self.saveModel(self._save_paths)# os.path.join(self._backup_loc, 'lowest_val_err_single_model.pt'))
+            else:
+                assert isinstance(self._save_paths, (tuple, list)), \
+                    'Save paths have to be strings in case of a multiple adapeter model.'
+                assert isinstance(self._save_paths[1], str), \
+                    'Save path for a core has to be a string in case of a multiple adapeter model.'                
+                assert all([isinstance(self._save_paths[idx], (tuple, list)) for idx in [0, 2]]), \
+                    'Save paths for adapters have to be passed list/tuple of strs.'
+
+                # files_adap = [os.path.join(self._backup_loc, f'lowest_val_err_adapter_{i}.pt') for i in range(len(self.model[0]))]
+                # files_proj = [os.path.join(self._backup_loc, f'lowest_val_err_proj_{i}.pt') for i in range(len(self.model[2]))]
+                # file_core  =  os.path.join(self._backup_loc, f'lowest_val_err_core.pt')
+
+                self.saveModel(self._save_paths) #  (self._save_paths[0], , files_proj))
 
 
     def trainOneBatch(self, idx, sample, training_loss, data_processor = None, training: bool = False):
@@ -474,9 +494,16 @@ class Trainer(object):
 
         if self.mixed_precision:
             with torch.autocast(device_type=self.autocast_device_type):
-                loss = training_loss(out, sample["y"], mask)
+                if isinstance(training_loss, list):
+                    loss = torch.add(*[loss_func(out, sample["y"], mask) for loss_func in training_loss])
+                else:
+                    loss = training_loss(out, sample["y"], mask)
         else:
-            loss = training_loss(out, sample["y"], mask)
+            if isinstance(training_loss, list):
+                # print([loss_func(out, sample["y"], mask) for loss_func in training_loss])
+                loss = torch.add(*[loss_func(out, sample["y"], mask) for loss_func in training_loss])
+            else:
+                loss = training_loss(out, sample["y"], mask)
         
         return loss
 
