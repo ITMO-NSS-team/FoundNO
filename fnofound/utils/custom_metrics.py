@@ -652,3 +652,21 @@ def load_and_merge_datasets_with_nan_filtering(file_paths):
 
 
 #     print("Done")
+
+class MaskedLpLoss:
+    def __init__(self, d=2, p=2, reduce_dims=0):
+        self.d = d
+        self.p = p
+
+    def abs(self, x, y, mask=None):
+        if mask is not None:
+            x, y = x * mask, y * mask
+        num_points = torch.sum(mask) if mask is not None else x.numel()
+        return torch.norm(x - y, p=self.p) / num_points
+
+    def rel(self, x, y, mask=None):
+        if mask is not None:
+            x, y = x * mask, y * mask
+        diff = torch.norm(x - y, p=self.p)
+        norm_y = torch.norm(y, p=self.p)
+        return diff / (norm_y + 1e-8)

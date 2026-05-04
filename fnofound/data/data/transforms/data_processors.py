@@ -601,3 +601,35 @@ class MultiTaskMGPatchingDataProcessor(DataProcessor):
         output = self.model(**data_dict)
         output, data_dict = self.postprocess(output, data_dict, task_name=task_name)
         return output, data_dict
+    
+class DnoDataProcessor:
+    """
+    Универсальный процессор для нормализации и масштабирования данных DNO.
+    Поддерживает константное масштабирование (Darcy) и StandardScaler (Fluid/Reservoir).
+    """
+    def __init__(self, case_type="darcy", u_scale=10.0, stats=None):
+        self.case_type = case_type
+        self.u_scale = u_scale
+        self.stats = stats # Словарь с mean и std для каждого канала
+
+    def encode(self, x):
+        """Нормализация перед подачей в модель."""
+        if self.case_type == "darcy":
+            # Для Darcy используем фиксированное масштабирование из конфига
+            return x * self.u_scale
+        elif self.stats is not None:
+            # Для Fluid/Reservoir используем Z-score нормализацию
+            mean = torch.tensor(self.stats['mean'], device=x.device)
+            std = torch.tensor(self.stats['std'], device=x.device)
+            return (x - mean) / (std + 1e-8)
+        return x
+
+    def decode(self, x):
+        """Денормализация предсказаний модели."""
+        if self.case_type == "darcy":
+            return x / self.u_scale
+        elif self.stats is not None:
+            mean = torch.tensor(self.stats['mean'], device=x.device)
+            std = torch.tensor(self.stats['std'], device=x.device)
+            return x * std + mean
+        return x
