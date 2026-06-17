@@ -1,0 +1,6 @@
+FROM mikemasliaev/fnofound_flows:v1.4.1
+
+RUN python3 -m pip install --no-cache-dir \
+    h5py \
+    datasets \
+    pyarrow
