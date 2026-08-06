@@ -3,6 +3,13 @@ from fnofound.data.data.datasets.navier_stokes import NavierStokesDataset, load_
 from fnofound.data.data.datasets.pt_dataset import PTDataset
 from fnofound.data.data.datasets.burgers import Burgers1dTimeDataset, load_mini_burgers_1dtime
 from fnofound.data.data.datasets.dict_dataset import DictDataset
+from fnofound.data.data.datasets.airfoil_datasets import (
+    FnoDataset,
+    DnoDataset,
+    GeofnoDataset,
+    get_airfoil_dataset,
+    collate_fn as airfoil_collate_fn,
+)
 from fnofound.data.data.datasets.mesh_datamodule import MeshDataModule
 from fnofound.data.data.datasets.car_cfd_dataset import CarCFDDataset, load_mini_car
 

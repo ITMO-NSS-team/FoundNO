@@ -14,3 +14,6 @@ from .pecoda import PeCODANO
 from .scOT.model import ScOT, ScOTConfig
 
 from .dno import DNO
+from .dno_airfoil import DNO as DNOAirfoil
+from .fno2d import FNO2d
+from .rno import RNO2d

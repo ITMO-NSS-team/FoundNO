@@ -209,3 +209,18 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ── AirfRANS experiments (airfoils) ──
+# generated data / checkpoints / run outputs
+/data/
+*.npz
+*.pth
+*.vtk
+*.npy
+runs_*/
+runs_diff/
+runs_airfoils/
+experiments/logs/
+experiments/pretrained_models/
+experiments/airfoils/data_prep/generated_data/
+experiments/airfoils/**/__pycache__/
