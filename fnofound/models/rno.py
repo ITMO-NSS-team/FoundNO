@@ -169,6 +169,11 @@ class RNO2d(nn.Module):
 
     Input:  [B, H, W, C_in] (+ 2 grid channels if use_grid=True)
     Output: [B, H, W, C_out]
+
+    The `padding` parameter mirrors FNO2d: zero-padding before the Riesz
+    blocks and cropping after absorbs FFT boundary artifacts on
+    non-periodic grids (e.g. the VKI raw 301x121 C-grid, u non-periodic).
+    With padding=0 this is the plain RNO.
     """
 
     def __init__(self,
@@ -177,13 +182,15 @@ class RNO2d(nn.Module):
                  modes=16,
                  width=32,
                  n_layers=4,
-                 use_grid=True):
+                 use_grid=True,
+                 padding=0):
         super().__init__()
         self.modes1 = modes
         self.modes2 = modes
         self.width = width
         self.n_layers = n_layers
         self.use_grid = use_grid
+        self.padding = padding
 
         # Lifting (CoordToRiesz)
         grid_channels = 2 if use_grid else 0
@@ -230,11 +237,19 @@ class RNO2d(nn.Module):
         x = self.fc0(x)                        # [B, H, W, width]
         x = x.permute(0, 3, 1, 2)             # [B, width, H, W]
 
+        # Padding buffer for non-periodic boundaries (zeros)
+        if self.padding > 0:
+            x = F.pad(x, [0, self.padding, 0, self.padding])
+
         # Riesz layers
         for riesz, bypass in zip(self.riesz_conductors, self.bypass_convs):
             x_riesz = riesz(x)
             x_bypass = bypass(x)
             x = F.gelu(x_riesz + x_bypass)
+
+        # Crop padding
+        if self.padding > 0:
+            x = x[..., :-self.padding, :-self.padding]
 
         # Projection
         x = x.permute(0, 2, 3, 1)             # [B, H, W, width]

@@ -224,3 +224,7 @@ experiments/logs/
 experiments/pretrained_models/
 experiments/airfoils/data_prep/generated_data/
 experiments/airfoils/**/__pycache__/
+
+# ── VKI-LS59 experiments ──
+runs_vki/
+experiments/vki/**/__pycache__/
