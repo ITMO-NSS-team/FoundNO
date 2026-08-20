@@ -17,7 +17,8 @@ Data (see fnofound.data.data.datasets.airfoil_datasets):
     dno:       {data.root_dir}/DNO_data/dno_small   (batch_N/*.npz, 256x256)
     geofno:    {data.root_dir}/Geo-FNO_data         (batch_N/*.pth, C-grid)
 
-Loss: FieldLpLoss over (vel_x, vel_y, pressure), masked where available.
+Loss: FieldLpLoss over all four fields (vel_x, vel_y, pressure, nu_t) -
+the fl4 setup matching the airrans runs_fl4, masked where available.
 Output: runs_airfoils/<model>_<ts>/{models, logs, plots}
 """
 

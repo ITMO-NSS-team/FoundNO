@@ -93,8 +93,9 @@ Per-model defaults (registry in `airfoil_train.py`):
 | dno    | DNOAirfoil  | dno          | 3  | 0       | + grid_mesh geometry |
 | geofno | FNO2d       | geofno       | 2  | 8       | C-grid, no mask |
 
-Loss: `FieldLpLoss` over (vel_x, vel_y, pressure) - nu_t excluded; masked
-where the case provides a mask (FNO/RNO/DNO), unmasked for Geo-FNO.
+Loss: `FieldLpLoss` over all four fields (vel_x, vel_y, pressure, nu_t) -
+the fl4 setup matching the airrans `runs_fl4`; masked where the case
+provides a mask (FNO/RNO/DNO), unmasked for Geo-FNO.
 
 Output per run: `runs_airfoils/<model>_<ts>/{models, logs, plots}`.
 
@@ -121,6 +122,26 @@ python experiments/scripts/airfoil_eval.py \
 Evaluates all four best checkpoints on the test split (architecture is
 inferred from each state dict), prints a per-field rel-L2 table and saves
 `leaderboard.json`.
+
+### Comparison on the original mesh points (fl4, quadratic)
+
+`airfoil_compare_fl4.py` is the port of the airrans
+`compare_fl4/compare_fl4.py` comparison: predictions of the four fl4 models
+(trained with nu_t in the loss) are interpolated onto the ORIGINAL mesh
+reference points (batch_10, samples 101..200 except 133, 155 = 98 samples,
+first 137 rows of `global_wing_rows`, FNO/RNO box) with QUADRATIC MLS
+interpolation + NN fallback, and per-field rel-L2 (all 4 fields incl.
+nu_t) is reported per sample, pooled over all points, and summarized in
+CSVs (plus per-sample plots and run_config.json).
+
+```bash
+python experiments/scripts/airfoil_compare_fl4.py \
+    --data.root_dir /media/.../airfrans \
+    --out runs_airfoils/compare_fl4
+```
+
+Default checkpoints are the airrans fl4 runs (`runs_fl4`, `runs_rno_fl4`,
+`runs_dno_small_fl4`) - override with `--checkpoint MODEL=PATH`.
 
 ## Environment
 

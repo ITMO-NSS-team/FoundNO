@@ -7,8 +7,8 @@ The trainer is case-agnostic: batches come from airfoil_datasets.collate_fn
 as dicts {x [B,H,W,C], y [B,H,W,4], mask [B,H,W]|None, grid_mesh [B,H,W,2]|None}.
 All models expose a uniform forward(x, mask=None, grid_mesh=None).
 
-Loss: FieldLpLoss (per-field rel-L2 over vel_x, vel_y, pressure), masked
-when the case provides a mask, unmasked otherwise.
+Loss: FieldLpLoss (per-field rel-L2 over all four fields incl. nu_t - the
+fl4 setup), masked when the case provides a mask, unmasked otherwise.
 Reporting: PerFieldLoss (all 4 fields) -> summary.json / leaderboard.
 
 Output layout per run:
@@ -66,11 +66,13 @@ class AirfoilTrainer:
     """
 
     def __init__(self, model, criterion: Optional[torch.nn.Module] = None,
-                 device: Optional[torch.device] = None):
+                 device: Optional[torch.device] = None,
+                 field_names=('vel_x', 'vel_y', 'pressure', 'nu_t')):
         self.model = model
         self.criterion = criterion if criterion is not None else FieldLpLoss()
         self.device = device or torch.device(
             'cuda' if torch.cuda.is_available() else 'cpu')
+        self.field_names = field_names
         self.model.to(self.device)
 
     # helpers
@@ -122,7 +124,7 @@ class AirfoilTrainer:
         """Validation metrics: {'loss': float, 'per_field': dict}."""
         self.model.eval()
         total, n = 0.0, 0
-        per_field = PerFieldLoss()
+        per_field = PerFieldLoss(field_names=self.field_names)
         pf_acc = None
         with torch.no_grad():
             for batch in loader:

@@ -2,12 +2,14 @@
 losses.py - training and reporting losses for the AirfRANS experiments.
 
 Training loss (used for all models):
-    FieldLpLoss - sum of per-field relative L2 over vel_x, vel_y, pressure
-                  (nu_t is excluded: it is noisy and would dominate the
-                  joint norm). Each field is normalized by its own norm, so
-                  all fields contribute equally regardless of scale.
-                  Optional mask: when given, x and y are masked before the
-                  computation (holes are ignored). Some cases have a mask
+    FieldLpLoss - sum of per-field relative L2 over ALL four fields
+                  (vel_x, vel_y, pressure, nu_t) - the "fl4" setup matching
+                  the airrans runs_fl4 (nu_t is included; per-field
+                  normalization keeps the noisy turbulence channel from
+                  dominating the joint norm). Each field is normalized by its
+                  own norm, so all fields contribute equally regardless of
+                  scale. Optional mask: when given, x and y are masked before
+                  the computation (holes are ignored). Some cases have a mask
                   (FNO/RNO/DNO), Geo-FNO does not.
 
 Reporting metric:
@@ -32,13 +34,13 @@ class FieldLpLoss(nn.Module):
     Parameters
     ----------
     field_indices : tuple[int]
-        Channels that participate (default (0, 1, 2): vel_x, vel_y, pressure;
-        nu_t is excluded).
+        Channels that participate (default (0, 1, 2, 3): all four fields,
+        including nu_t - the fl4 setup matching the airrans runs_fl4).
     weights : tuple[float] or None
         Optional per-field weights (default all 1.0).
     """
 
-    def __init__(self, field_indices=(0, 1, 2), weights=None):
+    def __init__(self, field_indices=(0, 1, 2, 3), weights=None):
         super().__init__()
         self.field_indices = list(field_indices)
         self.weights = weights
