@@ -1,0 +1,253 @@
+output:
+  root: D:/FoundNO_test_runs
+
+seed:
+  value: 42
+  deterministic: false
+
+inspections:
+  enabled: true
+
+tasks:
+  - name: thewell_turbulent_radiative_layer_2d
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/turbulent_radiative_layer_2D
+      cache_dir: D:/TheWell/turbulent_radiative_layer_2D/hf_cache
+      field_groups:
+        t0_fields: [density, pressure]
+        t1_fields: [velocity]
+        t2_fields: []
+      axis_selection:
+        0:
+          linspace: [0, 100, 16]
+        1:
+          slice: [0, 128, 2]
+        2:
+          slice: [0, 384, 3]
+      files:
+        - filename: data/train/turbulent_radiative_layer_tcool_0.03.hdf5
+        - filename: data/train/turbulent_radiative_layer_tcool_0.06.hdf5
+        - filename: data/train/turbulent_radiative_layer_tcool_0.10.hdf5
+        - filename: data/train/turbulent_radiative_layer_tcool_0.18.hdf5
+        - filename: data/train/turbulent_radiative_layer_tcool_0.32.hdf5
+        - filename: data/train/turbulent_radiative_layer_tcool_0.56.hdf5
+        - filename: data/train/turbulent_radiative_layer_tcool_1.00.hdf5
+        - filename: data/train/turbulent_radiative_layer_tcool_1.78.hdf5
+        - filename: data/train/turbulent_radiative_layer_tcool_3.16.hdf5
+        - filename: data/valid/turbulent_radiative_layer_tcool_0.03.hdf5
+        - filename: data/valid/turbulent_radiative_layer_tcool_0.06.hdf5
+        - filename: data/valid/turbulent_radiative_layer_tcool_0.10.hdf5
+        - filename: data/valid/turbulent_radiative_layer_tcool_0.18.hdf5
+        - filename: data/valid/turbulent_radiative_layer_tcool_0.32.hdf5
+        - filename: data/valid/turbulent_radiative_layer_tcool_0.56.hdf5
+        - filename: data/valid/turbulent_radiative_layer_tcool_1.00.hdf5
+        - filename: data/valid/turbulent_radiative_layer_tcool_1.78.hdf5
+        - filename: data/valid/turbulent_radiative_layer_tcool_3.16.hdf5
+        - filename: data/test/turbulent_radiative_layer_tcool_0.03.hdf5
+        - filename: data/test/turbulent_radiative_layer_tcool_0.06.hdf5
+        - filename: data/test/turbulent_radiative_layer_tcool_0.10.hdf5
+        - filename: data/test/turbulent_radiative_layer_tcool_0.18.hdf5
+        - filename: data/test/turbulent_radiative_layer_tcool_0.32.hdf5
+        - filename: data/test/turbulent_radiative_layer_tcool_0.56.hdf5
+        - filename: data/test/turbulent_radiative_layer_tcool_1.00.hdf5
+        - filename: data/test/turbulent_radiative_layer_tcool_1.78.hdf5
+        - filename: data/test/turbulent_radiative_layer_tcool_3.16.hdf5
+
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3]
+      output_time_indices: [1, 2, 3, 4]
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: turbulent_radiative_layer_2d
+
+    split:
+      type: explicit
+      train: [0, 72]
+      val: [72, 81]
+      test: [81, 90]
+
+    loaders:
+      train:
+        batch_size: 2
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_active_matter
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/active_matter
+      cache_dir: D:/TheWell/active_matter/hf_cache
+      field_groups:
+        t0_fields: [concentration]
+        t1_fields: []
+        t2_fields: []
+      axis_selection:
+        0:
+          linspace: [0, 80, 16]
+        1:
+          slice: [0, 256, 4]
+        2:
+          slice: [0, 256, 2]
+      files:
+        - filename: data/train/active_matter_L_10.0_zeta_17.0_alpha_-4.0.hdf5
+        - filename: data/valid/active_matter_L_10.0_zeta_17.0_alpha_-4.0.hdf5
+        - filename: data/test/active_matter_L_10.0_zeta_17.0_alpha_-4.0.hdf5
+
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3]
+      output_time_indices: [1, 2, 3, 4]
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: active_matter
+
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+
+    loaders:
+      train:
+        batch_size: 2
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_shear_flow
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: D:/TheWell/shear_flow/hf_cache
+      field_groups:
+        t0_fields: [tracer, pressure]
+        t1_fields: []
+        t2_fields: []
+      axis_selection:
+        0:
+          linspace: [0, 199, 16]
+        1:
+          slice: [0, 256, 4]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3]
+      output_time_indices: [1, 2, 3, 4]
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+
+    loaders:
+      train:
+        batch_size: 2
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+normalization:
+  enabled: true
+  normalize_x: true
+  normalize_y: true
+  device: cuda
+  max_fit_batches: 1
+
+model:
+  type: adapted_fno_no_mamba
+  n_dim: 3
+  hidden_channels: 8
+  lifting_layers: 1
+  projection_layers: 1
+  core_layers: 2
+  n_modes: [4, 8, 8]
+
+training:
+  epochs: 5
+  device: cuda
+  train_main_fno: true
+  optimizer:
+    optimizer: adamw
+    lr: 0.001
+    weight_decay: 0.00001
+  scheduler:
+    scheduler: reducelr
+    patience: 2
+    factor: 0.5
+    min_lr: 0.000001
+
+evaluation:
+  after_training: false
+
+metrics:
+  names:
+    - mse
+    - mae
+    - rmse
+    - nrmse
+    - vrmse
+    - relative_l2
