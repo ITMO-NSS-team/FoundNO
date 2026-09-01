@@ -176,7 +176,7 @@ class Trainer(object):
                 logger_name=logger_name,
                 write_every=1,
                 epochs_aggreg=1,
-                info_entries=["train_loss", "val_loss", "lr"],
+                info_entries=["trains_loss", "val_loss", "lr", "local_rank", "global_rank"],
             )
         else:
             self._logger = logger
