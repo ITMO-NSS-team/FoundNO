@@ -28,6 +28,7 @@ def _selector_from_config(config):
                 return [int(start)]
             step = (stop - start) / (count - 1)
             return [int(round(start + i * step)) for i in range(count)]
+
     raise ValueError(f"Unknown axis selection config: {config}")
 
 
@@ -71,10 +72,11 @@ class DictSource:
 
 
 class NetCDFSource:
-    def __init__(self, path, variable_name, sample_dim, ds=None, array=None):
+    def __init__(self, path, variable_name, sample_dim, axis_selection=None, ds=None, array=None):
         self.path = path
         self.variable_name = variable_name
         self.sample_dim = sample_dim
+        self.axis_selection = _normalize_axis_selection(axis_selection)
         self._ds = ds
         self._array = array
 
@@ -85,6 +87,18 @@ class NetCDFSource:
     def get_sample(self, idx):
         self._open()
         sample = self._array.isel({self.sample_dim: idx})
+
+        idx_dict = {}
+        for axis, axis_selector in self.axis_selection.items():
+            if axis < 0 or axis >= sample.ndim:
+                raise ValueError(
+                    f"axis_selection axis {axis} is out of range for NetCDF sample "
+                    f"with ndim={sample.ndim}, dims={sample.dims}"
+                )
+            dim_name = sample.dims[axis]
+            idx_dict[dim_name] = axis_selector
+        sample = sample.isel(idx_dict)
+
         return torch.from_numpy(sample.to_numpy()).float()
 
     def _open(self):

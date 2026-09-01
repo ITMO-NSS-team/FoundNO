@@ -135,6 +135,7 @@ def parse_args():
         help="Path to YAML experiment config.",
     )
     parser.add_argument("--epochs", type=int, default=None, help="Number of epochs to train the model.")
+    parser.add_argument("--device", type=int, default=0, help="Index of the used GPU device.")
 
     parser.add_argument("--core-checkpoint", default=None, help="Path to pre-trained core checkpoints.")
     parser.add_argument("--lift-checkpoint-dir", default=None, help="Path to pre-trained core checkpoints.")
@@ -170,8 +171,7 @@ def main():
     epochs = args.epochs if args.epochs is not None else training_config.get("epochs", 1)
     # device = args.device if args.device is not None else training_config.get("device", "cuda")
 
-    device = 'cuda' #[i for i in range(torch.cuda.device_count())] #[int(arg) for arg in devices]
-    print(f'Training model on devices {device}.')
+    device = f'cuda:{args.device}' #[i for i in range(torch.cuda.device_count())] #[int(arg) for arg in devices]
 
     output_config = config.get("output", {})
     output_root = (
@@ -270,6 +270,10 @@ def main():
         device=device
     )
     save_data_processors(data_processors, output_dir)
+
+    print('-' * 30)
+    print(f'Training model on devices {device}.')
+    print('-' * 30)
 
     trainer.train(
         train_loader=train_loader,
