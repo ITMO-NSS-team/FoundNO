@@ -1,0 +1,191 @@
+inspection:
+  enabled: true
+
+tasks:
+  - name: pdebench_2d_reacdiff
+    source:
+      location: url
+      format: hdf5_grouped
+      variable_path: data
+      url: https://darus.uni-stuttgart.de/api/access/datafile/133017
+      path: D:/PDEBench_data/2D_ReacDiff/2D_diff-react_NA_NA.h5
+      axis_selection:
+        0:
+          linspace: [0, 100, 16]
+
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TXYC
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: 2d_reacdiff
+
+    split:
+      type: ratios
+      train: 0.8
+      val: 0.1
+      test: 0.1
+
+    loaders:
+      train:
+        batch_size: 2
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 2
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 2
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: pdebench_swe
+    source:
+      location: url
+      format: hdf5_grouped
+      variable_path: data
+      url: https://darus.uni-stuttgart.de/api/access/datafile/133021
+      path: D:/PDEBench_data/SWE/2D_rdb_NA_NA.h5
+      axis_selection:
+        0:
+          linspace: [0, 100, 16]
+
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TXYC
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: swe
+
+    split:
+      type: ratios
+      train: 0.8
+      val: 0.1
+      test: 0.1
+
+    loaders:
+      train:
+        batch_size: 2
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 2
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 2
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: pdebench_ns_incom
+    source:
+      location: url
+      format: concat_hdf5
+      variable_path: velocity
+      sample_dim: 0
+      axis_selection:
+        0:
+          linspace: [0, 999, 16]
+        1:
+          slice: [0, 512, 4]
+        2:
+          slice: [0, 512, 4]
+
+      files:
+        - filename: ns_incom_inhom_2d_512-0.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133280
+          path: D:/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-0.h5
+
+        - filename: ns_incom_inhom_2d_512-1.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/136439
+          path: D:/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-1.h5
+
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TXYC
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: ns_incom
+
+    split:
+      type: ratios
+      train: 0.75
+      val: 0.125
+      test: 0.125
+
+    loaders:
+      train:
+        batch_size: 2
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 2
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 2
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+normalization:
+  enabled: true
+  normalize_x: true
+  normalize_y: true
+  device: cuda
+  max_fit_batches: 1
+
+model:
+  type: adapted_fno_no_mamba
+  n_dim: 3
+  hidden_channels: 8
+  lifting_layers: 1
+  projection_layers: 1
+  core_layers: 1
+  n_modes: [4, 8, 8]
+
+training:
+  epochs: 10
+  device: cuda
+  train_main_fno: true
+
+  optimizer:
+    optimizer: adamw
+    lr: 0.001
+    weight_decay: 0.00001
+
+  scheduler:
+    scheduler: reducelr
+    patience: 2
+    factor: 0.5
+    min_lr: 0.000001

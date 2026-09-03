@@ -1,0 +1,130 @@
+﻿tasks:
+  - source:
+      location: huggingface
+      format: netcdf
+      repo_id: camlab-ethz/SE-AF
+      filename: SE-AF.nc
+      cache_dir: D:\datasets_cache
+      variable_name: solution
+      sample_dim: sample
+    adapter:
+      type: index
+      variable_name: null
+      data_order: CHW
+      input_indices: [0]
+      output_indices: [1]
+      benchmark_name: POSEIDON
+      physics_name: SE-AF
+    split:
+      train: [0, 32]
+      val: [32, 48]
+      test: [48, 64]
+    max_samples_per_split:
+      train: 16
+      val: 16
+      test: 16
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - source:
+      location: huggingface
+      format: multi_netcdf
+      repo_id: camlab-ethz/Wave-Gauss
+      cache_dir: D:\datasets_cache
+      length_component: solution
+      components:
+        solution:
+          files:
+            - filename: solution_0.nc
+          variable_name: solution
+          sample_dim: sample
+        c:
+          filename: c_0.nc
+          variable_name: c
+          sample_dim: sample
+    adapter:
+      type: temporal
+      variable_name: solution
+      data_order: THW
+      input_time_indices: [0, 1, 2, 3]
+      output_time_indices: [4, 5]
+      static_inputs:
+        - variable_name: c
+          data_order: HW
+          target: x
+      benchmark_name: POSEIDON
+      physics_name: Wave-Gauss
+    split:
+      train: [0, 32]
+      val: [32, 48]
+      test: [48, 64]
+    max_samples_per_split:
+      train: 16
+      val: 16
+      test: 16
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+normalization:
+  enabled: true
+  normalize_x: true
+  normalize_y: true
+  device: cuda
+  max_fit_batches: null
+
+model:
+  type: adapted_fno_debug
+  n_dim: 2
+  hidden_channels: 16
+  lifting_layers: 2
+  projection_layers: 2
+  core_layers: 2
+  n_modes: [16, 16]
+
+training:
+  epochs: 1
+  device: cuda
+  optimizer:
+    optimizer: adamw
+    lr: 0.001
+    weight_decay: 0.00001
+  scheduler:
+    scheduler: reducelr
+    patience: 2
+    factor: 0.5
+    min_lr: 0.000001
+

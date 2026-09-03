@@ -1,0 +1,163 @@
+﻿tasks:
+  - source:
+      location: local
+      format: hdf5
+      path: D:\PDEBench_data\debug_diff_sorp.hdf5
+      variable_path: data
+      sample_dim: 0
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TCX
+      input_time_indices: [0, 1, 2]
+      output_time_indices: [3, 4]
+      input_channel_indices: [0, 1]
+      output_channel_indices: [0, 1]
+      benchmark_name: PDEBench
+      physics_name: diff_sorp
+      ensure_2d: true
+    split:
+      train: [0, 16]
+      val: [16, 24]
+      test: [24, 32]
+    max_samples_per_split:
+      train: 16
+      val: 8
+      test: 8
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - source:
+      location: local
+      format: hdf5
+      path: D:\PDEBench_data\debug_darcy.hdf5
+      sample_dim: 0
+      variables:
+        coeff: coeff
+        solution: solution
+    adapter:
+      type: input_output
+      input_variable_name: coeff
+      output_variable_name: solution
+      input_order: XY
+      output_order: XY
+      benchmark_name: PDEBench
+      physics_name: darcy
+    split:
+      train: [0, 16]
+      val: [16, 24]
+      test: [24, 32]
+    max_samples_per_split:
+      train: 16
+      val: 8
+      test: 8
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - source:
+      location: local
+      format: hdf5
+      path: D:\PDEBench_data\debug_swe.hdf5
+      variable_path: data
+      sample_dim: 0
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TCHW
+      input_time_indices: [0, 1, 2]
+      output_time_indices: [3, 4]
+      input_channel_indices: [0, 1, 2]
+      output_channel_indices: [0, 1, 2]
+      benchmark_name: PDEBench
+      physics_name: swe
+    split:
+      train: [0, 16]
+      val: [16, 24]
+      test: [24, 32]
+    max_samples_per_split:
+      train: 16
+      val: 8
+      test: 8
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+normalization:
+  enabled: true
+  normalize_x: true
+  normalize_y: true
+  device: cuda
+  max_fit_batches: null
+
+model:
+  type: adapted_fno_debug
+  n_dim: 2
+  hidden_channels: 16
+  lifting_layers: 2
+  projection_layers: 2
+  core_layers: 2
+  n_modes: [16, 16]
+
+training:
+  epochs: 1
+  device: cuda
+  optimizer:
+    optimizer: adamw
+    lr: 0.001
+    weight_decay: 0.00001
+  scheduler:
+    scheduler: reducelr
+    patience: 2
+    factor: 0.5
+    min_lr: 0.000001
+

@@ -1,0 +1,668 @@
+output:
+  root: /workspace/runs
+
+seed:
+  value: 42
+  deterministic: false
+
+inspections:
+  enabled: true
+
+tasks:
+  - name: pdebench_2d_cfd
+    source:
+      location: url
+      format: hdf5
+      sample_dim: 0
+      variables:
+        density: density
+        pressure: pressure
+        Vx: Vx
+        Vy: Vy
+      url: https://darus.uni-stuttgart.de/api/access/datafile/164687
+      path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
+      axis_selection:
+        0:
+          linspace: [0, 20, 16]
+
+    adapter:
+      type: temporal
+      variable_names: [density, pressure, Vx, Vy]
+      data_order: TXY
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: 2d_cfd
+
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+
+    loaders:
+      train:
+        batch_size: 16
+        num_workers: 0
+        pin_memory: true
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: true
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: true
+        shuffle: false
+        drop_last: false
+
+  - name: pdebench_2d_reacdiff
+    source:
+      location: url
+      format: hdf5_grouped
+      variable_path: data
+      url: https://darus.uni-stuttgart.de/api/access/datafile/133017
+      path: /workspace/data/PDEBench_data/2D_ReacDiff/2D_diff-react_NA_NA.h5
+      axis_selection:
+        0:
+          linspace: [0, 50, 16]
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TXYC
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: 2d_reacdiff
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 16
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: pdebench_swe
+    source:
+      location: url
+      format: hdf5_grouped
+      variable_path: data
+      url: https://darus.uni-stuttgart.de/api/access/datafile/133021
+      path: /workspace/data/PDEBench_data/SWE/2D_rdb_NA_NA.h5
+      axis_selection:
+        0:
+          linspace: [0, 50, 16]
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TXYC
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: swe
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 16
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: pdebench_ns_incom
+    source:
+      location: url
+      format: concat_hdf5
+      variable_path: velocity
+      sample_dim: 0
+      axis_selection:
+        0:
+          linspace: [0, 500, 16]
+        1:
+          slice: [0, 512, 4]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: ns_incom_inhom_2d_512-0.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133280
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-0.h5
+        - filename: ns_incom_inhom_2d_512-1.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/136439
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-1.h5
+        - filename: ns_incom_inhom_2d_512-10.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133309
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-10.h5
+        - filename: ns_incom_inhom_2d_512-25.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133619
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-25.h5
+        - filename: ns_incom_inhom_2d_512-50.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133678
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-50.h5
+        - filename: ns_incom_inhom_2d_512-75.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133694
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-75.h5
+        - filename: ns_incom_inhom_2d_512-100.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133267
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-100.h5
+        - filename: ns_incom_inhom_2d_512-150.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133602
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-150.h5
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TXYC
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: ns_incom
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 16
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: poseidon_ce_rp
+    source:
+      location: huggingface
+      format: concat_netcdf
+      repo_id: camlab-ethz/CE-RP
+      cache_dir: /workspace/data/Poseidon_data/CE-RP/hf_cache
+      variable_name: data
+      sample_dim: sample
+      file_selection:
+        max_files: 7
+        strategy: first
+      files:
+        - filename: data_0.nc
+        - filename: data_1.nc
+        - filename: data_2.nc
+        - filename: data_3.nc
+        - filename: data_4.nc
+        - filename: data_5.nc
+        - filename: data_6.nc
+#        - filename: data_7.nc
+#        - filename: data_8.nc
+#        - filename: data_9.nc
+#        - filename: data_10.nc
+#        - filename: data_11.nc
+#        - filename: data_12.nc
+#        - filename: data_13.nc
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+      output_time_indices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      flatten_time_to_channels: false
+      benchmark_name: Poseidon
+      window_start_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      physics_name: ce_rp
+      input_channel_indices: [0, 1, 2, 3, 4]
+      output_channel_indices: [0, 1, 2, 3, 4]
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 16
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: poseidon_ce_kh
+    source:
+      location: huggingface
+      format: concat_netcdf
+      repo_id: camlab-ethz/CE-KH
+      cache_dir: /workspace/data/Poseidon_data/CE-KH/hf_cache
+      variable_name: data
+      sample_dim: sample
+      file_selection:
+        max_files: 7
+        strategy: first
+      files:
+        - filename: data_0.nc
+        - filename: data_1.nc
+        - filename: data_2.nc
+        - filename: data_3.nc
+        - filename: data_4.nc
+        - filename: data_5.nc
+        - filename: data_6.nc
+#        - filename: data_7.nc
+#        - filename: data_8.nc
+#        - filename: data_9.nc
+#        - filename: data_10.nc
+#        - filename: data_11.nc
+#        - filename: data_12.nc
+#        - filename: data_13.nc
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+      output_time_indices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      flatten_time_to_channels: false
+      benchmark_name: Poseidon
+      window_start_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      physics_name: ce_kh
+      input_channel_indices: [0, 1, 2, 3, 4]
+      output_channel_indices: [ 0, 1, 2, 3, 4]
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 16
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: poseidon_ce_crp
+    source:
+      location: huggingface
+      format: concat_netcdf
+      repo_id: camlab-ethz/CE-CRP
+      cache_dir: /workspace/data/Poseidon_data/CE-CRP/hf_cache
+      variable_name: data
+      sample_dim: sample
+      file_selection:
+        max_files: 7
+        strategy: first
+      files:
+        - filename: data_0.nc
+        - filename: data_1.nc
+        - filename: data_2.nc
+        - filename: data_3.nc
+        - filename: data_4.nc
+        - filename: data_5.nc
+        - filename: data_6.nc
+#        - filename: data_7.nc
+#        - filename: data_8.nc
+#        - filename: data_9.nc
+#        - filename: data_10.nc
+#        - filename: data_11.nc
+#        - filename: data_12.nc
+#        - filename: data_13.nc
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+      output_time_indices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      flatten_time_to_channels: false
+      benchmark_name: Poseidon
+      window_start_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      physics_name: ce_crp
+      input_channel_indices: [0, 1, 2, 3, 4]
+      output_channel_indices: [0, 1, 2, 3, 4]
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 16
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: poseidon_ce_gauss
+    source:
+      location: huggingface
+      format: concat_netcdf
+      repo_id: camlab-ethz/CE-Gauss
+      cache_dir: /workspace/data/Poseidon_data/CE-Gauss/hf_cache
+      variable_name: data
+      sample_dim: sample
+      file_selection:
+        max_files: 7
+        strategy: first
+      files:
+        - filename: data_0.nc
+        - filename: data_1.nc
+        - filename: data_2.nc
+        - filename: data_3.nc
+        - filename: data_4.nc
+        - filename: data_5.nc
+        - filename: data_6.nc
+#        - filename: data_7.nc
+#        - filename: data_8.nc
+#        - filename: data_9.nc
+#        - filename: data_10.nc
+#        - filename: data_11.nc
+#        - filename: data_12.nc
+#        - filename: data_13.nc
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+      output_time_indices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      flatten_time_to_channels: false
+      benchmark_name: Poseidon
+      window_start_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      physics_name: ce_gauss
+      input_channel_indices: [0, 1, 2, 3, 4]
+      output_channel_indices: [0, 1, 2, 3, 4]
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 16
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: poseidon_ns_sines
+    source:
+      location: huggingface
+      format: concat_netcdf
+      repo_id: camlab-ethz/NS-Sines
+      cache_dir: /workspace/data/Poseidon_data/NS-Sines/hf_cache
+      variable_name: velocity
+      sample_dim: sample
+      file_selection:
+        max_files: 7
+        strategy: first
+      files:
+        - filename: velocity_0.nc
+        - filename: velocity_1.nc
+        - filename: velocity_2.nc
+        - filename: velocity_3.nc
+        - filename: velocity_4.nc
+        - filename: velocity_5.nc
+        - filename: velocity_6.nc
+#        - filename: velocity_7.nc
+#        - filename: velocity_8.nc
+#        - filename: velocity_9.nc
+#        - filename: velocity_10.nc
+#        - filename: velocity_11.nc
+#        - filename: velocity_12.nc
+#        - filename: velocity_13.nc
+#        - filename: velocity_14.nc
+#        - filename: velocity_15.nc
+#        - filename: velocity_16.nc
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+      output_time_indices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      flatten_time_to_channels: false
+      benchmark_name: Poseidon
+      window_start_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      physics_name: ns_sines
+      input_channel_indices: [0, 1, 2]
+      output_channel_indices: [0, 1, 2]
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 16
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: poseidon_ns_gauss
+    source:
+      location: huggingface
+      format: concat_netcdf
+      repo_id: camlab-ethz/NS-Gauss
+      cache_dir: /workspace/data/Poseidon_data/NS-Gauss/hf_cache
+      variable_name: velocity
+      sample_dim: sample
+      file_selection:
+        max_files: 7
+        strategy: first
+      files:
+        - filename: velocity_0.nc
+        - filename: velocity_1.nc
+        - filename: velocity_2.nc
+        - filename: velocity_3.nc
+        - filename: velocity_4.nc
+        - filename: velocity_5.nc
+        - filename: velocity_6.nc
+#        - filename: velocity_7.nc
+#        - filename: velocity_8.nc
+#        - filename: velocity_9.nc
+#        - filename: velocity_10.nc
+#        - filename: velocity_11.nc
+#        - filename: velocity_12.nc
+#        - filename: velocity_13.nc
+#        - filename: velocity_14.nc
+#        - filename: velocity_15.nc
+#        - filename: velocity_16.nc
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+      output_time_indices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      flatten_time_to_channels: false
+      benchmark_name: Poseidon
+      window_start_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      physics_name: ns_gauss
+      input_channel_indices: [0, 1, 2]
+      output_channel_indices: [0, 1, 2]
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 16
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 32
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+normalization:
+  enabled: true
+  normalize_x: true
+  normalize_y: true
+  device: cuda
+  max_fit_batches: 32
+
+model:
+  type: adapted_fno_no_mamba
+  n_dim: 3
+  hidden_channels: 120
+  lifting_layers: 1
+  projection_layers: 1
+  core_layers: 2
+  n_modes: [16, 32, 32]
+
+training:
+  epochs: 10
+  device: cuda
+  train_main_fno: true
+  optimizer:
+    optimizer: adamw
+    lr: 0.001
+    weight_decay: 1.0e-05
+  scheduler:
+    scheduler: reducelr
+    patience: 2
+    factor: 0.5
+    min_lr: 1.0e-06
+
+evaluation:
+  after_training: true
+
+metrics:
+  names:
+    - mse
+    - mae
+    - rmse
+    - nrmse
+    - vrmse
+    - relative_l2
+    - balanced_relative_l2
+    - nmae_range
+    - r2_score
+    - mean_linf_error
+    - max_linf_error
+  physical:
+    - name: spectral_mse
+      tasks: all
+    - name: spectral_nrmse
+      tasks: all

@@ -13,18 +13,18 @@ import torch
 
 from neuralop.models import FNO
 
-from fnofound.utils.training_utils import load_files_hdf5, validateOperator
+from muno.utils.training_utils import load_files_hdf5, validateOperator
 
-from fnofound.utils.domains import Domain
-from fnofound.utils.data_utils import SimpleDataset, NDDataset
-from fnofound.utils.custom_trainer import Trainer, Logger
+from muno.utils.domains import Domain
+from muno.utils.data_utils import SimpleDataset, NDDataset
+from muno.utils.custom_trainer import Trainer, Logger
 
-from fnofound.models.pecoda import PeCODANO
-from fnofound.models.mamba_fno import PostLiftMambaFNO
-from fnofound.models.localattn_exp import LocalAttnFNO
+from muno.models.pecoda import PeCODANO
+from muno.models.mamba_fno import PostLiftMambaFNO
+from muno.models.localattn_exp import LocalAttnFNO
 
-from fnofound.data import UnitGaussianNormalizer
-from fnofound.data.data.transforms.data_processors import DefaultDataProcessor
+from muno.data import UnitGaussianNormalizer
+from muno.data.data.transforms.data_processors import DefaultDataProcessor
 
 
 # OPTIMIZER_PARAMS = {'optimizer': "adam", 'lr': 1e-3}

@@ -15,12 +15,12 @@ from neuralop.models import FNO
 
 # from 
 
-from fnofound.utils.training_utils import load_files_hdf5
+from muno.utils.training_utils import load_files_hdf5
 
-from fnofound.utils.domains import Domain
-from fnofound.utils.data_utils import SimpleDataset
+from muno.utils.domains import Domain
+from muno.utils.data_utils import SimpleDataset
 
-from fnofound.utils.custom_finetuner import FineTuner
+from muno.utils.custom_finetuner import FineTuner
 
 OPTIMIZER_PARAMS = {'optimizer': "adam", 'lr': 1e-3}
 
