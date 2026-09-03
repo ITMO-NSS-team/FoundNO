@@ -1,0 +1,652 @@
+output:
+  root: D:\FoundNO_test_runs
+
+seed:
+  value: 42
+  deterministic: false
+
+inspections:
+  enabled: true
+
+tasks:
+  #  - name: pdebench_2d_cfd
+  #    source:
+  #      location: url
+  #      format: hdf5
+  #      sample_dim: 0
+  #      variables:
+  #        density: density
+  #        pressure: pressure
+  #        Vx: Vx
+  #        Vy: Vy
+  #      url: https://darus.uni-stuttgart.de/api/access/datafile/164687
+  #      path: D:/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
+  #      axis_selection:
+  #        0:
+  #          linspace: [0, 20, 16]
+  #
+  #    adapter:
+  #      type: temporal
+  #      variable_names: [density, pressure, Vx, Vy]
+  #      data_order: TXY
+  #      temporal_mode: initial_to_trajectory
+  #      input_time_index: 0
+  #      output_time_indices: all
+  #      flatten_time_to_channels: false
+  #      benchmark_name: PDEBench
+  #      physics_name: 2d_cfd
+  #
+  #    split:
+  #      type: explicit
+  #      train: [0, 1600]
+  #      val: [1600, 1800]
+  #      test: [1800, 2000]
+  #
+  #    loaders:
+  #      train:
+  #        batch_size: 4
+  #        num_workers: 0
+  #        pin_memory: false
+  #        shuffle: true
+  #        drop_last: false
+  #      val:
+  #        batch_size: 4
+  #        num_workers: 0
+  #        pin_memory: false
+  #        shuffle: false
+  #        drop_last: false
+  #      test:
+  #        batch_size: 4
+  #        num_workers: 0
+  #        pin_memory: false
+  #        shuffle: false
+  #        drop_last: false
+
+  - name: pdebench_2d_reacdiff
+    source:
+      location: url
+      format: hdf5_grouped
+      variable_path: data
+      url: https://darus.uni-stuttgart.de/api/access/datafile/133017
+      path: D:/PDEBench_data/2D_ReacDiff/2D_diff-react_NA_NA.h5
+      axis_selection:
+        0:
+          linspace: [ 0, 50, 16 ]
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TXYC
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: 2d_reacdiff
+    trajectory_selection:
+      count: 100
+      strategy: first
+      seed: 42
+    split:
+      type: ratios
+      train: 0.8
+      val: 0.1
+      test: 0.1
+    loaders:
+      train:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: false
+      val:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: pdebench_swe
+    source:
+      location: url
+      format: hdf5_grouped
+      variable_path: data
+      url: https://darus.uni-stuttgart.de/api/access/datafile/133021
+      path: D:/PDEBench_data/SWE/2D_rdb_NA_NA.h5
+      axis_selection:
+        0:
+          linspace: [ 0, 50, 16 ]
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TXYC
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: swe
+    trajectory_selection:
+      count: 50
+      strategy: random
+      seed: 42
+    split:
+      type: ratios
+      train: 0.8
+      val: 0.1
+      test: 0.1
+    loaders:
+      train:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: false
+      val:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+#  - name: pdebench_ns_incom
+#    source:
+#      location: url
+#      format: concat_hdf5
+#      variable_path: velocity
+#      sample_dim: 0
+#      axis_selection:
+#        0:
+#          linspace: [ 0, 500, 16 ]
+#        1:
+#          slice: [ 0, 512, 4 ]
+#        2:
+#          slice: [ 0, 512, 4 ]
+#      files:
+#        - filename: ns_incom_inhom_2d_512-0.h5
+#          url: https://darus.uni-stuttgart.de/api/access/datafile/133280
+#          path: D:/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-0.h5
+#        - filename: ns_incom_inhom_2d_512-1.h5
+#          url: https://darus.uni-stuttgart.de/api/access/datafile/136439
+#          path: D:/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-1.h5
+#        - filename: ns_incom_inhom_2d_512-10.h5
+#          url: https://darus.uni-stuttgart.de/api/access/datafile/133309
+#          path: D:/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-10.h5
+#        - filename: ns_incom_inhom_2d_512-25.h5
+#          url: https://darus.uni-stuttgart.de/api/access/datafile/133619
+#          path: D:/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-25.h5
+#        - filename: ns_incom_inhom_2d_512-50.h5
+#          url: https://darus.uni-stuttgart.de/api/access/datafile/133678
+#          path: D:/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-50.h5
+#        - filename: ns_incom_inhom_2d_512-75.h5
+#          url: https://darus.uni-stuttgart.de/api/access/datafile/133694
+#          path: D:/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-75.h5
+#        - filename: ns_incom_inhom_2d_512-100.h5
+#          url: https://darus.uni-stuttgart.de/api/access/datafile/133267
+#          path: D:/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-100.h5
+#        - filename: ns_incom_inhom_2d_512-150.h5
+#          url: https://darus.uni-stuttgart.de/api/access/datafile/133602
+#          path: D:/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-150.h5
+#    adapter:
+#      type: temporal
+#      variable_name: null
+#      data_order: TXYC
+#      temporal_mode: initial_to_trajectory
+#      input_time_index: 0
+#      output_time_indices: all
+#      flatten_time_to_channels: false
+#      benchmark_name: PDEBench
+#      physics_name: ns_incom
+#    split:
+#      type: ratios
+#      train: 0.6
+#      val: 0.2
+#      test: 0.2
+#    loaders:
+#      train:
+#        batch_size: 4
+#        num_workers: 0
+#        pin_memory: false
+#        shuffle: true
+#        drop_last: false
+#      val:
+#        batch_size: 4
+#        num_workers: 0
+#        pin_memory: false
+#        shuffle: false
+#        drop_last: false
+#      test:
+#        batch_size: 4
+#        num_workers: 0
+#        pin_memory: false
+#        shuffle: false
+#        drop_last: false
+
+  - name: poseidon_ce
+    source:
+      location: huggingface
+      format: concat_netcdf
+      variable_name: data
+      sample_dim: sample
+      token_env: HF_TOKEN
+      axis_selection:
+        0:
+          linspace: [ 0, 20, 16 ]
+        2:
+          slice: [ 0, 128, 2 ]
+        3:
+          slice: [ 0, 128, 2 ]
+      files:
+        - repo_id: camlab-ethz/CE-RP
+          cache_dir: D:/Poseidon_data/CE-RP/hf_cache
+          filename: data_0.nc
+        - repo_id: camlab-ethz/CE-RP
+          cache_dir: D:/Poseidon_data/CE-RP/hf_cache
+          filename: data_1.nc
+        - repo_id: camlab-ethz/CE-KH
+          cache_dir: D:/Poseidon_data/CE-KH/hf_cache
+          filename: data_0.nc
+        - repo_id: camlab-ethz/CE-KH
+          cache_dir: D:/Poseidon_data/CE-KH/hf_cache
+          filename: data_1.nc
+        - repo_id: camlab-ethz/CE-CRP
+          cache_dir: D:/Poseidon_data/CE-CRP/hf_cache
+          filename: data_0.nc
+        - repo_id: camlab-ethz/CE-CRP
+          cache_dir: D:/Poseidon_data/CE-CRP/hf_cache
+          filename: data_1.nc
+        - repo_id: camlab-ethz/CE-Gauss
+          cache_dir: D:/Poseidon_data/CE-Gauss/hf_cache
+          filename: data_0.nc
+        - repo_id: camlab-ethz/CE-Gauss
+          cache_dir: D:/Poseidon_data/CE-Gauss/hf_cache
+          filename: data_1.nc
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TCHW
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: Poseidon
+      physics_name: ce
+      input_channel_indices: [ 0, 1, 2, 3, 4 ]
+      output_channel_indices: [ 0, 1, 2, 3, 4 ]
+    trajectory_selection:
+      count: 2000
+      strategy: first
+      seed: 42
+    split:
+      type: ratios
+      train: 0.8
+      val: 0.1
+      test: 0.1
+    loaders:
+      train:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: false
+      val:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: poseidon_ns
+    source:
+      location: huggingface
+      format: concat_netcdf
+      variable_name: velocity
+      sample_dim: sample
+      token_env: HF_TOKEN
+      axis_selection:
+        0:
+          linspace: [ 0, 20, 16 ]
+        2:
+          slice: [ 0, 128, 2 ]
+        3:
+          slice: [ 0, 128, 2 ]
+      files:
+        - repo_id: camlab-ethz/NS-Sines
+          cache_dir: D:/Poseidon_data/NS-Sines/hf_cache
+          filename: velocity_0.nc
+        - repo_id: camlab-ethz/NS-Sines
+          cache_dir: D:/Poseidon_data/NS-Sines/hf_cache
+          filename: velocity_1.nc
+        - repo_id: camlab-ethz/NS-Gauss
+          cache_dir: D:/Poseidon_data/NS-Gauss/hf_cache
+          filename: velocity_0.nc
+        - repo_id: camlab-ethz/NS-Gauss
+          cache_dir: D:/Poseidon_data/NS-Gauss/hf_cache
+          filename: velocity_1.nc
+    adapter:
+      type: temporal
+      variable_name: null
+      data_order: TCHW
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: Poseidon
+      physics_name: ns
+      input_channel_indices: [ 0, 1, 2 ]
+      output_channel_indices: [ 0, 1, 2 ]
+    trajectory_selection:
+      fraction: 0.4
+      strategy: random
+      seed: 42
+    split:
+      type: ratios
+      train: 0.8
+      val: 0.1
+      test: 0.1
+    loaders:
+      train:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: false
+      val:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_turbulent_radiative_layer_2d
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/turbulent_radiative_layer_2D
+      cache_dir: D:/TheWell_data/turbulent_radiative_layer_2D/hf_cache
+      token_env: HF_TOKEN
+      field_groups:
+        t0_fields: [ density, pressure ]
+        t1_fields: [ velocity ]
+        t2_fields: [ ]
+      axis_selection:
+        0:
+          linspace: [ 0, 100, 16 ]
+        1:
+          slice: [ 0, 128, 2 ]
+        2:
+          slice: [ 0, 384, 3 ]
+      files:
+        - filename: data/train/turbulent_radiative_layer_tcool_0.03.hdf5
+        - filename: data/train/turbulent_radiative_layer_tcool_0.06.hdf5
+        #        - filename: data/train/turbulent_radiative_layer_tcool_0.10.hdf5
+        #        - filename: data/train/turbulent_radiative_layer_tcool_0.18.hdf5
+        #        - filename: data/train/turbulent_radiative_layer_tcool_0.32.hdf5
+        #        - filename: data/train/turbulent_radiative_layer_tcool_0.56.hdf5
+        #        - filename: data/train/turbulent_radiative_layer_tcool_1.00.hdf5
+        #        - filename: data/train/turbulent_radiative_layer_tcool_1.78.hdf5
+        #        - filename: data/train/turbulent_radiative_layer_tcool_3.16.hdf5
+        - filename: data/valid/turbulent_radiative_layer_tcool_0.03.hdf5
+        - filename: data/valid/turbulent_radiative_layer_tcool_0.06.hdf5
+        #        - filename: data/valid/turbulent_radiative_layer_tcool_0.10.hdf5
+        #        - filename: data/valid/turbulent_radiative_layer_tcool_0.18.hdf5
+        #        - filename: data/valid/turbulent_radiative_layer_tcool_0.32.hdf5
+        #        - filename: data/valid/turbulent_radiative_layer_tcool_0.56.hdf5
+        #        - filename: data/valid/turbulent_radiative_layer_tcool_1.00.hdf5
+        #        - filename: data/valid/turbulent_radiative_layer_tcool_1.78.hdf5
+        #        - filename: data/valid/turbulent_radiative_layer_tcool_3.16.hdf5
+        - filename: data/test/turbulent_radiative_layer_tcool_0.03.hdf5
+        - filename: data/test/turbulent_radiative_layer_tcool_0.06.hdf5
+    #        - filename: data/test/turbulent_radiative_layer_tcool_0.10.hdf5
+    #        - filename: data/test/turbulent_radiative_layer_tcool_0.18.hdf5
+    #        - filename: data/test/turbulent_radiative_layer_tcool_0.32.hdf5
+    #        - filename: data/test/turbulent_radiative_layer_tcool_0.56.hdf5
+    #        - filename: data/test/turbulent_radiative_layer_tcool_1.00.hdf5
+    #        - filename: data/test/turbulent_radiative_layer_tcool_1.78.hdf5
+    #        - filename: data/test/turbulent_radiative_layer_tcool_3.16.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: turbulent_radiative_layer_2d
+    trajectory_selection:
+      count: 16
+      strategy: first
+      seed: 42
+    split:
+      type: explicit
+      train: [ 0, 8 ]
+      val: [ 8, 12 ]
+      test: [ 12, 16 ]
+    loaders:
+      train:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_active_matter
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/active_matter
+      cache_dir: D:/TheWell_data/active_matter/hf_cache
+      token_env: HF_TOKEN
+      field_groups:
+        t0_fields: [ concentration ]
+        t1_fields: [ velocity ]
+        t2_fields: [ D, E ]
+      axis_selection:
+        0:
+          linspace: [ 0, 80, 16 ]
+        1:
+          slice: [ 0, 256, 4 ]
+        2:
+          slice: [ 0, 256, 4 ]
+      files:
+        - filename: data/train/active_matter_L_10.0_zeta_17.0_alpha_-4.0.hdf5
+        - filename: data/valid/active_matter_L_10.0_zeta_17.0_alpha_-4.0.hdf5
+        - filename: data/test/active_matter_L_10.0_zeta_17.0_alpha_-4.0.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: active_matter
+#    trajectory_selection:
+#      count: 5
+#      strategy: first
+#      seed: 42
+    split:
+      type: explicit
+      train: [ 0, 3 ]
+      val: [ 3, 4 ]
+      test: [ 4, 5 ]
+    loaders:
+      train:
+        batch_size: 2
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: false
+      val:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+#  - name: thewell_shear_flow
+#    source:
+#      location: huggingface
+#      format: concat_thewell_hdf5
+#      repo_id: polymathic-ai/shear_flow
+#      cache_dir: D:/TheWell_data/shear_flow/hf_cache
+#      token_env: HF_TOKEN
+#      field_groups:
+#        t0_fields: [ tracer, pressure ]
+#        t1_fields: [ velocity ]
+#        t2_fields: [ ]
+#      axis_selection:
+#        0:
+#          linspace: [ 0, 199, 16 ]
+#        1:
+#          slice: [ 0, 256, 4 ]
+#        2:
+#          slice: [ 0, 512, 4 ]
+#      files:
+#        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+#        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+#        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+#    adapter:
+#      type: temporal
+#      variable_name: data
+#      data_order: TCHW
+#      temporal_mode: initial_to_trajectory
+#      input_time_index: 0
+#      output_time_indices: all
+#      flatten_time_to_channels: false
+#      benchmark_name: TheWell
+#      physics_name: shear_flow
+#    trajectory_selection:
+#      count: 30
+#      strategy: first
+#      seed: 42
+#    #    split:
+#    #      type: ratios
+#    #      train: 0.7
+#    #      val: 0.1
+#    #      test: 0.2
+#    split:
+#      type: explicit
+#      train: [ 0, 20 ]
+#      val: [ 20, 25 ]
+#      test: [ 25, 30 ]
+#    loaders:
+#      train:
+#        batch_size: 4
+#        num_workers: 0
+#        pin_memory: false
+#        shuffle: true
+#        drop_last: false
+#      val:
+#        batch_size: 4
+#        num_workers: 0
+#        pin_memory: false
+#        shuffle: false
+#        drop_last: false
+#      test:
+#        batch_size: 4
+#        num_workers: 0
+#        pin_memory: false
+#        shuffle: false
+#        drop_last: false
+
+normalization:
+  enabled: true
+  normalize_x: true
+  normalize_y: true
+  device: cuda
+  max_fit_batches: 2
+
+model:
+  type: adapted_fno
+  n_dim: 3
+  hidden_channels: 2
+  lifting_layers: 1
+  projection_layers: 1
+  core_layers: 2
+  n_modes: [ 2, 2, 2 ]
+
+training:
+  epochs: 10
+  device: cuda
+  train_main_fno: true
+  gradient_accumulation_steps: 2
+  optimizer:
+    optimizer: adamw
+    lr: 0.001
+    weight_decay: 1.0e-05
+  #  gradient_accumulation_steps: 4
+  scheduler:
+    scheduler: reducelr
+    patience: 2
+    factor: 0.5
+    min_lr: 1.0e-06
+
+evaluation:
+  after_training: true
+
+metrics:
+  names:
+    - mse
+    - mae
+    - rmse
+    - nrmse
+    - vrmse
+    - relative_l2
+    - balanced_relative_l2
+    - nmae_range
+    - r2_score
+    - mean_linf_error
+    - max_linf_error
+  physical:
+    - name: spectral_mse
+      tasks: all
+    - name: spectral_nrmse
+      tasks: all
+    - name: band_spectral_mse_2d
+      tasks: all
+    - name: band_spectral_nrmse_2d
+      tasks: all

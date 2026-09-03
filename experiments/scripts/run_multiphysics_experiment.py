@@ -228,6 +228,9 @@ def main():
     else:
         model = Muno(single_model = model_blocks)
 
+    DEFAULT_MODE = 'pretrain' # insert selection of the mode from a config
+    model.setMode(DEFAULT_MODE)
+
     trainer = Trainer(backup_loc=str(checkpoint_dir)) # , devices=devices
 
     trainer.gradient_accumulation_steps = int(training_config["gradient_accumulation_steps"])

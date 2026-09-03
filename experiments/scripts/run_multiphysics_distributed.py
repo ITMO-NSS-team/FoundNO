@@ -257,6 +257,9 @@ def main():
 
     model = Muno(liftings = model_blocks[0], core = model_blocks[1], projections = model_blocks[2])
     model.to(device=device)
+    
+    DEFAULT_MODE = 'pretrain' # insert selection of the mode from a config
+    model.setMode(DEFAULT_MODE)
 
     model = DistributedDataParallel(model, device_ids=[int(local_rank)], output_device=int(local_rank))
 

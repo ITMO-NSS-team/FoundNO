@@ -248,11 +248,15 @@ def _resolve_model_config(model_config):
     return resolved
 
 
+def get_all_files(dir: str, file_type: str = '.pt'):
+    return glob.glob(dir + "/*" + file_type)
+
+
 def load_from_dir(dir: str, SAVE_LOAD_ARGS = None):
-    files = glob.glob(dir + "/*.pt")
+    files = get_all_files(dir) # glob.glob(dir + "/*.pt")
     print('loading from {}'.format(files))
     return [torch.load(file, pickle_module=dill, **SAVE_LOAD_ARGS) for file in files]
-
+   
 
 def build_model(loader_channels, model_config,
                 pretr_core: torch.nn.Module = None,
