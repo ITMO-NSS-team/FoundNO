@@ -38,7 +38,7 @@ from muno.data.benchmarks.evaluation import filter_physical_metric_configs, comp
 
 from muno.data.benchmarks.datasets import MultiPhysicsDataset
 from muno.data.benchmarks.normalization import build_data_processors
-from muno.data.benchmarks.inspections import inspect_tasks
+from muno.data.benchmarks.inspections import inspect_tasks, save_image, canonical_image
 from muno.utils.custom_trainer import Trainer
 from muno.utils.training_utils import BalancedRelL2Loss
 from muno.utils.model_factory import build_model, load_from_dir, get_all_files
@@ -49,6 +49,7 @@ from muno.data.benchmarks.evaluation import (
 )
 
 from muno.models.muno import Muno
+from muno.models.mamba_fno import LiftingFeatureDropout, LiftingGaussianPerturbation
 
 def resolve_path(path):
     path = Path(path)
@@ -107,11 +108,10 @@ def predict_batch(model, sample, data_processor=None, device='cuda:0'):
         out, sample = data_processor.postprocess(out, sample, training=False)
 
     assert isinstance(out, dict), 'Multisample model prediction is expected to be a dict.'
-    return out, {sample[key]["y"] for key in sample.keys()}
+    return out, {key: sample[key]["y"] for key in sample.keys()}
 
 def compute_batch_metrics(pred: dict, target: dict, metrics_config, task_name):
     results = {}
-
     metric_names = metrics_config.get("names", [])
     if metric_names:
         results.update({key: compute_metrics(pred[key], target[key], metric_names=metric_names)
@@ -122,10 +122,41 @@ def compute_batch_metrics(pred: dict, target: dict, metrics_config, task_name):
         task_name,
     )
     if physical_configs:
-        results.update({key: compute_physical_metrics(pred, target, metric_configs=physical_configs)
+        results.update({key: compute_physical_metrics(pred[key], target[key], metric_configs=physical_configs)
                         for key in pred.keys()})
 
     return results
+
+    
+def set_mc_lifting(model: 'Muno', on: bool, adapter_idx: int = None):
+    """Turn structure-aware sampling on/off for one adapter, or all if adapter_idx is None."""
+    model.eval()  # core + projections always deterministic
+    indices = range(len(model._liftings)) if adapter_idx is None else [adapter_idx]
+    for i in indices:
+        lift = model._liftings[i]
+        if isinstance(lift, (LiftingFeatureDropout, LiftingGaussianPerturbation)):
+            lift.sample_noise = on
+
+@torch.no_grad()
+def mc_lifting_predict(model, sample, adapter_idx=0, T=20, device='cuda:0', **kwargs):
+    x = {key: sample[key]["x"].to(device) for key in sample}
+    target = {key: sample[key]["y"].to(device) for key in sample.keys()}
+    set_mc_lifting(model, on=True, adapter_idx=adapter_idx)
+    raw_samples = [model(x, adapter_idx=adapter_idx, **kwargs) for _ in range(T)]
+
+    if isinstance(raw_samples[0], dict):
+        keys = raw_samples[0].keys()
+        mean, band = {}, {}
+        for key in keys:
+            stacked = torch.stack([s[key] for s in raw_samples], dim=0)  # (T, B, C, ...)
+            mean[key] = stacked.mean(0)
+            band[key] = stacked.pow(2).mean(0).sub(mean[key].pow(2)).clamp_min(0).sqrt()
+        return mean, band, target
+    else:
+        stacked = torch.stack(raw_samples, dim=0)
+        mean = stacked.mean(0)
+        band = stacked.pow(2).mean(0).sub(mean.pow(2)).clamp_min(0).sqrt()
+        return mean, band, target
 
 def evaluate_loader(
     model,
@@ -133,10 +164,15 @@ def evaluate_loader(
     data_processor,
     metrics_config,
     task_name,
+    output_dir
 ):
     metric_sums = {}
-    n_samples = 0
+    n_batches = 0
 
+    model.eval()
+    output_prefix = Path(output_dir / f"inspections_inf_{task_name}")
+    output_prefix.mkdir(parents=True, exist_ok=True)
+    output_prefix = Path.joinpath(output_prefix, "inf_")
     with torch.no_grad():
         for sample in loader:
             pred, target = predict_batch(
@@ -144,11 +180,70 @@ def evaluate_loader(
                 sample,
                 data_processor=data_processor,
             )
+            band = pred
+            #pred, band, target = mc_lifting_predict(model, sample)
 
-            batch_metrics = compute_batch_metrics(pred, target, metrics_config=metrics_config,
-                                                  task_name=task_name)
+            k=1.2
+            for key in pred:
+                residual = pred[key] - target[key]
+                covered = residual.abs() <= k * band[key]
 
-    return batch_metrics
+                if pred[key].ndim >= 4:
+                    time_index = pred[key].shape[1] - 1
+                else:
+                    time_index = 0
+
+                save_image(
+                        canonical_image(pred[key], channel_index=0, time_index=time_index),
+                        output_prefix.with_name(output_prefix.name + f"{n_batches}_pred_.png"),
+                        f"{output_prefix.name} pred",
+                    )
+                save_image(
+                        canonical_image(target[key], channel_index=0, time_index=time_index),
+                        output_prefix.with_name(output_prefix.name + f"{n_batches}_target_.png"),
+                        f"{output_prefix.name} target",
+                                )
+                save_image(
+                        canonical_image(band[key], channel_index=0, time_index=time_index),
+                        output_prefix.with_name(output_prefix.name + f"{n_batches}_band_.png"),
+                        f"{output_prefix.name} band",
+                                )
+                save_image(
+                        canonical_image(covered[key], channel_index=0, time_index=time_index),
+                        output_prefix.with_name(output_prefix.name + f"{n_batches}_covered_.png"),
+                        f"{output_prefix.name} covered",
+                                )
+                save_image(
+                        canonical_image(residual[key], channel_index=0, time_index=time_index),
+                        output_prefix.with_name(output_prefix.name + f"{n_batches}_residual_.png"),
+                        f"{output_prefix.name} residual",
+                                )
+
+            batch_metrics = compute_batch_metrics(
+                pred,
+                target,
+                metrics_config=metrics_config,
+                task_name=task_name,
+            )
+            
+            for task_name, task_metrics in batch_metrics.items():
+                if task_name not in metric_sums:
+                    metric_sums[task_name] = {}
+
+                for name, value in task_metrics.items():
+                    metric_sums[task_name][name] = (
+                        metric_sums[task_name].get(name, 0.0) + value
+                    )
+
+            n_batches += 1
+
+    return {
+    task_name: {
+        name: value / n_batches
+        for name, value in task_metrics.items()
+    }
+    for task_name, task_metrics in metric_sums.items()
+}
 
 
 def main():
@@ -210,12 +305,12 @@ def main():
     loader_channels = get_loaders_channels(train_loader)
     print("loader_channels:", loader_channels)
 
-    write_run_metadata(output_dir, config_path, config, metadata, loader_channels)
+    #write_run_metadata(output_dir, config_path, config, metadata, loader_channels)
 
     CORE_IDX = 0
     core_checkpoint = load_from_dir(args.core_checkpoint)[CORE_IDX] if args.core_checkpoint is not None else None
     liftings = load_from_dir(args.lift_checkpoint_dir) if args.lift_checkpoint_dir is not None else None
-    projections = load_from_dir(args.lift_checkpoint_dir) if args.proj_checkpoint_dir is not None else None
+    projections = load_from_dir(args.proj_checkpoint_dir) if args.proj_checkpoint_dir is not None else None
 
     model_blocks = build_model(loader_channels, model_config, 
                                core_checkpoint, liftings, projections)
@@ -231,6 +326,13 @@ def main():
         model = Muno(single_model = model_blocks)
 
 
+    if model._single_model:
+        raise ValueError("Structure-aware UQ needs an explicit lifting module to wrap.")
+
+    for i, lift in enumerate(model._liftings):
+        if not isinstance(lift, (LiftingFeatureDropout, LiftingGaussianPerturbation)):
+            model._liftings[i] = LiftingFeatureDropout(lift, p=0.1)
+
     from muno.data import UnitGaussianNormalizer, MultiphysicsUnitGaussianNormalizer
     from muno.data.data.transforms.data_processors import DefaultDataProcessor
 
@@ -244,19 +346,21 @@ def main():
 
     first_batch = next(iter(train_loader))
 
-    dims = {i: get_channelwise_reduce_dims(subbatch[key]) for i, subbatch in first_batch.items()}
+    dims_x = {i: get_channelwise_reduce_dims(subbatch['x']) for i, subbatch in first_batch.items()}
+    dims_y = {i: get_channelwise_reduce_dims(subbatch['y']) for i, subbatch in first_batch.items()}
 
-    in_normalizer = MultiphysicsUnitGaussianNormalizer(num=len(model_blocks[0]), dim = dims, key = 'x')
-    inp_norm_files = get_all_files(args.in_normalizers, '.pickle')
-    in_normalizer.from_file(inp_norm_files)
+    in_normalizer = MultiphysicsUnitGaussianNormalizer(num=len(model_blocks[0]), dim = dims_x, key = 'x')
+    #inp_norm_files = get_all_files(args.in_normalizers, '.pickle')
+    #in_normalizer.from_file(inp_norm_files)
 
-    out_normalizer = MultiphysicsUnitGaussianNormalizer(num=len(model_blocks[0]), dim = dims, key = 'y')
-    out_norm_files = get_all_files(args.out_normalizers, '.pickle')
-    out_normalizer.from_file(out_norm_files)
+    out_normalizer = MultiphysicsUnitGaussianNormalizer(num=len(model_blocks[0]), dim = dims_y, key = 'y')
+    #out_norm_files = get_all_files(args.out_normalizers, '.pickle')
+    #out_normalizer.from_file(out_norm_files)
 
     data_processors = DefaultDataProcessor(in_normalizer=in_normalizer,
                                            out_normalizer=out_normalizer,
                                            device=device)
+    data_processors = None
 
     metrics_config = config.get("metrics", {})
     assert metrics_config, 'No metrics were passed for evaluation.'
@@ -267,11 +371,12 @@ def main():
 
     train_metrics = evaluate_loader(
         model=model,
-        loaders=train_loader,
-        data_processors=data_processors,
-        task_metadata=metadata,
+        loader=train_loader,
+        data_processor=data_processors,
+        #task_metadata=metadata,
         metrics_config=metrics_config,
-        split_name="train"
+        task_name="train",
+        output_dir = output_dir
     )
     print(f'train_metrics: {train_metrics}')
     with open(os.path.join(eval_metrics_dir, "train_metrics.pkl"), "wb") as file:
@@ -279,11 +384,12 @@ def main():
 
     val_metrics = evaluate_loader(
         model=model,
-        loaders=val_loader,
-        data_processors=data_processors,
-        task_metadata=metadata,
+        loader=val_loader,
+        data_processor=data_processors,
+        #task_metadata=metadata,
         metrics_config=metrics_config,
-        split_name="val"
+        task_name="val",
+        output_dir = output_dir
     )
     print(f'train_metrics: {val_metrics}')
     with open(os.path.join(eval_metrics_dir, "val_metrics.pkl"), "wb") as file:
@@ -291,11 +397,12 @@ def main():
 
     test_metrics = evaluate_loader(
         model=model,
-        loaders=test_loader,
-        data_processors=data_processors,
-        task_metadata=metadata,
+        loader=test_loader,
+        data_processor=data_processors,
+        #task_metadata=metadata,
         metrics_config=metrics_config,
-        split_name="test"
+        task_name="test",
+        output_dir = output_dir
     )
     print(f'train_metrics: {test_metrics}')
     with open(os.path.join(eval_metrics_dir, "test_metrics.pkl"), "wb") as file:

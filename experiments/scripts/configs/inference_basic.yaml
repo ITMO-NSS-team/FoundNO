@@ -1,0 +1,103 @@
+output:
+  root: /workspace/fno_uq_runs
+
+seed:
+  value: 42
+  deterministic: false
+
+inspections:
+  enabled: true
+
+tasks:
+  - name: pdebench_2d_cfd
+    source:
+      location: url
+      format: hdf5
+      sample_dim: 0
+      variables:
+        density: density
+        pressure: pressure
+        Vx: Vx
+        Vy: Vy
+      url: https://darus.uni-stuttgart.de/api/access/datafile/164687
+      path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
+      axis_selection:
+        0:
+          linspace: [0, 20, 16]
+
+    adapter:
+      type: temporal
+      variable_names: [density, pressure, Vx, Vy]
+      data_order: TXY
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: 2d_cfd
+
+    split:
+      type: explicit
+      train: [0, 10]
+      val: [1600, 1610]
+      test: [1800, 1810]
+
+    loaders:
+      train:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: false
+      val:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+
+normalization:
+  enabled: true
+  normalize_x: true
+  normalize_y: true
+  device: cuda
+  max_fit_batches: 1
+
+model:
+  type: adapted_fno
+  n_dim: 4
+  hidden_channels: 16
+  lifting_layers: 1
+  projection_layers: 1
+  core_layers: 2
+  n_modes: [4, 8, 8]
+
+metrics:
+  names:
+    - mse
+    - mae
+    - rmse
+    - nrmse
+    - vrmse
+    - relative_l2
+    - balanced_relative_l2
+    - nmae_range
+    - r2_score
+    - mean_linf_error
+    - max_linf_error
+  physical:
+    - name: spectral_mse
+      tasks: all
+    - name: spectral_nrmse
+      tasks: all
+    - name: band_spectral_mse_2d
+      tasks: all
+    - name: band_spectral_nrmse_2d
+      tasks: all

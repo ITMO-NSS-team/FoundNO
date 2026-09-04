@@ -252,7 +252,7 @@ def get_all_files(dir: str, file_type: str = '.pt'):
     return glob.glob(dir + "/*" + file_type)
 
 
-def load_from_dir(dir: str, SAVE_LOAD_ARGS = None):
+def load_from_dir(dir: str, SAVE_LOAD_ARGS = {}):
     files = get_all_files(dir) # glob.glob(dir + "/*.pt")
     print('loading from {}'.format(files))
     return [torch.load(file, pickle_module=dill, **SAVE_LOAD_ARGS) for file in files]
@@ -333,7 +333,7 @@ def build_model(loader_channels, model_config,
             assert len(pretr_liftings) == len(pretr_projections), 'Incosistent lengths of liftings and projections.'
             assert len(pretr_liftings) == len(liftings), 'Number of passed liftings does not match the problem.'
 
-            for ad_idx in enumerate(liftings):
+            for ad_idx, _ in enumerate(liftings):
                 if liftings[ad_idx].state_dict().keys() != pretr_liftings[ad_idx].state_dict().keys():
                     warnings.warn(f'Parameter dict of pretr. lifting {ad_idx} does not match the one, set in config. \
                                     Defaulting to the passed one.')

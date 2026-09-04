@@ -16,6 +16,62 @@ from neuralop.models import FNO, UNO        # user had this import in latest sni
 from neuralop.layers.padding import DomainPadding
 from neuralop.models.base_model import BaseModel
 
+
+# -------------------------
+# UQ Lifting dropout
+# -------------------------
+class LiftingFeatureDropout(nn.Module):
+    """
+    Wraps an already-trained lifting module and injects the paper's channel-wise
+    multiplicative feature dropout (Method A, Eq. 11-13) on its output.
+
+    Key difference from plain nn.Dropout: stochasticity is controlled by
+    `self.sample_noise`, NOT by `.training`. This lets you keep the whole model
+    in eval() (deterministic propagation/recovery) while still sampling here.
+    """
+    def __init__(self, lifting_module: nn.Module, p: float = 0.1, channel_dim: int = 1):
+        super().__init__()
+        self.lifting = lifting_module      # trained, untouched
+        self.p = p
+        self.channel_dim = channel_dim
+        self.sample_noise = False          # deterministic by default
+
+    def forward(self, x):
+        v0 = self.lifting(x)
+        if not self.sample_noise or self.p <= 0.0:
+            return v0                      # deterministic pass-through
+
+        # sample one Bernoulli value per (batch element, channel), shared across
+        # all spatial locations -> matches Eq. 11 exactly, for any spatial rank
+        shape = [1] * v0.dim()
+        shape[0] = v0.shape[0]                 # batch
+        shape[self.channel_dim] = v0.shape[self.channel_dim]  # channels
+        z = torch.bernoulli(torch.full(shape, 1 - self.p, device=v0.device, dtype=v0.dtype))
+        xi = z / (1 - self.p)                  # inverted-dropout scaling, E[xi]=1
+        return v0 * xi
+
+
+class LiftingGaussianPerturbation(nn.Module):
+    """Method B (Eq. 15): Gaussian perturbation with variance matched to p/(1-p)."""
+    def __init__(self, lifting_module: nn.Module, p: float = 0.1, channel_dim: int = 1):
+        super().__init__()
+        self.lifting = lifting_module
+        self.p = p
+        self.channel_dim = channel_dim
+        self.sample_noise = False
+
+    def forward(self, x):
+        v0 = self.lifting(x)
+        if not self.sample_noise or self.p <= 0.0:
+            return v0
+
+        shape = [1] * v0.dim()
+        shape[0] = v0.shape[0]
+        shape[self.channel_dim] = v0.shape[self.channel_dim]
+        std = (self.p / (1 - self.p)) ** 0.5
+        eps = torch.randn(shape, device=v0.device, dtype=v0.dtype) * std
+        return v0 + v0 * eps
+
 # -------------------------
 # PDEBench dataset (unchanged)
 # -------------------------
@@ -520,12 +576,14 @@ class PostLiftMambaLifting(BaseModel):
                  resolution_scaling_factor = None,
                  use_mamba_kwargs=None,
                  mamba_fallback_kernel=9,
+                 lifting_dropout = 0.0,
                  positional_embedding: Union[str, nn.Module] = "grid",
                  non_linearity: nn.Module = F.gelu):
         """
         A compact FNO that runs the standard lifting, then a Mamba/SSM processor across spatial axis,
         then continues with FNO spectral blocks and projection.
         """
+
         self.complex_data = False
         super().__init__()
 
@@ -587,6 +645,7 @@ class PostLiftMambaLifting(BaseModel):
             n_layers=2,
             n_dim=self.n_dim,
             non_linearity=non_linearity,
+            dropout=lifting_dropout
         )
 
         if self.complex_data:
