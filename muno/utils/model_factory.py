@@ -252,7 +252,7 @@ def get_all_files(dir: str, file_type: str = '.pt'):
     return glob.glob(dir + "/*" + file_type)
 
 
-def load_from_dir(dir: str, SAVE_LOAD_ARGS = {}):
+def load_from_dir(dir: str, SAVE_LOAD_ARGS = None):
     files = get_all_files(dir) # glob.glob(dir + "/*.pt")
     print('loading from {}'.format(files))
     return [torch.load(file, pickle_module=dill, **SAVE_LOAD_ARGS) for file in files]
@@ -333,20 +333,31 @@ def build_model(loader_channels, model_config,
             assert len(pretr_liftings) == len(pretr_projections), 'Incosistent lengths of liftings and projections.'
             assert len(pretr_liftings) == len(liftings), 'Number of passed liftings does not match the problem.'
 
-            for ad_idx, _ in enumerate(liftings):
+            for ad_idx in enumerate(liftings):
                 if liftings[ad_idx].state_dict().keys() != pretr_liftings[ad_idx].state_dict().keys():
                     warnings.warn(f'Parameter dict of pretr. lifting {ad_idx} does not match the one, set in config. \
                                     Defaulting to the passed one.')
                     liftings[ad_idx] = pretr_liftings[ad_idx]
                 else:
-                    liftings[ad_idx].load_state_dict(pretr_liftings[ad_idx].state_dict())
+                    try:
+                        liftings[ad_idx].load_state_dict(pretr_liftings[ad_idx].state_dict())
+                    except:
+                        warnings.warn(f'Parameter dict of pretr. lifting {ad_idx} does not match the one, set in config. \
+                                        Defaulting to the passed one, despite matching state_dict keys.')
+                        liftings[ad_idx] = pretr_liftings[ad_idx]
 
                 if projections[ad_idx].state_dict().keys() != pretr_projections[ad_idx].state_dict().keys():
                     warnings.warn(f'Parameter dict of pretr. proj. {ad_idx} does not match the one, set in config. \
                                     Defaulting to the passed one.')
                     projections[ad_idx] = pretr_projections[ad_idx]
                 else:
-                    projections[ad_idx].load_state_dict(pretr_projections[ad_idx].state_dict())
+                    try:
+                        projections[ad_idx].load_state_dict(pretr_projections[ad_idx].state_dict())
+                    except:
+                        warnings.warn(f'Parameter dict of pretr. proj. {ad_idx} does not match the one, set in config. \
+                                        Defaulting to the passed one, despite matching state_dict keys.')
+                        projections[ad_idx] = pretr_projections[ad_idx]
+
                 
 
         current_core_params = _filter_init_params(core_cls, core_params)
@@ -362,7 +373,13 @@ def build_model(loader_channels, model_config,
                                     Defaulting to the passed one.')
                     core = pretr_core
                 else:
-                    core.load_state_dict(pretr_core.state_dict())
+                    try:
+                        core.load_state_dict(pretr_core.state_dict())
+                    except:
+                        warnings.warn(f'Parameter dict of the passed pretrained core does not match the one, set in config. \
+                                        Defaulting to the passed one, despite matching state_dict keys.')
+                        core = pretr_core
+
 
         return liftings, core, projections
 
