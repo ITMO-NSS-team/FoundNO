@@ -39,26 +39,26 @@ tasks:
     split:
       type: explicit
       train: [0, 10]
-      val: [1600, 1610]
-      test: [1800, 1810]
+      val: [11, 21]
+      test: [31, 41]
 
     loaders:
       train:
-        batch_size: 1
+        batch_size: 16
         num_workers: 0
-        pin_memory: false
+        pin_memory: true
         shuffle: true
-        drop_last: false
+        drop_last: true
       val:
-        batch_size: 1
+        batch_size: 32
         num_workers: 0
-        pin_memory: false
+        pin_memory: true
         shuffle: false
         drop_last: false
       test:
-        batch_size: 1
+        batch_size: 32
         num_workers: 0
-        pin_memory: false
+        pin_memory: true
         shuffle: false
         drop_last: false
 
@@ -68,16 +68,17 @@ normalization:
   normalize_x: true
   normalize_y: true
   device: cuda
-  max_fit_batches: 1
+  max_fit_batches: 32
 
 model:
-  type: adapted_fno
-  n_dim: 4
-  hidden_channels: 16
-  lifting_layers: 1
-  projection_layers: 1
-  core_layers: 2
-  n_modes: [4, 8, 8]
+  type: adapted_fno_no_mamba
+#   n_dim: 3
+  hidden_channels: 60
+#   lifting_layers: 2
+#   projection_layers: 2
+#   core_layers: 4
+#   n_modes: [16, 60, 60]
+
 
 metrics:
   names:
