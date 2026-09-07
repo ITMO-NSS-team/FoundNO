@@ -41,7 +41,7 @@ from muno.data.benchmarks.normalization import build_data_processors
 from muno.data.benchmarks.inspections import inspect_tasks, save_image, canonical_image
 from muno.utils.custom_trainer import Trainer
 from muno.utils.training_utils import BalancedRelL2Loss
-from muno.utils.model_factory import build_model, load_from_dir, get_all_files
+from muno.utils.model_factory import build_model, load_from_dir, get_all_files, build_model_new
 from muno.data.benchmarks.evaluation import (
     evaluate_multitask_loaders,
     save_metrics,
@@ -134,8 +134,14 @@ def set_mc_lifting(model: 'Muno', on: bool, adapter_idx: int = None):
     indices = range(len(model._liftings)) if adapter_idx is None else [adapter_idx]
     for i in indices:
         lift = model._liftings[i]
-        if isinstance(lift, (LiftingFeatureDropout, LiftingGaussianPerturbation)):
-            lift.sample_noise = on
+        if not isinstance(lift, (LiftingFeatureDropout, LiftingGaussianPerturbation)):
+            raise TypeError(
+                f"Lifting adapter {i} is {type(lift).__name__}, not wrapped with "
+                f"LiftingFeatureDropout/LiftingGaussianPerturbation. "
+                f"Call the wrapping step first."
+            )
+        lift.sample_noise = on
+        lift.p = 0.1
 
 @torch.no_grad()
 def mc_lifting_predict(model, sample, adapter_idx=0, T=20, device='cuda:0', **kwargs):
@@ -312,7 +318,7 @@ def main():
     liftings = load_from_dir(args.lift_checkpoint_dir) if args.lift_checkpoint_dir is not None else None
     projections = load_from_dir(args.proj_checkpoint_dir) if args.proj_checkpoint_dir is not None else None
 
-    model_blocks = build_model(loader_channels, model_config, 
+    model_blocks = build_model_new(loader_channels, model_config, 
                                core_checkpoint, liftings, projections)
 
     if not isinstance(model_blocks, tuple):
@@ -326,14 +332,11 @@ def main():
         model = Muno(single_model = model_blocks)
 
 
-    if model._single_model:
-        raise ValueError("Structure-aware UQ needs an explicit lifting module to wrap.")
-
     for i, lift in enumerate(model._liftings):
         if not isinstance(lift, (LiftingFeatureDropout, LiftingGaussianPerturbation)):
             model._liftings[i] = LiftingFeatureDropout(lift, p=0.1)
 
-    from muno.data import UnitGaussianNormalizer, MultiphysicsUnitGaussianNormalizer
+    from muno.data.data.transforms.normalizers import UnitGaussianNormalizer, MultiphysicsUnitGaussianNormalizer
     from muno.data.data.transforms.data_processors import DefaultDataProcessor
 
     def get_channelwise_reduce_dims(batch_tensor):
@@ -350,17 +353,35 @@ def main():
     dims_y = {i: get_channelwise_reduce_dims(subbatch['y']) for i, subbatch in first_batch.items()}
 
     in_normalizer = MultiphysicsUnitGaussianNormalizer(num=len(model_blocks[0]), dim = dims_x, key = 'x')
-    #inp_norm_files = get_all_files(args.in_normalizers, '.pickle')
-    #in_normalizer.from_file(inp_norm_files)
+    print(args.in_normalizers)
+    inp_norm_files = get_all_files(args.in_normalizers, '.pkl')
+    in_normalizer.from_file(inp_norm_files)
 
     out_normalizer = MultiphysicsUnitGaussianNormalizer(num=len(model_blocks[0]), dim = dims_y, key = 'y')
-    #out_norm_files = get_all_files(args.out_normalizers, '.pickle')
-    #out_normalizer.from_file(out_norm_files)
+    out_norm_files = get_all_files(args.out_normalizers, '.pkl')
+    out_normalizer.from_file(out_norm_files)
 
+    # for batch in train_loader:
+    #     print(batch[0]['x'].shape)
+    #     in_normalizer.partial_fit(batch)
+    #     out_normalizer.partial_fit(batch)
+    # for batch in test_loader:
+    #     in_normalizer.partial_fit(batch)
+    #     out_normalizer.partial_fit(batch)
+    # for batch in val_loader:
+    #     in_normalizer.partial_fit(batch)
+    #     out_normalizer.partial_fit(batch)
+
+    
+    
+    print(out_normalizer.normalizers[0].mean.flatten())
+    print(out_normalizer.normalizers[0].std.flatten())
+
+    in_normalizer.to(device)
+    out_normalizer.to(device)
     data_processors = DefaultDataProcessor(in_normalizer=in_normalizer,
                                            out_normalizer=out_normalizer,
                                            device=device)
-    data_processors = None
 
     metrics_config = config.get("metrics", {})
     assert metrics_config, 'No metrics were passed for evaluation.'

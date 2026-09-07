@@ -187,8 +187,8 @@ class UnitGaussianNormalizer(Transform):
             return
         count = 0
 
-        if batch_size == 1:
-            data_batch = data_batch.unsqueeze(0)
+        # if batch_size == 1:
+        #     data_batch = data_batch.unsqueeze(0)
         n_samples = len(data_batch)
         while count < n_samples:
             samples = data_batch[count: count + batch_size]
@@ -419,6 +419,7 @@ class MultiphysicsUnitGaussianNormalizer(Transform):
         assert all(['pkl' in name for name in filenames]), 'Incorrect filename'
         # savedict = {'mask': self.mask, 'mean': self.mean, 'std': self.std}
         for idx, normalizer in enumerate(self.normalizers.values()):
+            print(filenames)
             normalizer.from_file(filenames[idx])
 
         # with open(filename, 'rb') as f:

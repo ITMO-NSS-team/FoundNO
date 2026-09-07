@@ -368,6 +368,171 @@ def build_model(loader_channels, model_config,
 
     raise ValueError(f"Unsupported model kind: {resolved['kind']}")
 
+def _find_conv_like_layers(module: torch.nn.Module) -> List[torch.nn.Module]:
+    """Collects Conv1d/2d/3d and Linear layers in traversal order, regardless of
+    how deeply the module is wrapped (e.g. by LiftingFeatureDropout)."""
+    return [
+        m for m in module.modules()
+        if isinstance(m, (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Linear))
+    ]
+
+
+def _infer_in_channels(module: torch.nn.Module) -> Union[int, None]:
+    layers = _find_conv_like_layers(module)
+    if not layers:
+        return None
+    return layers[0].weight.shape[1]
+
+
+def _infer_out_channels(module: torch.nn.Module) -> Union[int, None]:
+    layers = _find_conv_like_layers(module)
+    if not layers:
+        return None
+    return layers[-1].weight.shape[0]
+
+
+def build_model_new(loader_channels, model_config,
+                pretr_core: torch.nn.Module = None,
+                pretr_liftings: List[torch.nn.Module] = None,
+                pretr_projections: List[torch.nn.Module] = None):
+    resolved = _resolve_model_config(model_config or {})
+
+    if resolved["kind"] == "single":
+        if len(loader_channels) != 1:
+            raise ValueError(
+                f"Model '{resolved['name']}' is a single-model architecture and can be used only "
+                f"with one task/loader. For multiphysics training use 'adapted_fno' or "
+                f"'adapted_fno_no_mamba'. Got {len(loader_channels)} loaders."
+            )
+
+        if pretr_core is not None:
+            if not isinstance(pretr_core, torch.nn.Module):
+                raise TypeError(f"pretr_core must be a torch.nn.Module instance, got {type(pretr_core)}.")
+            in_channels, out_channels = loader_channels[0]
+            actual_in = _infer_in_channels(pretr_core)
+            actual_out = _infer_out_channels(pretr_core)
+            if actual_in is not None and actual_in != in_channels:
+                warnings.warn(
+                    f"Pretrained single model: inferred in_channels={actual_in} does not match "
+                    f"loader in_channels={in_channels}. Using the pretrained model as-is."
+                )
+            if actual_out is not None and actual_out != out_channels:
+                warnings.warn(
+                    f"Pretrained single model: inferred out_channels={actual_out} does not match "
+                    f"loader out_channels={out_channels}. Using the pretrained model as-is."
+                )
+            return pretr_core
+
+        model_cls = resolved["model"]
+        if not isinstance(model_cls, type):
+            model_cls = model_cls()
+        params = _filter_init_params(model_cls, resolved["params"])
+        validateOperator(model_cls, ["in_channels", "out_channels"] + list(params.keys()))
+
+        in_channels, out_channels = loader_channels[0]
+        return model_cls(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            **params,
+        )
+
+    if resolved["kind"] == "adapter_core_adapter":
+        model_classes = resolved["model"]
+        params = resolved["params"]
+
+        lifting_cls, core_cls, projection_cls = model_classes
+        if not isinstance(lifting_cls, type):
+            lifting_cls = lifting_cls()
+        if not isinstance(core_cls, type):
+            core_cls = core_cls()
+        if not isinstance(projection_cls, type):
+            projection_cls = projection_cls()
+
+        lifting_params, core_params, projection_params = params
+        hidden_channels = core_params["hidden_channels"]
+
+        has_pretr_adapters = pretr_liftings is not None or pretr_projections is not None
+        if has_pretr_adapters:
+            assert pretr_liftings is not None and pretr_projections is not None, \
+                'If build_model gets pretrained adapters, both liftings and projections have to be passed!'
+            assert len(pretr_liftings) == len(pretr_projections), \
+                'Inconsistent lengths of liftings and projections.'
+            assert len(pretr_liftings) == len(loader_channels), \
+                f'Number of passed liftings ({len(pretr_liftings)}) does not match the number ' \
+                f'of tasks ({len(loader_channels)}).'
+
+        liftings = []
+        projections = []
+
+        for task_idx, (in_channels, out_channels) in enumerate(loader_channels):
+            # ---- LIFTING ----
+            if has_pretr_adapters:
+                lift = pretr_liftings[task_idx]
+                if not isinstance(lift, torch.nn.Module):
+                    raise TypeError(
+                        f"pretr_liftings[{task_idx}] must be a torch.nn.Module instance, got {type(lift)}."
+                    )
+                actual_in = _infer_in_channels(lift)
+                if actual_in is not None and actual_in != in_channels:
+                    warnings.warn(
+                        f"Pretrained lifting {task_idx}: inferred in_channels={actual_in} does not "
+                        f"match loader in_channels={in_channels}. Using the pretrained module as-is; "
+                        f"make sure the dataloader for this task actually feeds {actual_in} channels."
+                    )
+                liftings.append(lift)
+            else:
+                current_lifting_params = dict(lifting_params)
+                if lifting_cls.__name__ == "PostLiftMambaLifting":
+                    current_lifting_params.pop("hidden_channels", None)
+                current_lifting_params = _filter_init_params(lifting_cls, current_lifting_params)
+                liftings.append(
+                    lifting_cls(
+                        in_channels=in_channels,
+                        out_channels=hidden_channels,
+                        **current_lifting_params,
+                    )
+                )
+
+            # ---- PROJECTION ----
+            if has_pretr_adapters:
+                proj = pretr_projections[task_idx]
+                if not isinstance(proj, torch.nn.Module):
+                    raise TypeError(
+                        f"pretr_projections[{task_idx}] must be a torch.nn.Module instance, got {type(proj)}."
+                    )
+                actual_out = _infer_out_channels(proj)
+                if actual_out is not None and actual_out != out_channels:
+                    warnings.warn(
+                        f"Pretrained projection {task_idx}: inferred out_channels={actual_out} does not "
+                        f"match loader out_channels={out_channels}. Using the pretrained module as-is."
+                    )
+                projections.append(proj)
+            else:
+                current_projection_params = _filter_init_params(projection_cls, projection_params)
+                projections.append(
+                    projection_cls(
+                        in_channels=hidden_channels,
+                        out_channels=out_channels,
+                        **current_projection_params,
+                    )
+                )
+
+        # ---- CORE ----
+        if pretr_core is not None:
+            if not isinstance(pretr_core, torch.nn.Module):
+                raise TypeError(f"pretr_core must be a torch.nn.Module instance, got {type(pretr_core)}.")
+            core = pretr_core
+        else:
+            current_core_params = _filter_init_params(core_cls, core_params)
+            core = core_cls(
+                in_channels=hidden_channels,
+                out_channels=hidden_channels,
+                **current_core_params,
+            )
+
+        return liftings, core, projections
+
+    raise ValueError(f"Unsupported model kind: {resolved['kind']}")
 
 def passModelToDevice(model: Union[torch.nn.Module, torch.nn.DataParallel, tuple], device: str = 'cuda') \
     -> Union[torch.nn.Module, torch.nn.DataParallel, tuple]:
