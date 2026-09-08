@@ -252,7 +252,7 @@ def get_all_files(dir: str, file_type: str = '.pt'):
     return glob.glob(dir + "/*" + file_type)
 
 
-def load_from_dir(dir: str, SAVE_LOAD_ARGS = {}):
+def load_from_dir(dir: str, SAVE_LOAD_ARGS = None):
     files = get_all_files(dir) # glob.glob(dir + "/*.pt")
     print('loading from {}'.format(files))
     return [torch.load(file, pickle_module=dill, **SAVE_LOAD_ARGS) for file in files]
@@ -406,28 +406,61 @@ def build_model(loader_channels, model_config,
                         **current_projection_params,
                     )
                 )
-        if has_pretr_adapters and pretr_core is None:
-            inferred_hidden = _infer_out_channels(pretr_liftings[0])  # выход первого лифтинга = hidden_channels
-            if inferred_hidden is not None and inferred_hidden != hidden_channels:
-                warnings.warn(
-                    f"model_config hidden_channels={hidden_channels} does not match pretrained "
-                    f"adapters' hidden dimension={inferred_hidden}. Using the pretrained value "
-                    f"for core construction to keep shapes consistent."
-                )
-                hidden_channels = inferred_hidden
+
+        if pretr_liftings is not None or pretr_projections is not None:
+            assert pretr_liftings is not None and pretr_projections is not None, \
+                'If build_model gets pretrained adapters, both liftings and projections have to be passed!'
+            assert len(pretr_liftings) == len(pretr_projections), 'Incosistent lengths of liftings and projections.'
+            assert len(pretr_liftings) == len(liftings), 'Number of passed liftings does not match the problem.'
+
+            for ad_idx in enumerate(liftings):
+                if liftings[ad_idx].state_dict().keys() != pretr_liftings[ad_idx].state_dict().keys():
+                    warnings.warn(f'Parameter dict of pretr. lifting {ad_idx} does not match the one, set in config. \
+                                    Defaulting to the passed one.')
+                    liftings[ad_idx] = pretr_liftings[ad_idx]
+                else:
+                    try:
+                        liftings[ad_idx].load_state_dict(pretr_liftings[ad_idx].state_dict())
+                    except:
+                        warnings.warn(f'Parameter dict of pretr. lifting {ad_idx} does not match the one, set in config. \
+                                        Defaulting to the passed one, despite matching state_dict keys.')
+                        liftings[ad_idx] = pretr_liftings[ad_idx]
+
+                if projections[ad_idx].state_dict().keys() != pretr_projections[ad_idx].state_dict().keys():
+                    warnings.warn(f'Parameter dict of pretr. proj. {ad_idx} does not match the one, set in config. \
+                                    Defaulting to the passed one.')
+                    projections[ad_idx] = pretr_projections[ad_idx]
+                else:
+                    try:
+                        projections[ad_idx].load_state_dict(pretr_projections[ad_idx].state_dict())
+                    except:
+                        warnings.warn(f'Parameter dict of pretr. proj. {ad_idx} does not match the one, set in config. \
+                                        Defaulting to the passed one, despite matching state_dict keys.')
+                        projections[ad_idx] = pretr_projections[ad_idx]
+
+                
+
+        current_core_params = _filter_init_params(core_cls, core_params)
+        core = core_cls(
+            in_channels=hidden_channels,
+            out_channels=hidden_channels,
+            **current_core_params,
+        )
 
         # ---- CORE ----
         if pretr_core is not None:
-            if not isinstance(pretr_core, torch.nn.Module):
-                raise TypeError(f"pretr_core must be a torch.nn.Module instance, got {type(pretr_core)}.")
-            core = pretr_core
-        else:
-            current_core_params = _filter_init_params(core_cls, core_params)
-            core = core_cls(
-                in_channels=hidden_channels,
-                out_channels=hidden_channels,
-                **current_core_params,
-            )
+                if core.state_dict().keys() != pretr_core.state_dict().keys():
+                    warnings.warn(f'Parameter dict of the passed pretrained core does not match the one, set in config. \
+                                    Defaulting to the passed one.')
+                    core = pretr_core
+                else:
+                    try:
+                        core.load_state_dict(pretr_core.state_dict())
+                    except:
+                        warnings.warn(f'Parameter dict of the passed pretrained core does not match the one, set in config. \
+                                        Defaulting to the passed one, despite matching state_dict keys.')
+                        core = pretr_core
+
 
         return liftings, core, projections
 
