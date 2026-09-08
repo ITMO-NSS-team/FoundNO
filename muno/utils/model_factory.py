@@ -282,9 +282,9 @@ def _infer_out_channels(module: torch.nn.Module) -> Union[int, None]:
 
 
 def build_model(loader_channels, model_config,
-                pretr_core: torch.nn.Module = None,
-                pretr_liftings: List[torch.nn.Module] = None,
-                pretr_projections: List[torch.nn.Module] = None):
+                 pretr_core: torch.nn.Module = None,
+                 pretr_liftings: List[torch.nn.Module] = None,
+                 pretr_projections: List[torch.nn.Module] = None):
     resolved = _resolve_model_config(model_config or {})
 
     if resolved["kind"] == "single":
@@ -351,6 +351,31 @@ def build_model(loader_channels, model_config,
                 f'Number of passed liftings ({len(pretr_liftings)}) does not match the number ' \
                 f'of tasks ({len(loader_channels)}).'
 
+        if pretr_core is not None and not isinstance(pretr_core, torch.nn.Module):
+            raise TypeError(f"pretr_core must be a torch.nn.Module instance, got {type(pretr_core)}.")
+
+        # ---- Resolve ONE authoritative hidden_channels BEFORE building anything, so
+        # freshly-built liftings/projections/core never use a stale config value that a
+        # pretrained module actually disagrees with. Precedence: pretr_core > pretr_liftings > config.
+        if pretr_core is not None:
+            core_hidden = _infer_in_channels(pretr_core)
+            if core_hidden is not None and core_hidden != hidden_channels:
+                warnings.warn(
+                    f"model_config hidden_channels={hidden_channels} does not match pretrained "
+                    f"core's hidden width={core_hidden}. Using the pretrained core's width so any "
+                    f"freshly-built lifting/projection stays shape-compatible."
+                )
+                hidden_channels = core_hidden
+        elif has_pretr_adapters:
+            adapter_hidden = _infer_out_channels(pretr_liftings[0])
+            if adapter_hidden is not None and adapter_hidden != hidden_channels:
+                warnings.warn(
+                    f"model_config hidden_channels={hidden_channels} does not match pretrained "
+                    f"adapters' hidden dimension={adapter_hidden}. Using the pretrained adapters' "
+                    f"hidden dimension to build a compatible core."
+                )
+                hidden_channels = adapter_hidden
+
         liftings = []
         projections = []
 
@@ -368,6 +393,13 @@ def build_model(loader_channels, model_config,
                         f"Pretrained lifting {task_idx}: inferred in_channels={actual_in} does not "
                         f"match loader in_channels={in_channels}. Using the pretrained module as-is; "
                         f"make sure the dataloader for this task actually feeds {actual_in} channels."
+                    )
+                actual_out = _infer_out_channels(lift)
+                if actual_out is not None and actual_out != hidden_channels:
+                    warnings.warn(
+                        f"Pretrained lifting {task_idx}: inferred hidden width={actual_out} does not "
+                        f"match resolved hidden_channels={hidden_channels}. This task's lifting may be "
+                        f"incompatible with the shared core."
                     )
                 liftings.append(lift)
             else:
@@ -396,6 +428,13 @@ def build_model(loader_channels, model_config,
                         f"Pretrained projection {task_idx}: inferred out_channels={actual_out} does not "
                         f"match loader out_channels={out_channels}. Using the pretrained module as-is."
                     )
+                actual_in = _infer_in_channels(proj)
+                if actual_in is not None and actual_in != hidden_channels:
+                    warnings.warn(
+                        f"Pretrained projection {task_idx}: inferred hidden width={actual_in} does not "
+                        f"match resolved hidden_channels={hidden_channels}. This task's projection may be "
+                        f"incompatible with the shared core."
+                    )
                 projections.append(proj)
             else:
                 current_projection_params = _filter_init_params(projection_cls, projection_params)
@@ -407,60 +446,18 @@ def build_model(loader_channels, model_config,
                     )
                 )
 
-        if pretr_liftings is not None or pretr_projections is not None:
-            assert pretr_liftings is not None and pretr_projections is not None, \
-                'If build_model gets pretrained adapters, both liftings and projections have to be passed!'
-            assert len(pretr_liftings) == len(pretr_projections), 'Incosistent lengths of liftings and projections.'
-            assert len(pretr_liftings) == len(liftings), 'Number of passed liftings does not match the problem.'
-
-            for ad_idx in enumerate(liftings):
-                if liftings[ad_idx].state_dict().keys() != pretr_liftings[ad_idx].state_dict().keys():
-                    warnings.warn(f'Parameter dict of pretr. lifting {ad_idx} does not match the one, set in config. \
-                                    Defaulting to the passed one.')
-                    liftings[ad_idx] = pretr_liftings[ad_idx]
-                else:
-                    try:
-                        liftings[ad_idx].load_state_dict(pretr_liftings[ad_idx].state_dict())
-                    except:
-                        warnings.warn(f'Parameter dict of pretr. lifting {ad_idx} does not match the one, set in config. \
-                                        Defaulting to the passed one, despite matching state_dict keys.')
-                        liftings[ad_idx] = pretr_liftings[ad_idx]
-
-                if projections[ad_idx].state_dict().keys() != pretr_projections[ad_idx].state_dict().keys():
-                    warnings.warn(f'Parameter dict of pretr. proj. {ad_idx} does not match the one, set in config. \
-                                    Defaulting to the passed one.')
-                    projections[ad_idx] = pretr_projections[ad_idx]
-                else:
-                    try:
-                        projections[ad_idx].load_state_dict(pretr_projections[ad_idx].state_dict())
-                    except:
-                        warnings.warn(f'Parameter dict of pretr. proj. {ad_idx} does not match the one, set in config. \
-                                        Defaulting to the passed one, despite matching state_dict keys.')
-                        projections[ad_idx] = pretr_projections[ad_idx]
-
-                
-
-        current_core_params = _filter_init_params(core_cls, core_params)
-        core = core_cls(
-            in_channels=hidden_channels,
-            out_channels=hidden_channels,
-            **current_core_params,
-        )
-
         # ---- CORE ----
         if pretr_core is not None:
-                if core.state_dict().keys() != pretr_core.state_dict().keys():
-                    warnings.warn(f'Parameter dict of the passed pretrained core does not match the one, set in config. \
-                                    Defaulting to the passed one.')
-                    core = pretr_core
-                else:
-                    try:
-                        core.load_state_dict(pretr_core.state_dict())
-                    except:
-                        warnings.warn(f'Parameter dict of the passed pretrained core does not match the one, set in config. \
-                                        Defaulting to the passed one, despite matching state_dict keys.')
-                        core = pretr_core
-
+            core = pretr_core
+        else:
+            current_core_params = dict(core_params)
+            current_core_params["hidden_channels"] = hidden_channels
+            current_core_params = _filter_init_params(core_cls, current_core_params)
+            core = core_cls(
+                in_channels=hidden_channels,
+                out_channels=hidden_channels,
+                **current_core_params,
+            )
 
         return liftings, core, projections
 
