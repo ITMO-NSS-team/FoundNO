@@ -41,7 +41,7 @@ from muno.data.benchmarks.normalization import build_data_processors
 from muno.data.benchmarks.inspections import inspect_tasks, save_image, canonical_image
 from muno.utils.custom_trainer import Trainer
 from muno.utils.training_utils import BalancedRelL2Loss
-from muno.utils.model_factory import build_model, load_from_dir, get_all_files, build_model_new
+from muno.utils.model_factory import build_model, load_from_dir, get_all_files
 from muno.data.benchmarks.evaluation import (
     evaluate_multitask_loaders,
     save_metrics,
@@ -318,7 +318,7 @@ def main():
     liftings = load_from_dir(args.lift_checkpoint_dir) if args.lift_checkpoint_dir is not None else None
     projections = load_from_dir(args.proj_checkpoint_dir) if args.proj_checkpoint_dir is not None else None
 
-    model_blocks = build_model_new(loader_channels, model_config, 
+    model_blocks = build_model(loader_channels, model_config, 
                                core_checkpoint, liftings, projections)
 
     if not isinstance(model_blocks, tuple):

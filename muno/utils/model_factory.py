@@ -258,116 +258,6 @@ def load_from_dir(dir: str, SAVE_LOAD_ARGS = {}):
     return [torch.load(file, pickle_module=dill, **SAVE_LOAD_ARGS) for file in files]
    
 
-def build_model(loader_channels, model_config,
-                pretr_core: torch.nn.Module = None,
-                pretr_liftings: List[torch.nn.Module] = None,
-                pretr_projections: List[torch.nn.Module] = None):
-    resolved = _resolve_model_config(model_config or {})
-
-    if resolved["kind"] == "single":
-        if len(loader_channels) != 1:
-            raise ValueError(
-                f"Model '{resolved['name']}' is a single-model architecture and can be used only "
-                f"with one task/loader. For multiphysics training use 'adapted_fno' or "
-                f"'adapted_fno_no_mamba'. Got {len(loader_channels)} loaders."
-            )
-
-        model_cls = resolved["model"]
-        if not isinstance(model_cls, type):
-            model_cls = model_cls()
-        params = _filter_init_params(model_cls, resolved["params"])
-        validateOperator(model_cls, ["in_channels", "out_channels"] + list(params.keys()))
-
-        in_channels, out_channels = loader_channels[0]
-        return model_cls(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            **params,
-        )
-
-    if resolved["kind"] == "adapter_core_adapter":
-        model_classes = resolved["model"]
-        params = resolved["params"]
-
-        lifting_cls, core_cls, projection_cls = model_classes
-        if not isinstance(lifting_cls, type):
-            lifting_cls = lifting_cls()
-        if not isinstance(core_cls, type):
-            core_cls = core_cls()
-        if not isinstance(projection_cls, type):
-            projection_cls = projection_cls()
-
-        lifting_params, core_params, projection_params = params
-
-        hidden_channels = core_params["hidden_channels"]
-
-        liftings = []
-        projections = []
-
-        for in_channels, out_channels in loader_channels:
-            current_lifting_params = dict(lifting_params)
-            if lifting_cls.__name__ == "PostLiftMambaLifting":
-                current_lifting_params.pop("hidden_channels", None)
-            current_lifting_params = _filter_init_params(lifting_cls, current_lifting_params)
-
-            liftings.append(
-                lifting_cls(
-                    in_channels=in_channels,
-                    out_channels=hidden_channels,
-                    **current_lifting_params,
-                )
-            )
-
-            current_projection_params = _filter_init_params(projection_cls, projection_params)
-            projections.append(
-                projection_cls(
-                    in_channels=hidden_channels,
-                    out_channels=out_channels,
-                    **current_projection_params,
-                )
-            )
-
-        if pretr_liftings is not None or pretr_projections is not None:
-            assert pretr_liftings is not None and pretr_projections is not None, \
-                'If build_model gets pretrained adapters, both liftings and projections have to be passed!'
-            assert len(pretr_liftings) == len(pretr_projections), 'Incosistent lengths of liftings and projections.'
-            assert len(pretr_liftings) == len(liftings), 'Number of passed liftings does not match the problem.'
-
-            for ad_idx, _ in enumerate(liftings):
-                if liftings[ad_idx].state_dict().keys() != pretr_liftings[ad_idx].state_dict().keys():
-                    warnings.warn(f'Parameter dict of pretr. lifting {ad_idx} does not match the one, set in config. \
-                                    Defaulting to the passed one.')
-                    liftings[ad_idx] = pretr_liftings[ad_idx]
-                else:
-                    liftings[ad_idx].load_state_dict(pretr_liftings[ad_idx].state_dict())
-
-                if projections[ad_idx].state_dict().keys() != pretr_projections[ad_idx].state_dict().keys():
-                    warnings.warn(f'Parameter dict of pretr. proj. {ad_idx} does not match the one, set in config. \
-                                    Defaulting to the passed one.')
-                    projections[ad_idx] = pretr_projections[ad_idx]
-                else:
-                    projections[ad_idx].load_state_dict(pretr_projections[ad_idx].state_dict())
-                
-
-        current_core_params = _filter_init_params(core_cls, core_params)
-        core = core_cls(
-            in_channels=hidden_channels,
-            out_channels=hidden_channels,
-            **current_core_params,
-        )
-
-        if pretr_core is not None:
-                if core.state_dict().keys() != pretr_core.state_dict().keys():
-                    warnings.warn(f'Parameter dict of the passed pretrained core does not match the one, set in config. \
-                                    Defaulting to the passed one.')
-                    core = pretr_core
-                else:
-                    core.load_state_dict(pretr_core.state_dict())
-
-        return liftings, core, projections
-
-    raise ValueError(f"Unsupported model kind: {resolved['kind']}")
-
 def _find_conv_like_layers(module: torch.nn.Module) -> List[torch.nn.Module]:
     """Collects Conv1d/2d/3d and Linear layers in traversal order, regardless of
     how deeply the module is wrapped (e.g. by LiftingFeatureDropout)."""
@@ -391,7 +281,7 @@ def _infer_out_channels(module: torch.nn.Module) -> Union[int, None]:
     return layers[-1].weight.shape[0]
 
 
-def build_model_new(loader_channels, model_config,
+def build_model(loader_channels, model_config,
                 pretr_core: torch.nn.Module = None,
                 pretr_liftings: List[torch.nn.Module] = None,
                 pretr_projections: List[torch.nn.Module] = None):
@@ -516,6 +406,15 @@ def build_model_new(loader_channels, model_config,
                         **current_projection_params,
                     )
                 )
+        if has_pretr_adapters and pretr_core is None:
+            inferred_hidden = _infer_out_channels(pretr_liftings[0])  # выход первого лифтинга = hidden_channels
+            if inferred_hidden is not None and inferred_hidden != hidden_channels:
+                warnings.warn(
+                    f"model_config hidden_channels={hidden_channels} does not match pretrained "
+                    f"adapters' hidden dimension={inferred_hidden}. Using the pretrained value "
+                    f"for core construction to keep shapes consistent."
+                )
+                hidden_channels = inferred_hidden
 
         # ---- CORE ----
         if pretr_core is not None:
