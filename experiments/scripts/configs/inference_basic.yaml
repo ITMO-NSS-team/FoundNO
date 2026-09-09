@@ -23,7 +23,7 @@ tasks:
       path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
       axis_selection:
         0:
-          linspace: [0, 20, 16]
+          linspace: [0, 100, 1]
 
     adapter:
       type: temporal
@@ -39,29 +39,28 @@ tasks:
     split:
       type: explicit
       train: [0, 10]
-      val: [11, 21]
-      test: [31, 41]
+      val: [11, 20]
+      test: [21, 31]
 
     loaders:
       train:
-        batch_size: 16
+        batch_size: 10
         num_workers: 0
         pin_memory: true
         shuffle: true
         drop_last: true
       val:
-        batch_size: 32
+        batch_size: 1
         num_workers: 0
         pin_memory: true
         shuffle: false
         drop_last: false
       test:
-        batch_size: 32
+        batch_size: 1
         num_workers: 0
         pin_memory: true
         shuffle: false
         drop_last: false
-
 
 normalization:
   enabled: true
@@ -71,14 +70,13 @@ normalization:
   max_fit_batches: 32
 
 model:
-  type: adapted_fno_no_mamba
-#   n_dim: 3
+  type: adapted_fno
+  n_dim: 3
   hidden_channels: 60
-#   lifting_layers: 2
-#   projection_layers: 2
-#   core_layers: 4
-#   n_modes: [16, 60, 60]
-
+  lifting_layers: 2
+  projection_layers: 2
+  core_layers: 4
+  n_modes: [8, 30, 30]
 
 metrics:
   names:

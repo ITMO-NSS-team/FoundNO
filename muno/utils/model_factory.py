@@ -252,7 +252,7 @@ def get_all_files(dir: str, file_type: str = '.pt'):
     return glob.glob(dir + "/*" + file_type)
 
 
-def load_from_dir(dir: str, SAVE_LOAD_ARGS = None):
+def load_from_dir(dir: str, SAVE_LOAD_ARGS = {}):
     files = get_all_files(dir) # glob.glob(dir + "/*.pt")
     print('loading from {}'.format(files))
     return [torch.load(file, pickle_module=dill, **SAVE_LOAD_ARGS) for file in files]

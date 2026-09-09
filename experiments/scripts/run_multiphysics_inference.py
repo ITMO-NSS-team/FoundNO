@@ -44,8 +44,7 @@ from muno.utils.training_utils import BalancedRelL2Loss
 from muno.utils.model_factory import build_model, load_from_dir, get_all_files
 from muno.data.benchmarks.evaluation import (
     evaluate_multitask_loaders,
-    save_metrics,
-    compute_batch_metrics
+    save_metrics
 )
 
 from muno.models.muno import Muno
@@ -113,17 +112,19 @@ def predict_batch(model, sample, data_processor=None, device='cuda:0'):
 def compute_batch_metrics(pred: dict, target: dict, metrics_config, task_name):
     results = {}
     metric_names = metrics_config.get("names", [])
-    if metric_names:
-        results.update({key: compute_metrics(pred[key], target[key], metric_names=metric_names)
-                        for key in pred.keys()})
 
     physical_configs = filter_physical_metric_configs(
         metrics_config.get("physical", []),
         task_name,
     )
-    if physical_configs:
-        results.update({key: compute_physical_metrics(pred[key], target[key], metric_configs=physical_configs)
-                        for key in pred.keys()})
+
+    for key in pred.keys():
+        entry = {}
+        if metric_names:
+            entry.update(compute_metrics(pred[key], target[key], metric_names=metric_names))
+        if physical_configs:
+            entry.update(compute_physical_metrics(pred[key], target[key], metric_configs=physical_configs))
+        results[key] = entry
 
     return results
 
@@ -181,13 +182,13 @@ def evaluate_loader(
     output_prefix = Path.joinpath(output_prefix, "inf_")
     with torch.no_grad():
         for sample in loader:
-            pred, target = predict_batch(
-                model,
-                sample,
-                data_processor=data_processor,
-            )
-            band = pred
-            #pred, band, target = mc_lifting_predict(model, sample)
+            # pred, target = predict_batch(
+            #     model,
+            #     sample,
+            #     data_processor=data_processor,
+            # )
+            # band = pred
+            pred, band, target = mc_lifting_predict(model, sample)
 
             k=1.2
             for key in pred:
@@ -195,7 +196,7 @@ def evaluate_loader(
                 covered = residual.abs() <= k * band[key]
 
                 if pred[key].ndim >= 4:
-                    time_index = pred[key].shape[1] - 1
+                    time_index = pred[key].shape[2] - 1
                 else:
                     time_index = 0
 
@@ -334,7 +335,7 @@ def main():
 
     for i, lift in enumerate(model._liftings):
         if not isinstance(lift, (LiftingFeatureDropout, LiftingGaussianPerturbation)):
-            model._liftings[i] = LiftingFeatureDropout(lift, p=0.1)
+            model._liftings[i] = LiftingGaussianPerturbation(lift, p=0.1)
 
     from muno.data.data.transforms.normalizers import UnitGaussianNormalizer, MultiphysicsUnitGaussianNormalizer
     from muno.data.data.transforms.data_processors import DefaultDataProcessor
