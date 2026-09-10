@@ -37,26 +37,26 @@ tasks:
       physics_name: 2d_cfd
 
     split:
-      type: explicit
-      train: [0, 10]
-      val: [11, 20]
-      test: [21, 31]
+      type: ratios
+      train: 0.8
+      val: 0.1
+      test: 0.1
 
     loaders:
       train:
-        batch_size: 10
+        batch_size: 16
         num_workers: 0
         pin_memory: true
         shuffle: true
         drop_last: true
       val:
-        batch_size: 1
+        batch_size: 32
         num_workers: 0
         pin_memory: true
         shuffle: false
         drop_last: false
       test:
-        batch_size: 1
+        batch_size: 32
         num_workers: 0
         pin_memory: true
         shuffle: false
@@ -70,13 +70,29 @@ normalization:
   max_fit_batches: 32
 
 model:
-  type: adapted_fno
+  type: adapted_fno_no_mamba
   n_dim: 3
   hidden_channels: 60
   lifting_layers: 2
   projection_layers: 2
   core_layers: 4
   n_modes: [8, 30, 30]
+
+
+training:
+  epochs: 10
+  device: cuda
+  train_main_fno: false
+  gradient_accumulation_steps: 4
+  optimizer:
+    optimizer: adamw
+    lr: 0.001
+    weight_decay: 1.0e-05
+  scheduler:
+    scheduler: reducelr
+    patience: 2
+    factor: 0.5
+    min_lr: 1.0e-06
 
 metrics:
   names:

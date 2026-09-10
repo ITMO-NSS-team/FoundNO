@@ -24,10 +24,6 @@ class LiftingFeatureDropout(nn.Module):
     """
     Wraps an already-trained lifting module and injects the paper's channel-wise
     multiplicative feature dropout (Method A, Eq. 11-13) on its output.
-
-    Key difference from plain nn.Dropout: stochasticity is controlled by
-    `self.sample_noise`, NOT by `.training`. This lets you keep the whole model
-    in eval() (deterministic propagation/recovery) while still sampling here.
     """
     def __init__(self, lifting_module: nn.Module, p: float = 0.1, channel_dim: int = 1):
         super().__init__()
@@ -35,42 +31,75 @@ class LiftingFeatureDropout(nn.Module):
         self.p = p
         self.channel_dim = channel_dim
         self.sample_noise = False          # deterministic by default
+        self.last_layer_drop = False
 
     def forward(self, x):
-        v0 = self.lifting(x)
-        if not self.sample_noise or self.p <= 0.0:
-            return v0                      # deterministic pass-through
+        has_ssm = hasattr(self.lifting, 'post_lift_ssm')
 
-        # sample one Bernoulli value per (batch element, channel), shared across
-        # all spatial locations -> matches Eq. 11 exactly, for any spatial rank
+        if not self.sample_noise or self.p <= 0.0:
+                return self.lifting(x)
+
+        if has_ssm and not self.last_layer_drop:
+            if self.lifting.positional_embedding is not None:
+                x = self.lifting.positional_embedding(x)          
+            v0 = self.lifting.lifting(x)
+        else:
+            v0 = self.lifting(x)
+
         shape = [1] * v0.dim()
-        shape[0] = v0.shape[0]                 # batch
-        shape[self.channel_dim] = v0.shape[self.channel_dim]  # channels
+        shape[0] = v0.shape[0]
+        shape[self.channel_dim] = v0.shape[self.channel_dim]
         z = torch.bernoulli(torch.full(shape, 1 - self.p, device=v0.device, dtype=v0.dtype))
-        xi = z / (1 - self.p)                  # inverted-dropout scaling, E[xi]=1
-        return v0 * xi
+        xi = z / (1 - self.p)
+        v0 = v0 * xi
+
+        if has_ssm:
+            if self.lifting.domain_padding is not None:
+                v0 = self.lifting.domain_padding.pad(v0)
+            return self.lifting.post_lift_ssm(v0)
+        return v0
 
 
 class LiftingGaussianPerturbation(nn.Module):
-    """Method B (Eq. 15): Gaussian perturbation with variance matched to p/(1-p)."""
+    """Method B (Eq. 15): Gaussian perturbation with variance matched to p/(1-p).
+
+    If the wrapped lifting module has a `post_lift_ssm` attribute (e.g.
+    PostLiftMambaLifting), noise is applied only to the MLP output and the
+    SSM processes the noisy features unchanged.
+    """
     def __init__(self, lifting_module: nn.Module, p: float = 0.1, channel_dim: int = 1):
         super().__init__()
         self.lifting = lifting_module
         self.p = p
         self.channel_dim = channel_dim
         self.sample_noise = False
+        self.last_layer_drop = False
 
     def forward(self, x):
-        v0 = self.lifting(x)
+        has_ssm = hasattr(self.lifting, 'post_lift_ssm')
+
         if not self.sample_noise or self.p <= 0.0:
-            return v0
+                return self.lifting(x)
+
+        if has_ssm and not self.last_layer_drop:
+            if self.lifting.positional_embedding is not None:
+                x = self.lifting.positional_embedding(x)          
+            v0 = self.lifting.lifting(x)
+        else:
+            v0 = self.lifting(x)
 
         shape = [1] * v0.dim()
         shape[0] = v0.shape[0]
         shape[self.channel_dim] = v0.shape[self.channel_dim]
         std = (self.p / (1 - self.p)) ** 0.5
         eps = torch.randn(shape, device=v0.device, dtype=v0.dtype) * std
-        return v0 + v0 * eps
+        v0 = v0 + v0 * eps
+
+        if has_ssm:
+            if self.lifting.domain_padding is not None:
+                v0 = self.lifting.domain_padding.pad(v0)
+            return self.lifting.post_lift_ssm(v0)
+        return v0
 
 # -------------------------
 # PDEBench dataset (unchanged)

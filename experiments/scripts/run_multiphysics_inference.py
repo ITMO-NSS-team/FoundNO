@@ -129,7 +129,7 @@ def compute_batch_metrics(pred: dict, target: dict, metrics_config, task_name):
     return results
 
     
-def set_mc_lifting(model: 'Muno', on: bool, adapter_idx: int = None):
+def set_mc_lifting(model: 'Muno', on: bool, adapter_idx: int = None, last_layer_drop: bool = False):
     """Turn structure-aware sampling on/off for one adapter, or all if adapter_idx is None."""
     model.eval()  # core + projections always deterministic
     indices = range(len(model._liftings)) if adapter_idx is None else [adapter_idx]
@@ -142,28 +142,42 @@ def set_mc_lifting(model: 'Muno', on: bool, adapter_idx: int = None):
                 f"Call the wrapping step first."
             )
         lift.sample_noise = on
-        lift.p = 0.1
+        lift.last_layer_drop = last_layer_drop
+        lift.p = 0.0 if not on else 0.1
 
 @torch.no_grad()
-def mc_lifting_predict(model, sample, adapter_idx=0, T=20, device='cuda:0', **kwargs):
-    x = {key: sample[key]["x"].to(device) for key in sample}
-    target = {key: sample[key]["y"].to(device) for key in sample.keys()}
-    set_mc_lifting(model, on=True, adapter_idx=adapter_idx)
+def mc_lifting_predict(model, sample, data_processor=None, on_dropout= False, last_layer_drop = True, adapter_idx=0, T=20, device='cuda:0', **kwargs):
+    for key in sample.keys():
+        sample[key]["x"] = sample[key]["x"].to(device)
+        sample[key]["y"] = sample[key]["y"].to(device)
+        if "mask" in sample[key].keys():
+            sample[key]["mask"] = sample[key]["mask"].to(device)
+
+    if data_processor is not None:
+        sample = data_processor.preprocess(sample, training=False)
+
+    x = {key: sample[key]["x"] for key in sample}
+    target = {key: sample[key]["y"] for key in sample.keys()}
+
+    set_mc_lifting(model, on=on_dropout, adapter_idx=adapter_idx, last_layer_drop = last_layer_drop)
     raw_samples = [model(x, adapter_idx=adapter_idx, **kwargs) for _ in range(T)]
 
     if isinstance(raw_samples[0], dict):
         keys = raw_samples[0].keys()
         mean, band = {}, {}
         for key in keys:
-            stacked = torch.stack([s[key] for s in raw_samples], dim=0)  # (T, B, C, ...)
+            stacked = torch.stack([s[key] for s in raw_samples], dim=0)
             mean[key] = stacked.mean(0)
             band[key] = stacked.pow(2).mean(0).sub(mean[key].pow(2)).clamp_min(0).sqrt()
-        return mean, band, target
     else:
         stacked = torch.stack(raw_samples, dim=0)
         mean = stacked.mean(0)
         band = stacked.pow(2).mean(0).sub(mean.pow(2)).clamp_min(0).sqrt()
-        return mean, band, target
+
+    if data_processor is not None:
+        mean, sample = data_processor.postprocess(mean, sample, training=False)
+
+    return mean, band, target
 
 def evaluate_loader(
     model,
@@ -188,7 +202,9 @@ def evaluate_loader(
             #     data_processor=data_processor,
             # )
             # band = pred
-            pred, band, target = mc_lifting_predict(model, sample)
+            pred, band, target = mc_lifting_predict(
+                model, sample, data_processor=data_processor, T=100, on_dropout=True, last_layer_drop = True
+            )
 
             k=1.2
             for key in pred:
@@ -374,9 +390,8 @@ def main():
     #     out_normalizer.partial_fit(batch)
 
     
-    
-    print(out_normalizer.normalizers[0].mean.flatten())
-    print(out_normalizer.normalizers[0].std.flatten())
+    # print(out_normalizer.normalizers[0].mean.flatten())
+    # print(out_normalizer.normalizers[0].std.flatten())
 
     in_normalizer.to(device)
     out_normalizer.to(device)
@@ -413,7 +428,7 @@ def main():
         task_name="val",
         output_dir = output_dir
     )
-    print(f'train_metrics: {val_metrics}')
+    print(f'val_metrics: {val_metrics}')
     with open(os.path.join(eval_metrics_dir, "val_metrics.pkl"), "wb") as file:
         pickle.dump(val_metrics, file)
 
@@ -426,7 +441,7 @@ def main():
         task_name="test",
         output_dir = output_dir
     )
-    print(f'train_metrics: {test_metrics}')
+    print(f'test_metrics: {test_metrics}')
     with open(os.path.join(eval_metrics_dir, "test_metrics.pkl"), "wb") as file:
         pickle.dump(test_metrics, file)
 

@@ -51,7 +51,7 @@ class Trainer(object):
         try:
             self.global_rank = int(os.environ["RANK"])  
         except KeyError:
-            self.local_rank = 0            
+            self.global_rank= 0            
 
         if backup_loc is None:
             backup_loc = os.path.join(os.getcwd(), 'backup')

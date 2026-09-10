@@ -38,7 +38,7 @@ from muno.data.benchmarks.normalization import build_data_processors
 from muno.data.benchmarks.inspections import inspect_tasks
 from muno.utils.custom_trainer import Trainer
 from muno.utils.training_utils import BalancedRelL2Loss
-from muno.utils.model_factory import build_model
+from muno.utils.model_factory import build_model, load_from_dir
 from muno.data.benchmarks.evaluation import (
     evaluate_multitask_loaders,
     save_metrics,
