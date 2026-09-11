@@ -34,11 +34,13 @@ from muno.data.benchmarks.multiphysics_loaders import (
 )
 
 from muno.utils.metrics import compute_metrics
-from muno.data.benchmarks.evaluation import filter_physical_metric_configs, compute_physical_metrics
+from muno.utils.metrics_physical import compute_physical_metrics
+from muno.utils.metrics_uq import compute_uq_metrics
+from muno.data.benchmarks.evaluation import filter_physical_metric_configs
 
 from muno.data.benchmarks.datasets import MultiPhysicsDataset
 from muno.data.benchmarks.normalization import build_data_processors
-from muno.data.benchmarks.inspections import inspect_tasks, save_image, canonical_image
+from muno.data.benchmarks.inspections import inspect_tasks, result_img_save, result_uq_img_save
 from muno.utils.custom_trainer import Trainer
 from muno.utils.training_utils import BalancedRelL2Loss
 from muno.utils.model_factory import build_model, load_from_dir, get_all_files
@@ -109,12 +111,16 @@ def predict_batch(model, sample, data_processor=None, device='cuda:0'):
     assert isinstance(out, dict), 'Multisample model prediction is expected to be a dict.'
     return out, {key: sample[key]["y"] for key in sample.keys()}
 
-def compute_batch_metrics(pred: dict, target: dict, metrics_config, task_name):
+def compute_batch_metrics(pred: dict, band: dict, target: dict, metrics_config, task_name):
     results = {}
     metric_names = metrics_config.get("names", [])
 
     physical_configs = filter_physical_metric_configs(
         metrics_config.get("physical", []),
+        task_name,
+    )
+    uq_configs = filter_physical_metric_configs(
+        metrics_config.get("uncertainty", []),
         task_name,
     )
 
@@ -124,6 +130,8 @@ def compute_batch_metrics(pred: dict, target: dict, metrics_config, task_name):
             entry.update(compute_metrics(pred[key], target[key], metric_names=metric_names))
         if physical_configs:
             entry.update(compute_physical_metrics(pred[key], target[key], metric_configs=physical_configs))
+        if uq_configs:
+            entry.update(compute_uq_metrics(pred[key], band[key], target[key], metric_configs=uq_configs))
         results[key] = entry
 
     return results
@@ -131,7 +139,7 @@ def compute_batch_metrics(pred: dict, target: dict, metrics_config, task_name):
     
 def set_mc_lifting(model: 'Muno', on: bool, adapter_idx: int = None, last_layer_drop: bool = False):
     """Turn structure-aware sampling on/off for one adapter, or all if adapter_idx is None."""
-    model.eval()  # core + projections always deterministic
+    #model.eval()  # core + projections always deterministic
     indices = range(len(model._liftings)) if adapter_idx is None else [adapter_idx]
     for i in indices:
         lift = model._liftings[i]
@@ -185,10 +193,18 @@ def evaluate_loader(
     data_processor,
     metrics_config,
     task_name,
-    output_dir
+    output_dir,
+    inference_config=None,
 ):
     metric_sums = {}
     n_batches = 0
+
+    mc_config = (inference_config or {}).get("mc_drop_out", {})
+    use_mc = bool(mc_config)
+    T = mc_config.get("T", 10)
+    on_dropout = mc_config.get("on_dropout", True)
+    lift_last_layer_drop = mc_config.get("lift_last_layer_drop", True)
+    k = metrics_config.get("uncertainty", [{}])[0].get("k", 1.2)
 
     model.eval()
     output_prefix = Path(output_dir / f"inspections_inf_{task_name}")
@@ -196,54 +212,24 @@ def evaluate_loader(
     output_prefix = Path.joinpath(output_prefix, "inf_")
     with torch.no_grad():
         for sample in loader:
-            # pred, target = predict_batch(
-            #     model,
-            #     sample,
-            #     data_processor=data_processor,
-            # )
-            # band = pred
-            pred, band, target = mc_lifting_predict(
-                model, sample, data_processor=data_processor, T=100, on_dropout=True, last_layer_drop = True
-            )
+            if use_mc:
+                pred, band, target = mc_lifting_predict(
+                    model, sample, data_processor=data_processor, T=T, on_dropout=on_dropout, last_layer_drop = lift_last_layer_drop
+                )
+                result_uq_img_save(pred, band, target, output_prefix, n_batches, k=k)
+            else:
+                pred, target = predict_batch(
+                    model,
+                    sample,
+                    data_processor=data_processor,
+                )
+                band = pred
 
-            k=1.2
-            for key in pred:
-                residual = pred[key] - target[key]
-                covered = residual.abs() <= k * band[key]
-
-                if pred[key].ndim >= 4:
-                    time_index = pred[key].shape[2] - 1
-                else:
-                    time_index = 0
-
-                save_image(
-                        canonical_image(pred[key], channel_index=0, time_index=time_index),
-                        output_prefix.with_name(output_prefix.name + f"{n_batches}_pred_.png"),
-                        f"{output_prefix.name} pred",
-                    )
-                save_image(
-                        canonical_image(target[key], channel_index=0, time_index=time_index),
-                        output_prefix.with_name(output_prefix.name + f"{n_batches}_target_.png"),
-                        f"{output_prefix.name} target",
-                                )
-                save_image(
-                        canonical_image(band[key], channel_index=0, time_index=time_index),
-                        output_prefix.with_name(output_prefix.name + f"{n_batches}_band_.png"),
-                        f"{output_prefix.name} band",
-                                )
-                save_image(
-                        canonical_image(covered[key], channel_index=0, time_index=time_index),
-                        output_prefix.with_name(output_prefix.name + f"{n_batches}_covered_.png"),
-                        f"{output_prefix.name} covered",
-                                )
-                save_image(
-                        canonical_image(residual[key], channel_index=0, time_index=time_index),
-                        output_prefix.with_name(output_prefix.name + f"{n_batches}_residual_.png"),
-                        f"{output_prefix.name} residual",
-                                )
+            result_img_save(pred, target, output_prefix, n_batches)
 
             batch_metrics = compute_batch_metrics(
                 pred,
+                band,
                 target,
                 metrics_config=metrics_config,
                 task_name=task_name,
@@ -286,6 +272,8 @@ def main():
 
     training_config = config.get("training", {})
     model_config = config.get("model", {})
+    inference_config = config.get("inference", {})
+    use_inference_mc = bool(inference_config.get("mc_drop_out", {}))
 
     epochs = args.epochs if args.epochs is not None else training_config.get("epochs", 1)
     # device = args.device if args.device is not None else training_config.get("device", "cuda")
@@ -349,9 +337,10 @@ def main():
         model = Muno(single_model = model_blocks)
 
 
-    for i, lift in enumerate(model._liftings):
-        if not isinstance(lift, (LiftingFeatureDropout, LiftingGaussianPerturbation)):
-            model._liftings[i] = LiftingGaussianPerturbation(lift, p=0.1)
+    if use_inference_mc:
+        for i, lift in enumerate(model._liftings):
+            if not isinstance(lift, (LiftingFeatureDropout, LiftingGaussianPerturbation)):
+                model._liftings[i] = LiftingFeatureDropout(lift, p=0.1)
 
     from muno.data.data.transforms.normalizers import UnitGaussianNormalizer, MultiphysicsUnitGaussianNormalizer
     from muno.data.data.transforms.data_processors import DefaultDataProcessor
@@ -406,18 +395,18 @@ def main():
     eval_metrics_dir = output_dir / "metrics"
     eval_metrics_dir.mkdir(parents=True, exist_ok=True)
 
-    train_metrics = evaluate_loader(
-        model=model,
-        loader=train_loader,
-        data_processor=data_processors,
-        #task_metadata=metadata,
-        metrics_config=metrics_config,
-        task_name="train",
-        output_dir = output_dir
-    )
-    print(f'train_metrics: {train_metrics}')
-    with open(os.path.join(eval_metrics_dir, "train_metrics.pkl"), "wb") as file:
-        pickle.dump(train_metrics, file)
+    # train_metrics = evaluate_loader(
+    #     model=model,
+    #     loader=train_loader,
+    #     data_processor=data_processors,
+    #     #task_metadata=metadata,
+    #     metrics_config=metrics_config,
+    #     task_name="train",
+    #     output_dir = output_dir
+    # )
+    # print(f'train_metrics: {train_metrics}')
+    # with open(os.path.join(eval_metrics_dir, "train_metrics.pkl"), "wb") as file:
+    #     pickle.dump(train_metrics, file)
 
     val_metrics = evaluate_loader(
         model=model,
@@ -426,7 +415,8 @@ def main():
         #task_metadata=metadata,
         metrics_config=metrics_config,
         task_name="val",
-        output_dir = output_dir
+        output_dir = output_dir,
+        inference_config=inference_config,
     )
     print(f'val_metrics: {val_metrics}')
     with open(os.path.join(eval_metrics_dir, "val_metrics.pkl"), "wb") as file:
@@ -439,7 +429,8 @@ def main():
         #task_metadata=metadata,
         metrics_config=metrics_config,
         task_name="test",
-        output_dir = output_dir
+        output_dir = output_dir,
+        inference_config=inference_config,
     )
     print(f'test_metrics: {test_metrics}')
     with open(os.path.join(eval_metrics_dir, "test_metrics.pkl"), "wb") as file:

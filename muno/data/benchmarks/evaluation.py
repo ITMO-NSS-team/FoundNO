@@ -14,7 +14,6 @@ def prefix_metrics(metrics, prefix):
         for name, value in metrics.items()
     }
 
-
 def filter_physical_metric_configs(metric_configs, task_name):
     selected_configs = []
 

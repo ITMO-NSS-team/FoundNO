@@ -159,6 +159,49 @@ def save_image(image, path, title):
     plt.close()
 
 
+def _inference_time_index(tensor):
+    return tensor.shape[2] - 1 if tensor.ndim >= 4 else 0
+
+
+def result_img_save(pred, target, output_prefix, batch_idx):
+    for key in pred.keys():
+        time_index = _inference_time_index(pred[key])
+
+        save_image(
+            canonical_image(pred[key], channel_index=0, time_index=time_index),
+            output_prefix.with_name(output_prefix.name + f"{batch_idx}_pred_.png"),
+            f"{output_prefix.name} pred",
+        )
+        save_image(
+            canonical_image(target[key], channel_index=0, time_index=time_index),
+            output_prefix.with_name(output_prefix.name + f"{batch_idx}_target_.png"),
+            f"{output_prefix.name} target",
+        )
+
+
+def result_uq_img_save(pred, band, target, output_prefix, batch_idx, k):
+    for key in pred.keys():
+        residual = (pred[key] - target[key]).abs()
+        covered = residual.abs() <= k * band[key]
+        time_index = _inference_time_index(pred[key])
+
+        save_image(
+            canonical_image(band[key], channel_index=0, time_index=time_index),
+            output_prefix.with_name(output_prefix.name + f"{batch_idx}_band_.png"),
+            f"{output_prefix.name} band",
+        )
+        save_image(
+            canonical_image(covered[key].to(torch.float32), channel_index=0, time_index=time_index),
+            output_prefix.with_name(output_prefix.name + f"{batch_idx}_covered_.png"),
+            f"{output_prefix.name} covered",
+        )
+        save_image(
+            canonical_image(residual[key], channel_index=0, time_index=time_index),
+            output_prefix.with_name(output_prefix.name + f"{batch_idx}_residual_.png"),
+            f"{output_prefix.name} residual",
+        )
+
+
 def save_raw_images(raw_sample, output_prefix, data_order=None):
     if isinstance(raw_sample, dict):
         for key, tensor in raw_sample.items():

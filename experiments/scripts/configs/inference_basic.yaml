@@ -38,9 +38,9 @@ tasks:
 
     split:
       type: ratios
-      train: 0.8
-      val: 0.1
-      test: 0.1
+      train: 0.998
+      val: 0.001
+      test: 0.001
 
     loaders:
       train:
@@ -77,6 +77,13 @@ model:
   projection_layers: 2
   core_layers: 4
   n_modes: [8, 30, 30]
+
+
+inference:
+  mc_drop_out:
+    T: 5
+    on_dropout: true
+    lift_last_layer_drop: true
 
 
 training:
@@ -116,3 +123,10 @@ metrics:
       tasks: all
     - name: band_spectral_nrmse_2d
       tasks: all
+  uncertainty:
+    - name: coverage_rate
+      tasks: all
+      k: 1.5
+    - name: normalized_avg_bandwidth
+      tasks: all
+      k: 1.5
