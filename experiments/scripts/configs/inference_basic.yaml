@@ -79,11 +79,14 @@ model:
   n_modes: [8, 30, 30]
 
 
-inference:
-  mc_drop_out:
-    T: 5
-    on_dropout: true
-    lift_last_layer_drop: true
+# inference:
+#   mc_drop_out:
+#     method: bernoulli #gaussian
+#     T: 5
+#     on_dropout: true
+#     lift_last_layer_drop: true
+#     p: 0.1
+#     target_coverage: 0.9
 
 
 training:
@@ -123,10 +126,8 @@ metrics:
       tasks: all
     - name: band_spectral_nrmse_2d
       tasks: all
-  uncertainty:
-    - name: coverage_rate
-      tasks: all
-      k: 1.5
-    - name: normalized_avg_bandwidth
-      tasks: all
-      k: 1.5
+  # uncertainty:
+  #   - name: coverage_rate
+  #     tasks: all
+  #   - name: normalized_avg_bandwidth
+  #     tasks: all

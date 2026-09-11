@@ -147,11 +147,11 @@ def canonical_axis_names(tensor):
     return None
 
 
-def save_image(image, path, title):
+def save_image(image, path, title, vmin = None, vmax = None):
     image = image.detach().cpu()
 
     plt.figure(figsize=(5, 4))
-    plt.imshow(image, cmap="viridis")
+    plt.imshow(image, cmap="viridis", vmin=vmin, vmax=vmax)
     plt.colorbar()
     plt.title(title)
     plt.tight_layout()
@@ -169,35 +169,36 @@ def result_img_save(pred, target, output_prefix, batch_idx):
 
         save_image(
             canonical_image(pred[key], channel_index=0, time_index=time_index),
-            output_prefix.with_name(output_prefix.name + f"{batch_idx}_pred_.png"),
+            output_prefix.with_name(output_prefix.name + f"{key}_{batch_idx}_pred_.png"),
             f"{output_prefix.name} pred",
         )
         save_image(
             canonical_image(target[key], channel_index=0, time_index=time_index),
-            output_prefix.with_name(output_prefix.name + f"{batch_idx}_target_.png"),
+            output_prefix.with_name(output_prefix.name + f"{key}_{batch_idx}_target_.png"),
             f"{output_prefix.name} target",
         )
 
 
-def result_uq_img_save(pred, band, target, output_prefix, batch_idx, k):
+def result_uq_img_save(pred, band, target, output_prefix, batch_idx, k=1.0):
     for key in pred.keys():
-        residual = (pred[key] - target[key]).abs()
-        covered = residual.abs() <= k * band[key]
+        k_key = k.get(key, 1.0) if isinstance(k, dict) else k
+        residual = pred[key] - target[key]
+        covered = residual.abs() <= k_key * band[key]
         time_index = _inference_time_index(pred[key])
 
         save_image(
             canonical_image(band[key], channel_index=0, time_index=time_index),
-            output_prefix.with_name(output_prefix.name + f"{batch_idx}_band_.png"),
+            output_prefix.with_name(output_prefix.name + f"{key}_{batch_idx}_band_.png"),
             f"{output_prefix.name} band",
         )
         save_image(
-            canonical_image(covered[key].to(torch.float32), channel_index=0, time_index=time_index),
-            output_prefix.with_name(output_prefix.name + f"{batch_idx}_covered_.png"),
-            f"{output_prefix.name} covered",
+            canonical_image(covered.to(torch.float32), channel_index=0, time_index=time_index),
+            output_prefix.with_name(output_prefix.name + f"{key}_{batch_idx}_covered_.png"),
+            f"{output_prefix.name} covered", vmin=0.0, vmax=1.0,
         )
         save_image(
-            canonical_image(residual[key], channel_index=0, time_index=time_index),
-            output_prefix.with_name(output_prefix.name + f"{batch_idx}_residual_.png"),
+            canonical_image(residual, channel_index=0, time_index=time_index),
+            output_prefix.with_name(output_prefix.name + f"{key}_{batch_idx}_residual_.png"),
             f"{output_prefix.name} residual",
         )
 

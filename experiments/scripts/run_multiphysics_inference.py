@@ -111,7 +111,7 @@ def predict_batch(model, sample, data_processor=None, device='cuda:0'):
     assert isinstance(out, dict), 'Multisample model prediction is expected to be a dict.'
     return out, {key: sample[key]["y"] for key in sample.keys()}
 
-def compute_batch_metrics(pred: dict, band: dict, target: dict, metrics_config, task_name):
+def compute_batch_metrics(pred: dict, band: dict, target: dict, metrics_config, task_name, k=None):
     results = {}
     metric_names = metrics_config.get("names", [])
 
@@ -131,13 +131,15 @@ def compute_batch_metrics(pred: dict, band: dict, target: dict, metrics_config, 
         if physical_configs:
             entry.update(compute_physical_metrics(pred[key], target[key], metric_configs=physical_configs))
         if uq_configs:
-            entry.update(compute_uq_metrics(pred[key], band[key], target[key], metric_configs=uq_configs))
+            k_key = k.get(key, 1.0) if isinstance(k, dict) else k
+            k_cfgs = [{**config, "k": k_key} for config in uq_configs] if k is not None else uq_configs
+            entry.update(compute_uq_metrics(pred[key], band[key], target[key], metric_configs=k_cfgs))
         results[key] = entry
 
     return results
 
     
-def set_mc_lifting(model: 'Muno', on: bool, adapter_idx: int = None, last_layer_drop: bool = False):
+def set_mc_lifting(model: 'Muno', on: bool, adapter_idx: int = None, last_layer_drop: bool = False, p: float = 0.1):
     """Turn structure-aware sampling on/off for one adapter, or all if adapter_idx is None."""
     #model.eval()  # core + projections always deterministic
     indices = range(len(model._liftings)) if adapter_idx is None else [adapter_idx]
@@ -151,10 +153,10 @@ def set_mc_lifting(model: 'Muno', on: bool, adapter_idx: int = None, last_layer_
             )
         lift.sample_noise = on
         lift.last_layer_drop = last_layer_drop
-        lift.p = 0.0 if not on else 0.1
+        lift.p = 0.0 if not on else p
 
 @torch.no_grad()
-def mc_lifting_predict(model, sample, data_processor=None, on_dropout= False, last_layer_drop = True, adapter_idx=0, T=20, device='cuda:0', **kwargs):
+def mc_lifting_predict(model, sample, data_processor=None, on_dropout= False, last_layer_drop = True, adapter_idx=0, T=20, p=0.1, device='cuda:0', **kwargs):
     for key in sample.keys():
         sample[key]["x"] = sample[key]["x"].to(device)
         sample[key]["y"] = sample[key]["y"].to(device)
@@ -167,7 +169,7 @@ def mc_lifting_predict(model, sample, data_processor=None, on_dropout= False, la
     x = {key: sample[key]["x"] for key in sample}
     target = {key: sample[key]["y"] for key in sample.keys()}
 
-    set_mc_lifting(model, on=on_dropout, adapter_idx=adapter_idx, last_layer_drop = last_layer_drop)
+    set_mc_lifting(model, on=on_dropout, adapter_idx=adapter_idx, last_layer_drop = last_layer_drop, p=p)
     raw_samples = [model(x, adapter_idx=adapter_idx, **kwargs) for _ in range(T)]
 
     if isinstance(raw_samples[0], dict):
@@ -187,6 +189,33 @@ def mc_lifting_predict(model, sample, data_processor=None, on_dropout= False, la
 
     return mean, band, target
 
+
+def calibrate_k(band_raw, target, pred, target_coverage=0.9, k_min=0.1, k_max=5.0, eps=1e-12):
+    # band_raw, residuals — на КАЛИБРОВОЧНОМ сплите (не train, не test)
+    residuals = (pred - target)
+    residuals = residuals.abs().flatten()
+    band = band_raw.flatten()
+
+    ratio = torch.full_like(residuals, float("inf"))
+    nonzero_band = band > eps
+    ratio[nonzero_band] = residuals[nonzero_band] / band[nonzero_band].clamp_min(eps)
+    ratio[~nonzero_band] = torch.where(
+        residuals[~nonzero_band] > eps,
+        torch.tensor(float("inf"), dtype=ratio.dtype, device=ratio.device),
+        torch.tensor(0.0, dtype=ratio.dtype, device=ratio.device),
+    )
+
+    k = torch.clamp(
+        torch.quantile(ratio, target_coverage, interpolation="lower"),
+        k_min,
+        k_max,
+    ).item()
+
+    coverage = (residuals <= k * band).float().mean().item()
+    if coverage >= target_coverage:
+        return k
+    return k_max
+
 def evaluate_loader(
     model,
     loader,
@@ -195,6 +224,7 @@ def evaluate_loader(
     task_name,
     output_dir,
     inference_config=None,
+    k=None,
 ):
     metric_sums = {}
     n_batches = 0
@@ -204,7 +234,10 @@ def evaluate_loader(
     T = mc_config.get("T", 10)
     on_dropout = mc_config.get("on_dropout", True)
     lift_last_layer_drop = mc_config.get("lift_last_layer_drop", True)
-    k = metrics_config.get("uncertainty", [{}])[0].get("k", 1.2)
+    p = mc_config.get("p", 0.1)
+    target_coverage =  mc_config.get("target_coverage", 0.9)
+    k_sums = {}
+    k_counts = {}
 
     model.eval()
     output_prefix = Path(output_dir / f"inspections_inf_{task_name}")
@@ -214,9 +247,19 @@ def evaluate_loader(
         for sample in loader:
             if use_mc:
                 pred, band, target = mc_lifting_predict(
-                    model, sample, data_processor=data_processor, T=T, on_dropout=on_dropout, last_layer_drop = lift_last_layer_drop
+                    model, sample, data_processor=data_processor, T=T, 
+                    on_dropout=on_dropout, last_layer_drop = lift_last_layer_drop, p = p
                 )
-                result_uq_img_save(pred, band, target, output_prefix, n_batches, k=k)
+                if task_name == "val":
+                    k = {
+                        key: calibrate_k(band[key], target[key], pred[key], target_coverage=target_coverage)
+                        for key in pred
+                    }
+                    for key, k_value in k.items():
+                        k_sums[key] = k_sums.get(key, 0.0) + k_value
+                        k_counts[key] = k_counts.get(key, 0) + 1
+                if k is not None:
+                    result_uq_img_save(pred, band, target, output_prefix, n_batches, k=k)
             else:
                 pred, target = predict_batch(
                     model,
@@ -233,6 +276,7 @@ def evaluate_loader(
                 target,
                 metrics_config=metrics_config,
                 task_name=task_name,
+                k=k,
             )
             
             for task_name, task_metrics in batch_metrics.items():
@@ -246,13 +290,28 @@ def evaluate_loader(
 
             n_batches += 1
 
-    return {
-    task_name: {
-        name: value / n_batches
-        for name, value in task_metrics.items()
+    metrics = {
+        task_name: {
+            name: value / n_batches
+            for name, value in task_metrics.items()
+        }
+        for task_name, task_metrics in metric_sums.items()
     }
-    for task_name, task_metrics in metric_sums.items()
-}
+
+    final_k = {}
+    if k_sums:
+        final_k = {
+            key: k_sums[key] / k_counts[key]
+            for key in k_sums
+        }
+    elif k is not None:
+        final_k = k
+
+    if final_k:
+        for task_name in metrics:
+            metrics[task_name]["k"] = final_k[task_name] if task_name in final_k else float("nan")
+
+    return metrics
 
 
 def main():
@@ -273,7 +332,10 @@ def main():
     training_config = config.get("training", {})
     model_config = config.get("model", {})
     inference_config = config.get("inference", {})
-    use_inference_mc = bool(inference_config.get("mc_drop_out", {}))
+    mc_config = inference_config.get("mc_drop_out", {})
+    use_inference_mc = bool(mc_config)
+    mc_method = mc_config.get("method", "bernoulli")
+    target_coverage = mc_config.get("target_coverage", 0.9)
 
     epochs = args.epochs if args.epochs is not None else training_config.get("epochs", 1)
     # device = args.device if args.device is not None else training_config.get("device", "cuda")
@@ -340,7 +402,15 @@ def main():
     if use_inference_mc:
         for i, lift in enumerate(model._liftings):
             if not isinstance(lift, (LiftingFeatureDropout, LiftingGaussianPerturbation)):
-                model._liftings[i] = LiftingFeatureDropout(lift, p=0.1)
+                if mc_method == "bernoulli":
+                    model._liftings[i] = LiftingFeatureDropout(lift, p=0.1)
+                elif  mc_method == "gaussian":
+                    model._liftings[i] = LiftingGaussianPerturbation(lift, p=0.1)
+                else:
+                    raise ValueError(
+                        f"Unknown MC method '{mc_method}'. "
+                        f"Expected one of: 'bernoulli', 'gaussian'."
+                    )
 
     from muno.data.data.transforms.normalizers import UnitGaussianNormalizer, MultiphysicsUnitGaussianNormalizer
     from muno.data.data.transforms.data_processors import DefaultDataProcessor
@@ -417,10 +487,18 @@ def main():
         task_name="val",
         output_dir = output_dir,
         inference_config=inference_config,
+        k=None,
     )
     print(f'val_metrics: {val_metrics}')
     with open(os.path.join(eval_metrics_dir, "val_metrics.pkl"), "wb") as file:
         pickle.dump(val_metrics, file)
+
+    k = {
+        task: task_metrics["k"]
+        for task, task_metrics in val_metrics.items()
+        if "k" in task_metrics
+    }
+    k = k or None
 
     test_metrics = evaluate_loader(
         model=model,
@@ -431,12 +509,13 @@ def main():
         task_name="test",
         output_dir = output_dir,
         inference_config=inference_config,
+        k=k,
     )
     print(f'test_metrics: {test_metrics}')
     with open(os.path.join(eval_metrics_dir, "test_metrics.pkl"), "wb") as file:
         pickle.dump(test_metrics, file)
 
-    print("done")
+
     print(f"output_dir: {output_dir}")
 
 
