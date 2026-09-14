@@ -38,9 +38,9 @@ tasks:
 
     split:
       type: ratios
-      train: 0.998
-      val: 0.001
-      test: 0.001
+      train: 0.8
+      val: 0.1
+      test: 0.1
 
     loaders:
       train:
@@ -79,14 +79,17 @@ model:
   n_modes: [8, 30, 30]
 
 
-# inference:
-#   mc_drop_out:
-#     method: bernoulli #gaussian
-#     T: 5
-#     on_dropout: true
-#     lift_last_layer_drop: true
-#     p: 0.1
-#     target_coverage: 0.9
+inference:
+  mc_drop_out:
+    method: bernoulli #gaussian
+    T: 20
+    on_dropout: true
+    lift_last_layer_drop: true
+    p: 0.0
+    target_coverage: 0.9
+  experiment:
+    T: [20, 100, 20, 20, 20, 20, 20]
+    p: [0.0, 0.01, 0.1, 0.3, 0.5, 0.7, 0.9]
 
 
 training:
@@ -126,8 +129,8 @@ metrics:
       tasks: all
     - name: band_spectral_nrmse_2d
       tasks: all
-  # uncertainty:
-  #   - name: coverage_rate
-  #     tasks: all
-  #   - name: normalized_avg_bandwidth
-  #     tasks: all
+  uncertainty:
+    - name: coverage_rate
+      tasks: all
+    - name: normalized_avg_bandwidth
+      tasks: all

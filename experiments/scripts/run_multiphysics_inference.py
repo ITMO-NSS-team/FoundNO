@@ -206,12 +206,11 @@ def calibrate_k(band_raw, target, pred, target_coverage=0.9, k_min=0.1, k_max=5.
     )
 
     k = torch.clamp(
-        torch.quantile(ratio, target_coverage, interpolation="lower"),
-        k_min,
-        k_max,
+    torch.quantile(ratio, target_coverage, interpolation="higher"),
+    k_min, k_max,
     ).item()
 
-    coverage = (residuals <= k * band).float().mean().item()
+    coverage = (residuals <= k * band + eps).float().mean().item()
     if coverage >= target_coverage:
         return k
     return k_max
@@ -248,7 +247,8 @@ def evaluate_loader(
             if use_mc:
                 pred, band, target = mc_lifting_predict(
                     model, sample, data_processor=data_processor, T=T, 
-                    on_dropout=on_dropout, last_layer_drop = lift_last_layer_drop, p = p
+                    on_dropout=on_dropout, last_layer_drop = lift_last_layer_drop, p = p,
+                    device = data_processor.device
                 )
                 if task_name == "val":
                     k = {
@@ -265,6 +265,7 @@ def evaluate_loader(
                     model,
                     sample,
                     data_processor=data_processor,
+                    device = data_processor.device
                 )
                 band = pred
 
@@ -411,6 +412,8 @@ def main():
                         f"Unknown MC method '{mc_method}'. "
                         f"Expected one of: 'bernoulli', 'gaussian'."
                     )
+
+    model.to(device)
 
     from muno.data.data.transforms.normalizers import UnitGaussianNormalizer, MultiphysicsUnitGaussianNormalizer
     from muno.data.data.transforms.data_processors import DefaultDataProcessor
