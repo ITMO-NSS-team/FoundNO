@@ -84,7 +84,7 @@ inference:
     method: bernoulli #gaussian
     T: 20
     on_dropout: true
-    lift_last_layer_drop: true
+    lift_last_layer_drop: false
     p: 0.0
     target_coverage: 0.9
   experiment:

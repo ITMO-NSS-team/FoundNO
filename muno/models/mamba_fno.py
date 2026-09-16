@@ -20,6 +20,56 @@ from neuralop.models.base_model import BaseModel
 # -------------------------
 # UQ Lifting dropout
 # -------------------------
+def _noise_apply_shape(v, channel_dim):
+    shape = [1] * v.dim()
+    shape[0] = v.shape[0]
+    shape[channel_dim] = v.shape[channel_dim]
+    return shape
+
+
+def _feature_dropout_noise(v, p, channel_dim):
+    shape = _noise_apply_shape(v, channel_dim)
+    z = torch.bernoulli(torch.full(shape, 1 - p, device=v.device, dtype=v.dtype))
+    return v * (z / (1 - p))
+
+
+def _gaussian_perturbation_noise(v, p, channel_dim):
+    shape = _noise_apply_shape(v, channel_dim)
+    std = (p / (1 - p)) ** 0.5
+    eps = torch.randn(shape, device=v.device, dtype=v.dtype) * std
+    return v + v * eps
+
+
+def _lift_with_first_layer_noise(self, x, noise_fn):
+    has_ssm = hasattr(self.lifting, 'post_lift_ssm')
+    mlp = self.lifting.lifting if has_ssm else self.lifting
+
+    if has_ssm and self.lifting.positional_embedding is not None:
+        x = self.lifting.positional_embedding(x)
+
+    size = list(x.shape)
+    was_reshaped = x.ndim > 3
+    if was_reshaped:
+        x = x.reshape((*size[:2], -1))
+
+    v0 = mlp.fcs[0](x)
+    v0 = noise_fn(v0, self.p, self.channel_dim)
+    v0 = mlp.non_linearity(v0)
+    for i in range(1, mlp.n_layers):
+        v0 = mlp.fcs[i](v0)
+        if i < mlp.n_layers - 1:
+            v0 = mlp.non_linearity(v0)
+
+    if was_reshaped:
+        v0 = v0.reshape((size[0], mlp.out_channels, *size[2:]))
+
+    if has_ssm:
+        if self.lifting.domain_padding is not None:
+            v0 = self.lifting.domain_padding.pad(v0)
+        return self.lifting.post_lift_ssm(v0)
+    return v0
+
+
 class LiftingFeatureDropout(nn.Module):
     """
     Wraps an already-trained lifting module and injects the paper's channel-wise
@@ -34,30 +84,20 @@ class LiftingFeatureDropout(nn.Module):
         self.last_layer_drop = False
 
     def forward(self, x):
-        has_ssm = hasattr(self.lifting, 'post_lift_ssm')
-
         if not self.sample_noise or self.p <= 0.0:
-                return self.lifting(x)
+            return self.lifting(x)
 
-        if has_ssm and not self.last_layer_drop:
-            if self.lifting.positional_embedding is not None:
-                x = self.lifting.positional_embedding(x)          
-            v0 = self.lifting.lifting(x)
-        else:
+        if self.last_layer_drop:
             v0 = self.lifting(x)
+            v0 = _feature_dropout_noise(v0, self.p, self.channel_dim)
+            has_ssm = hasattr(self.lifting, 'post_lift_ssm')
+            if has_ssm:
+                if self.lifting.domain_padding is not None:
+                    v0 = self.lifting.domain_padding.pad(v0)
+                return self.lifting.post_lift_ssm(v0)
+            return v0
 
-        shape = [1] * v0.dim()
-        shape[0] = v0.shape[0]
-        shape[self.channel_dim] = v0.shape[self.channel_dim]
-        z = torch.bernoulli(torch.full(shape, 1 - self.p, device=v0.device, dtype=v0.dtype))
-        xi = z / (1 - self.p)
-        v0 = v0 * xi
-
-        if has_ssm:
-            if self.lifting.domain_padding is not None:
-                v0 = self.lifting.domain_padding.pad(v0)
-            return self.lifting.post_lift_ssm(v0)
-        return v0
+        return _lift_with_first_layer_noise(self, x, _feature_dropout_noise)
 
 
 class LiftingGaussianPerturbation(nn.Module):
@@ -76,30 +116,20 @@ class LiftingGaussianPerturbation(nn.Module):
         self.last_layer_drop = False
 
     def forward(self, x):
-        has_ssm = hasattr(self.lifting, 'post_lift_ssm')
-
         if not self.sample_noise or self.p <= 0.0:
-                return self.lifting(x)
+            return self.lifting(x)
 
-        if has_ssm and not self.last_layer_drop:
-            if self.lifting.positional_embedding is not None:
-                x = self.lifting.positional_embedding(x)          
-            v0 = self.lifting.lifting(x)
-        else:
+        if self.last_layer_drop:
             v0 = self.lifting(x)
+            v0 = _gaussian_perturbation_noise(v0, self.p, self.channel_dim)
+            has_ssm = hasattr(self.lifting, 'post_lift_ssm')
+            if has_ssm:
+                if self.lifting.domain_padding is not None:
+                    v0 = self.lifting.domain_padding.pad(v0)
+                return self.lifting.post_lift_ssm(v0)
+            return v0
 
-        shape = [1] * v0.dim()
-        shape[0] = v0.shape[0]
-        shape[self.channel_dim] = v0.shape[self.channel_dim]
-        std = (self.p / (1 - self.p)) ** 0.5
-        eps = torch.randn(shape, device=v0.device, dtype=v0.dtype) * std
-        v0 = v0 + v0 * eps
-
-        if has_ssm:
-            if self.lifting.domain_padding is not None:
-                v0 = self.lifting.domain_padding.pad(v0)
-            return self.lifting.post_lift_ssm(v0)
-        return v0
+        return _lift_with_first_layer_noise(self, x, _gaussian_perturbation_noise)
 
 # -------------------------
 # PDEBench dataset (unchanged)
