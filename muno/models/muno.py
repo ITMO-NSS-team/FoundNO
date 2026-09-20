@@ -1,5 +1,12 @@
 from typing import Tuple, List, Union, Literal, Dict
+from types import BuiltinFunctionType
+
+import numpy as np
 import dill
+import inspect
+import warnings
+
+# from abc import ABC, abstractmethod
 
 from functools import singledispatchmethod
 
@@ -8,6 +15,24 @@ from collections.abc import Callable, Iterator, Mapping
 import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
+
+from muno.layers.skips import SkipLike
+        
+        # sig = inspect.signature(combinator)
+        # assert 
+
+# Presets indicate, which tensors shall be passed into the corresponding hidden layers:
+# x_0 -> L -> x_1 -> 
+
+# TODO: refactor as a class?
+
+# def generateSkips() -> List[Dict[Tuple[str, int, int], torch.nn.Module]]:
+#     return {}
+
+# PRESET_SKIPS = {'dno': ('g', -1, StandardSkip),
+#                 'film': ('p', -1, FiLM),
+#                 'unet': ('x', , )}
+
 
 class Muno(nn.Module):
     _single_model: bool = False
@@ -32,9 +57,11 @@ class Muno(nn.Module):
                 assert len(projections) == len(liftings), \
                     f'numbers of projections and liftings have to match, got {len(liftings)} liftings and {len(projections)} projs.'
 
-                self._liftings = liftings
-                self._projections = projections
+                self._liftings = torch.nn.ModuleList(liftings)
+                self._projections = torch.nn.ModuleList(projections)
                 self._adapters_set = True
+
+                self._skip_handlers = {}
             else:
                 assert projections is None, 'If liftings arg is None, projections arg has to be None as well.'
                 self._adapters_set = False
@@ -50,7 +77,11 @@ class Muno(nn.Module):
             self._core = single_model
             self._empty = False
 
-    def set_adapter(self, lifting, projection):
+    # def setSkip(self, skip: torch.nn.Module, mode: str, skip_from: int, skip_to: int):
+    #     self._horizontal_skips_map[]
+    # TODO: implement correct mapping method
+
+    def setAdapter(self, lifting, projection):
         self._liftings.append(lifting)
         self._projections.append(projection)
 
@@ -84,6 +115,10 @@ class Muno(nn.Module):
 
         yield from ()
 
+    def addSkips(self, skips: List[SkipLike]):
+        for skip in skips:
+            self._skip_handlers[hash(skip)] = skip
+
     def setMode(self, mode: Literal['pretrain', 'finetune', 'eval'] = 'pretrain') -> None:
         assert mode in {'pretrain', 'finetune', 'eval'}, \
             f"Got incorrect mode {mode}, expected 'pretrain', 'finetune', or 'eval'."
@@ -106,7 +141,13 @@ class Muno(nn.Module):
         raise NotImplementedError('Default generic singledispatch method is not available.')
 
     @forward.register
-    def _(self, x: torch.Tensor, adapter_idx: int = 0, output_shape = None, **kwargs) -> torch.Tensor:    
+    def _(self, x: torch.Tensor, adapter_idx: int = 0, output_shape = None, **kwargs) -> torch.Tensor:
+        if any([-2 == skip_hash[1] for skip_hash in self._skip_handlers]):
+            skip_tensors = {-2: torch.clone(x),}
+        else:
+            skip_tensors = {}
+
+
         if output_shape is not None:
             raise NotImplementedError('Unexpected behavior, output shape has to be None')
         if self._empty or not self._adapters_set:
@@ -115,12 +156,32 @@ class Muno(nn.Module):
         if not self._single_model:
             x = self._liftings[adapter_idx](x) # add **kwargs processor 
 
-        x = self._core(x)
+        if any([-1 == skip_hash[1] for skip_hash in self._skip_handlers]):
+            skip_tensors[-1] = torch.clone(x)
+
+        x = self._core(x, skip_tensors)
 
         if not self._single_model:
-            x = self._projections[adapter_idx](x) # add **kwargs processor 
+            x = self._projections[adapter_idx](x) # add **kwargs processor
 
         return x
+
+    @forward.register
+    def _(self, x: tuple, adapter_idx: int = 0, output_shape = None, **kwargs) -> torch.Tensor:    # Tuple[torch.Tensor]
+        if output_shape is not None:
+            raise NotImplementedError('Unexpected behavior, output shape has to be None')
+        if self._empty or not self._adapters_set:
+            raise RuntimeError('Trying to call an unprepared model')
+
+        if not self._single_model:
+            x[0] = self._liftings[adapter_idx](x[0]) # add **kwargs processor 
+
+        x[0] = self._core(x[0])
+
+        if not self._single_model:
+            x[0] = self._projections[adapter_idx](x[0]) # add **kwargs processor 
+
+        return x[0]
 
     @forward.register
     def _(self, x: dict, adapter_idx: int = 0, output_shape = None, **kwargs) -> Dict[int, torch.Tensor]: # x: Dict[int, torch.Tensor]
@@ -129,7 +190,7 @@ class Muno(nn.Module):
         return {adapter_idx: self.forward(inp_tensor, adapter_idx = adapter_idx) for adapter_idx, inp_tensor in x.items()}
 
     @classmethod
-    def load(cls, model_path: Union[str, Tuple[None, str, Tuple[str]]], _SAVE_LOAD_PARAMS: dict = {}):
+    def load(cls, model_path: Union[str, Tuple[Union[None, str, Tuple[str]]]], _SAVE_LOAD_PARAMS: dict = {}):
         if isinstance(model_path, str):
             core = torch.load(f = model_path, pickle_module = dill, **_SAVE_LOAD_PARAMS)
             return cls(single_model = core)

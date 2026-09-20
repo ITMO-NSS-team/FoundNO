@@ -4,7 +4,7 @@
 # ----------------------------------------------------------------------------------------------------------------------
 
 from functools import partialmethod
-from typing import Tuple, List, Union, Literal
+from typing import Tuple, List, Union, Literal, Dict
 
 Number = Union[float, int]
 
@@ -27,6 +27,7 @@ from neuralop.layers.channel_mlp import ChannelMLP
 from neuralop.layers.complex import ComplexValued
 from neuralop.models.base_model import BaseModel
 
+from muno.layers.skips import SkipLike
 from muno.layers.fno_block import FNOBlocks
 
 class FNO(BaseModel, name="FNO"):
@@ -284,33 +285,62 @@ class FNO(BaseModel, name="FNO"):
                     resolution_scaling_factor = [resolution_scaling_factor] * self.n_layers
             self.resolution_scaling_factor = resolution_scaling_factor
 
+        # TODO: dynamic init, according to types, implement via inspect
         ## FNO blocks
-        self.fno_blocks = FNOBlocks(
-            in_channels=hidden_channels,
-            out_channels=hidden_channels,
-            n_modes=self.n_modes,
-            resolution_scaling_factor=resolution_scaling_factor,
-            use_channel_mlp=use_channel_mlp,
-            channel_mlp_dropout=channel_mlp_dropout,
-            channel_mlp_expansion=channel_mlp_expansion,
-            non_linearity=non_linearity,
-            stabilizer=stabilizer,
-            norm=norm,
-            preactivation=preactivation,
-            fno_skip=fno_skip,
-            channel_mlp_skip=channel_mlp_skip,
-            complex_data=complex_data,
-            max_n_modes=max_n_modes,
-            fno_block_precision=fno_block_precision,
-            rank=rank,
-            fixed_rank_modes=fixed_rank_modes,
-            implementation=implementation,
-            separable=separable,
-            factorization=factorization,
-            decomposition_kwargs=decomposition_kwargs,
-            conv_module=conv_module,
-            n_layers=n_layers,
-        )
+        if conv_module == SpectralConv:
+            self.fno_blocks = FNOBlocks(
+                in_channels=hidden_channels,
+                out_channels=hidden_channels,
+                n_modes=self.n_modes,
+                resolution_scaling_factor=resolution_scaling_factor,
+                use_channel_mlp=use_channel_mlp,
+                channel_mlp_dropout=channel_mlp_dropout,
+                channel_mlp_expansion=channel_mlp_expansion,
+                non_linearity=non_linearity,
+                stabilizer=stabilizer,
+                norm=norm,
+                preactivation=preactivation,
+                fno_skip=fno_skip,
+                channel_mlp_skip=channel_mlp_skip,
+                complex_data=complex_data,
+                max_n_modes=max_n_modes,
+                fno_block_precision=fno_block_precision,
+                rank=rank,
+                fixed_rank_modes=fixed_rank_modes,
+                implementation=implementation,
+                separable=separable,
+                factorization=factorization,
+                decomposition_kwargs=decomposition_kwargs,
+                conv_module=conv_module,
+                n_layers=n_layers,
+            )
+        else:
+             self.fno_blocks = FNOBlocks(
+                in_channels=hidden_channels,
+                out_channels=hidden_channels,
+                n_modes=self.n_modes,
+                resolution_scaling_factor=resolution_scaling_factor,
+                use_channel_mlp=use_channel_mlp,
+                channel_mlp_dropout=channel_mlp_dropout,
+                channel_mlp_expansion=channel_mlp_expansion,
+                non_linearity=non_linearity,
+                stabilizer=stabilizer,
+                norm=norm,
+                preactivation=preactivation,
+                fno_skip=fno_skip,
+                channel_mlp_skip=channel_mlp_skip,
+                complex_data=complex_data,
+                max_n_modes=max_n_modes,
+                fno_block_precision=fno_block_precision,
+                rank=rank,
+                fixed_rank_modes=fixed_rank_modes,
+                implementation=implementation,
+                separable=separable,
+                factorization=factorization,
+                decomposition_kwargs=decomposition_kwargs,
+                conv_module=conv_module,
+                n_layers=n_layers,
+            )
 
         if not self._disable_lifting_and_projection:
             ## Lifting layer
@@ -341,12 +371,15 @@ class FNO(BaseModel, name="FNO"):
             if self.complex_data:
                 self.projection = ComplexValued(self.projection)
 
+    def addSkips(self, skips: Union[List[SkipLike], Dict[int, SkipLike]]):
+        self.fno_blocks.addSkips(skips)
+
     def get_run_function(self, block_idx):
         def get_block(*inputs):
-            return self.fno_blocks(inputs[0], block_idx, output_shape=inputs[1])
+            return self.fno_blocks(inputs[0], inputs[1], block_idx, output_shape=inputs[2])
         return get_block
 
-    def forward(self, x, output_shape=None, **kwargs):
+    def forward(self, x, skips: Dict[int, torch.Tensor], output_shape=None, **kwargs):
         """FNO's forward pass
 
         1. Applies optional positional encoding
@@ -401,9 +434,9 @@ class FNO(BaseModel, name="FNO"):
         # print(f'FNO BLOCK INPUT: {x.shape}')
         for layer_idx in range(self.n_layers):
             if self._checkpointing:
-                x = checkpoint(self.get_run_function(layer_idx), x, output_shape[layer_idx])
+                x, skips = checkpoint(self.get_run_function(layer_idx), x, skips, output_shape[layer_idx])
             else:
-                x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx])
+                x, skips = self.fno_blocks(x, layer_idx, skips, output_shape=output_shape[layer_idx])
 
         if not self._disable_lifting_and_projection:
             if self.domain_padding is not None:
