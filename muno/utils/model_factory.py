@@ -12,9 +12,11 @@ from typing import Union, List
 import torch
 
 from neuralop.layers.channel_mlp import ChannelMLP
+from neuralop.layers.spectral_convolution import SpectralConv
 from neuralop.models import UNO, FNO
 
 from muno.utils.training_utils import validateOperator
+
 from muno.layers.channel_wise_conv import FactorizedDimensionSpectralConv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]

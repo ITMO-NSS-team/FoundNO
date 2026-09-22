@@ -301,8 +301,14 @@ class SpectralConv(BaseSpectralConv):
         decomposition_kwargs: Optional[dict] = None,
         init_std="auto",
         fft_norm="forward",
-        device=None,
+        device=None, *args, **kwargs
     ):
+        if len(args) != 0 or len(kwargs) != 0:
+            print('Unsupported arguments of SpectralConv: ', end = '')
+            for key in kwargs.keys():
+                print(key, end = ' ')
+            print(f' with {len(args)} args.')
+
         super().__init__(device=device)
 
         self.in_channels = in_channels

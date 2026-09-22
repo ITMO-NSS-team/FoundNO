@@ -161,9 +161,8 @@ class Muno(nn.Module):
                 f'Tensors must represent single channels of the input, instead got {tensor_slice.shape[1]} chan. at once.'
 
             if all([torch.unique(tensor[traj_idx:traj_idx+1, 0:1, ...]).ndim == 1 for traj_idx in range(tensor_slice.shape[0])]):
-                tensor_slice = torch.unique(tensor_slice[..., 0:1, ...]).unsqueeze(axis)
+                tensor_slice = torch.unique(tensor_slice[:, 0:1, ...]).unsqueeze(axis)
             return tensor_slice
-
 
         with torch.no_grad(): # torch.select(to_slice, axis, key).unsqueeze(axis)
             skip_args = make_tensordict({str(key): prepareSkipTensor(to_slice, axis, key) for key in cutout_idxs}, 

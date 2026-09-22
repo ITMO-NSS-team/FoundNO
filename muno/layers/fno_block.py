@@ -5,6 +5,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import warnings
+import inspect
 
 from neuralop.layers.channel_mlp import ChannelMLP
 from neuralop.layers.complex import CGELU, ctanh, ComplexValued
@@ -13,6 +14,7 @@ from neuralop.layers.skip_connections import skip_connection
 from neuralop.layers.spectral_convolution import SpectralConv
 from neuralop.utils import validate_scaling_factor
 
+from muno.layers.channel_wise_conv import FactorizedDimensionSpectralConv
 from muno.layers.skips import SkipLike
 from muno.utils.data_utils import Heatmap
 
@@ -20,6 +22,24 @@ INITIAL_ACTIVATION_DISABLED: bool = True
 
 Number = Union[int, float]
 
+def matchConvModule(conv_module, arguments: dict):
+    match conv_module:
+        case SpectralConv:
+            assert arguments["enforce_"]
+            return arguments
+        case FactorizedDimensionSpectralConv:
+            if isinstance(arguments["n_modes"], (list, tuple)):
+                arguments["n_modes"] = {'t': arguments["n_modes"][0], 'x': arguments["n_modes"][1]}
+            
+            assert arguments["complex_data"] == False, \
+                'Complex data is not yet implemented in FactorizedDimensionSpectralConv'
+            assert arguments["max_n_modes"] is None, \
+                'Argument max_n_modes is unsupported in matchConvModule'
+            # assert arguments["bias"] == True,
+            # assert arguments["separable"] == False,
+        case default:
+            raise TypeError("Incorrect type of convolutions is employed...")
+    return arguments
 
 class FNOBlocks(nn.Module):
     """FNOBlocks implements a sequence of Fourier layers.
@@ -135,7 +155,7 @@ class FNOBlocks(nn.Module):
         implementation="factorized",
         decomposition_kwargs=dict(),
         enforce_hermitian_symmetry=True,
-        extra_feature_skips: Optional[Union[List[Any], Any]] = None,
+        # extra_feature_skips: Optional[Union[List[Any], Any]] = None,
         *args, **kwargs
     ):
         super().__init__()
@@ -233,15 +253,15 @@ class FNOBlocks(nn.Module):
         # if self.complex_data and self.fno_skips is not None:
         #     self.fno_skips = nn.ModuleList([ComplexValued(x) for x in self.fno_skips])
 
-        if extra_feature_skips is not None:
-            if not isinstance(extra_feature_skips, list):
-                extra_feature_skips = [extra_feature_skips,] * n_layers
-            else:
-                assert len(extra_feature_skips) == n_layers, \
-                    f'Mismatch of skips {len(extra_feature_skips)} and layers {n_layers}.'
-            self.feature_skips = extra_feature_skips
-        else:
-            self.feature_skips = None
+        # if extra_feature_skips is not None:
+        #     if not isinstance(extra_feature_skips, list):
+        #         extra_feature_skips = [extra_feature_skips,] * n_layers
+        #     else:
+        #         assert len(extra_feature_skips) == n_layers, \
+        #             f'Mismatch of skips {len(extra_feature_skips)} and layers {n_layers}.'
+        #     self.feature_skips = extra_feature_skips
+        # else:
+        #     self.feature_skips = None
 
         if self.use_channel_mlp:
             self.channel_mlp = nn.ModuleList(
@@ -357,23 +377,22 @@ class FNOBlocks(nn.Module):
     #     else:
     #         return self.forward_with_postactivation(x, None, index, output_shape)
 
-    def forward(self, x: List[torch.Tensor], index: int = 0, skips: Dict[int, torch.Tensor] = None, output_shape: Tuple[int] = None) -> torch.Tensor:
+    def forward(self,
+                x: List[torch.Tensor],
+                index: int = 0,
+                skips: Dict[int, torch.Tensor] = None,
+                skip_handlers: Dict[int, SkipLike] = None, 
+                output_shape: Tuple[int] = None) -> torch.Tensor:
         if skips is None:
             skips = {}
+
+        if skip_handlers is None:
+            skip_handlers = {}
 
         assert all([isinstance(arg, torch.Tensor) for arg in x]), \
             f'all arguments in x (typed as list) must be torch.Tensors, instead got {[type(arg) for arg in x]}.'
         assert len(x) == 2, \
             'List of inputs accomodates only for 2 elements: full spatio-temporal dim. 0-th and vector of params as 1-st.'
-
-        # if self.feature_skips is None:
-        #     external_skips = None
-        # else:
-        #     external_skips = (self.feature_skips[index][0](x[1]), self.feature_skips[index][1](x[1]))
-
-            # return x[0]
-        # else:
-            # return self.feature_skips[index][0](x[1]) * x[0] + self.feature_skips[index][1](x[1])
 
         if self.preactivation:
             x = self.forward_with_preactivation(x, index, output_shape) # , external_skips
@@ -407,7 +426,6 @@ class FNOBlocks(nn.Module):
             x_fno = self.norm[self.n_norms * index](x_fno)
 
         x = x_fno + x_skip_fno if self.fno_skips is not None else x_fno
-        # x = x + external_skips_under_activ if external_skips_under_activ is not None else x
 
         if index < (self.n_layers - 1):
             x = self.non_linearity(x)
@@ -426,33 +444,32 @@ class FNOBlocks(nn.Module):
 
         return x
 
-    def proceedWithSkips(self, x: torch.Tensor, layer_idx: int, skips: Dict[int, torch.Tensor], position: Literal['i', 'a'], output_shape = None):
-        for skip_hash, skip in self._skip_handlers.items():
+    def proceedWithSkips(self, x: torch.Tensor,
+                         layer_idx: int,
+                         skips: Dict[int, torch.Tensor],
+                         skip_handlers: Dict[int, SkipLike],
+                         position: Literal['i', 'a'],
+                         output_shape = None) -> torch.Tensor:
+        for skip_hash, skip in skip_handlers.items():
             if skip_hash[2] == layer_idx and skip_hash[3] == position:
                 x = skip(x, skips[skip_hash[1]], output_shape)
 
         return x
 
-    def forward_with_preactivation(self, x, skips: Dict[int, torch.Tensor] = None, index = 0, output_shape = None): # external_skips_under_activ: torch.Tensor = None, 
+    def forward_with_preactivation(self, x, skips: Dict[int, torch.Tensor], 
+                                   skip_handlers: Dict[int, SkipLike],
+                                   index = 0, output_shape = None): # external_skips_under_activ: torch.Tensor = None, 
         # Apply non-linear activation (and norm)
         # before this block's convolution/forward pass:
         # TODO: Shall we add film skip here?
         
-        x = self.proceedWithSkips(x, index, skips, 'i')
+        x = self.proceedWithSkips(x, index, skips, skip_handlers, 'i')
 
         if not INITIAL_ACTIVATION_DISABLED:
             x = self.non_linearity(x)
 
         if self.norm is not None:
             x = self.norm[self.n_norms * index](x)
-
-        # if self.fno_skips is not None:
-        #     x_skip_fno = self.fno_skips[index](x)
-        #     x_skip_fno = self.convs[index].transform(x_skip_fno, output_shape=output_shape)
-
-        # if self.use_channel_mlp and self.channel_mlp_skips is not None:
-        #     x_skip_channel_mlp = self.channel_mlp_skips[index](x)
-        #     x_skip_channel_mlp = self.convs[index].transform(x_skip_channel_mlp, output_shape=output_shape)
 
         if self.stabilizer == "tanh":
             if self.complex_data:
@@ -462,10 +479,7 @@ class FNOBlocks(nn.Module):
 
         x = self.convs[index](x, output_shape=output_shape)
 
-        x = self.proceedWithSkips(x, index, skips, 'a')
-
-        # x = x_fno + x_skip_fno if self.fno_skips is not None else x_fno
-        # x = x + external_skips_under_activ if external_skips_under_activ is not None else x
+        x = self.proceedWithSkips(x, index, skips, skip_handlers, 'a', output_shape)
 
         if index < (self.n_layers - 1):
             x = self.non_linearity(x)
@@ -474,9 +488,6 @@ class FNOBlocks(nn.Module):
             x = self.norm[self.n_norms * index + 1](x)
 
         if self.use_channel_mlp:
-            # if self.channel_mlp_skips is not None:
-            #     x = self.channel_mlp[index](x) + x_skip_channel_mlp
-            # else:
             x = self.channel_mlp[index](x)
 
         return x
