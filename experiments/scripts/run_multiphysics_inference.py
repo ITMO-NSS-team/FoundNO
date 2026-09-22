@@ -138,6 +138,53 @@ def compute_batch_metrics(pred: dict, band: dict, target: dict, metrics_config, 
 
     return results
 
+
+def compute_batch_metrics_per_time(pred: dict, band: dict, target: dict, metrics_config, task_name, k=None):
+    results = {}
+    metric_names = metrics_config.get("names", [])
+
+    physical_configs = filter_physical_metric_configs(
+        metrics_config.get("physical", []),
+        task_name,
+    )
+    uq_configs = filter_physical_metric_configs(
+        metrics_config.get("uncertainty", []),
+        task_name,
+    )
+
+    for key in pred.keys():
+        pred_t, band_t, target_t = pred[key], band[key], target[key]
+        n_time = pred_t.shape[2] if pred_t.ndim >= 4 else 1
+
+        per_time = {}
+        for t in range(n_time):
+            if n_time > 1:
+                p, b, y = pred_t[:, :, t], band_t[:, :, t], target_t[:, :, t]
+            else:
+                p, b, y = pred_t, band_t, target_t
+
+            entry = {}
+            if metric_names:
+                entry.update(compute_metrics(p, y, metric_names=metric_names))
+            if physical_configs:
+                entry.update(compute_physical_metrics(p, y, metric_configs=physical_configs))
+            if uq_configs:
+                k_key = k.get(key, 1.0) if isinstance(k, dict) else k
+                k_cfgs = [{**config, "k": k_key} for config in uq_configs] if k is not None else uq_configs
+                entry.update(compute_uq_metrics(p, b, y, metric_configs=k_cfgs))
+            per_time[t] = entry
+
+        entry = {}
+        for name in per_time[0]:
+            values = torch.tensor([per_time[t][name] for t in range(n_time)], dtype=torch.float32)
+            entry[name] = values
+        if k is not None:
+            k_key = k.get(key, 1.0) if isinstance(k, dict) else k
+            entry["k"] = float(k_key)
+        results[key] = entry
+
+    return results
+
     
 def set_mc_lifting(model: 'Muno', on: bool, adapter_idx: int = None, last_layer_drop: bool = False, p: float = 0.1):
     """Turn structure-aware sampling on/off for one adapter, or all if adapter_idx is None."""
@@ -279,6 +326,14 @@ def evaluate_loader(
                 task_name=task_name,
                 k=k,
             )
+            # batch_metrics = compute_batch_metrics_per_time(
+            #     pred,
+            #     band,
+            #     target,
+            #     metrics_config=metrics_config,
+            #     task_name=task_name,
+            #     k=k,
+            # )
             
             for task_name, task_metrics in batch_metrics.items():
                 if task_name not in metric_sums:

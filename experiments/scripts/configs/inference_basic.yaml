@@ -73,7 +73,7 @@ model:
   type: adapted_fno_no_mamba
   n_dim: 3
   hidden_channels: 60
-  lifting_layers: 2
+  lifting_layers: 1
   projection_layers: 2
   core_layers: 4
   n_modes: [8, 30, 30]
@@ -81,14 +81,14 @@ model:
 
 inference:
   mc_drop_out:
-    method: bernoulli #gaussian
+    method: bernoulli #gaussian, bernoulli
     T: 20
     on_dropout: true
     lift_last_layer_drop: false
-    p: 0.0
+    p: 0.1
     target_coverage: 0.9
   experiment:
-    T: [20, 100, 20, 20, 20, 20, 20]
+    T: [1, 100, 20, 20, 20, 20, 20]
     p: [0.0, 0.01, 0.1, 0.3, 0.5, 0.7, 0.9]
 
 
