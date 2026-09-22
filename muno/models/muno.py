@@ -1,4 +1,4 @@
-from typing import Tuple, List, Union, Literal, Dict
+from typing import Tuple, List, Union, Literal, Dict, Any
 from types import BuiltinFunctionType
 
 import numpy as np
@@ -13,10 +13,12 @@ from functools import singledispatchmethod
 from collections.abc import Callable, Iterator, Mapping
 
 import torch
+from tensordict import TensorDict, make_tensordict
 import torch.nn as nn
 from torch.nn.parameter import Parameter
 
 from muno.layers.skips import SkipLike
+from muno.data.benchmarks.multiphysics_loaders import getSkipsChannel
         
         # sig = inspect.signature(combinator)
         # assert 
@@ -61,7 +63,7 @@ class Muno(nn.Module):
                 self._projections = torch.nn.ModuleList(projections)
                 self._adapters_set = True
 
-                self._skip_handlers = {}
+                self._skip_handlers: List[Dict[int, SkipLike]] = []
             else:
                 assert projections is None, 'If liftings arg is None, projections arg has to be None as well.'
                 self._adapters_set = False
@@ -81,9 +83,19 @@ class Muno(nn.Module):
     #     self._horizontal_skips_map[]
     # TODO: implement correct mapping method
 
-    def setAdapter(self, lifting, projection):
+    def setAdapter(self, lifting: torch.nn.Module, projection: torch.nn.Module, skip: Dict[int, SkipLike] = None):
         self._liftings.append(lifting)
         self._projections.append(projection)
+        
+        if skip is None:
+            assert isinstance(skip, dict), \
+                'Skip must be passed as a DICT of format int: SkipLike-object.'
+            assert all([isinstance(key, int) for key in skip.keys()]), \
+                'Skip must be passed as a dict of format INT: SkipLike-object.'
+            assert all([isinstance(value, SkipLike) for value in skip.values()]), \
+                'Skip must be passed as a dict of format int: SKIPLIKE-object.'
+            
+            self._skip_handlers.append(skip)
 
     def to(self, device):
         if not self._single_model:
@@ -115,10 +127,6 @@ class Muno(nn.Module):
 
         yield from ()
 
-    def addSkips(self, skips: List[SkipLike]):
-        for skip in skips:
-            self._skip_handlers[hash(skip)] = skip
-
     def setMode(self, mode: Literal['pretrain', 'finetune', 'eval'] = 'pretrain') -> None:
         assert mode in {'pretrain', 'finetune', 'eval'}, \
             f"Got incorrect mode {mode}, expected 'pretrain', 'finetune', or 'eval'."
@@ -136,17 +144,48 @@ class Muno(nn.Module):
                 for param in self._projections[adapter_idx].parameters():
                     param.requires_grad = False
 
+    @staticmethod
+    def splitChannels(indexes: Any, to_slice: torch.Tensor, axis: int = 1) -> Tuple[torch.Tensor, TensorDict]:
+        try:
+            cutout_idxs = set(indexes)
+        except:
+            warnings.warn(f"Got incorrect indexes in splitChannels, defaulting to spliting nothing from the argument")
+            return to_slice, TensorDict({})
+        
+        remaining_idxs = torch.tensor([idx for idx in list(range(to_slice.shape[axis])) 
+                                       if idx not in cutout_idxs]).to(torch.int32)
+
+        def prepareSkipTensor(tensor: torch.Tensor, axis: int, key: int):
+            tensor_slice = torch.select(tensor, axis, key).unsqueeze(axis)
+            assert tensor_slice.shape[1] == 1, \
+                f'Tensors must represent single channels of the input, instead got {tensor_slice.shape[1]} chan. at once.'
+
+            if all([torch.unique(tensor[traj_idx:traj_idx+1, 0:1, ...]).ndim == 1 for traj_idx in range(tensor_slice.shape[0])]):
+                tensor_slice = torch.unique(tensor_slice[..., 0:1, ...]).unsqueeze(axis)
+            return tensor_slice
+
+
+        with torch.no_grad(): # torch.select(to_slice, axis, key).unsqueeze(axis)
+            skip_args = make_tensordict({str(key): prepareSkipTensor(to_slice, axis, key) for key in cutout_idxs}, 
+                                        batch_size=[to_slice.shape[0],],
+                                        device = to_slice.device)
+            to_slice = to_slice.index_select(axis, remaining_idxs)
+        
+        return to_slice, skip_args
+
     @singledispatchmethod
     def forward(self, x, adapter_idx: int = 0, output_shape = None, **kwargs):
         raise NotImplementedError('Default generic singledispatch method is not available.')
 
     @forward.register
     def _(self, x: torch.Tensor, adapter_idx: int = 0, output_shape = None, **kwargs) -> torch.Tensor:
-        if any([-2 == skip_hash[1] for skip_hash in self._skip_handlers]):
-            skip_tensors = {-2: torch.clone(x),}
+        if any([-2 == skip_hash[1] for skip_hash in self._skip_handlers[adapter_idx]]):
+            skips_channels = getSkipsChannel(self._skip_handlers[adapter_idx], lambda x: x.origin == -2)
+
+            x, skip_from_init = self.splitChannels(skips_channels, x, axis = 1)
+            skip_tensors = {-2: skip_from_init,}
         else:
             skip_tensors = {}
-
 
         if output_shape is not None:
             raise NotImplementedError('Unexpected behavior, output shape has to be None')
@@ -159,7 +198,7 @@ class Muno(nn.Module):
         if any([-1 == skip_hash[1] for skip_hash in self._skip_handlers]):
             skip_tensors[-1] = torch.clone(x)
 
-        x = self._core(x, skip_tensors)
+        x = self._core(x, skip_tensors, self._skip_handlers[adapter_idx])
 
         if not self._single_model:
             x = self._projections[adapter_idx](x) # add **kwargs processor
@@ -167,7 +206,8 @@ class Muno(nn.Module):
         return x
 
     @forward.register
-    def _(self, x: tuple, adapter_idx: int = 0, output_shape = None, **kwargs) -> torch.Tensor:    # Tuple[torch.Tensor]
+    def _(self, x: tuple, adapter_idx: int = 0, output_shape = None, **kwargs) -> torch.Tensor:
+        # Argument x is expected to have forms of Tuple[torch.Tensor]
         if output_shape is not None:
             raise NotImplementedError('Unexpected behavior, output shape has to be None')
         if self._empty or not self._adapters_set:
@@ -184,8 +224,11 @@ class Muno(nn.Module):
         return x[0]
 
     @forward.register
-    def _(self, x: dict, adapter_idx: int = 0, output_shape = None, **kwargs) -> Dict[int, torch.Tensor]: # x: Dict[int, torch.Tensor]
+    def _(self, x: dict, adapter_idx: int = None, output_shape = None, **kwargs) -> Dict[int, torch.Tensor]:
+        # Argument x is expected to have forms of Dict[int, torch.Tensor]
         assert len(x) == len(self._liftings), 'Mismatching adapters and problems in forward inputs.'
+        if adapter_idx is not None:
+            warnings.warn(f"Calling dict-mapped forward desipte having explicitly passed adapter index: {adapter_idx}.")
 
         return {adapter_idx: self.forward(inp_tensor, adapter_idx = adapter_idx) for adapter_idx, inp_tensor in x.items()}
 

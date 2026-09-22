@@ -26,16 +26,25 @@ ALL_IDS = list(np.arange(SKIP_MAX))
 USED_IDS = []
 
 class SkipLike(torch.nn.Module):
-    def __init__(self, skip_from: int, skip_to: Tuple[int, int], mode: Literal['i', 'a']):
+    def __init__(self, skip_from: int, skip_to: int, mode: Literal['i', 'a'], channels: Tuple[int]): # Tuple[int, int]
         super().__init__()
 
         assert mode in ['i', 'a', 'o'], f'Incompatible mode: expected "i", or "a", instead got {mode}!'
         self._from = skip_from  # -1 denotes, that inputs are takes from the original input data, 0 - from liftings, etc.
         self._to   = skip_to    # (layer, skip_loc)
         self._mode = mode
+        self._channels = channels
 
         cur_availible = np.setdiff1d(ALL_IDS, USED_IDS)
         self._ID      = np.random.choice(cur_availible)
+
+    @property
+    def origin(self) -> int:
+        return self._from
+
+    @property
+    def target(self) -> Tuple[int, str]:
+        return (self._to, self._mode)
 
     def __hash__(self):
         return (self._ID, self._from, self._to) # super().__hash__()
@@ -44,7 +53,12 @@ def generateDefaultFiLMMapping(scalars_num: int,
                                output_channels: int, 
                                num_layers: int = 1,
                                layers_widths: List[int] = [10,],
-                               activation = torch.nn.GELU,):
+                               activation = torch.nn.GELU,
+                               channels: List[int] = None):
+    if channels is None:
+        raise RuntimeError('FiLMs must be associated with specific channels, that will be omitted from data!')
+        # channels = []
+
     assert isinstance(layers_widths, list), 'layers_widths must be passed as a list'
     assert len(layers_widths) == num_layers, 'length of layers_widths must be equal to the num_layers value'
 
@@ -63,8 +77,8 @@ def generateDefaultFiLMMapping(scalars_num: int,
 
 class FiLM(SkipLike):
     def __init__(self, mappings: Tuple[torch.nn.Module], skip_from: int,
-                 skip_to: Tuple[int, int], mode: Literal['i', 'a']):
-        super().__init__(skip_from, skip_to, mode)
+                 skip_to: Tuple[int, int], mode: Literal['i', 'a'], channels: Tuple[int]):
+        super().__init__(skip_from, skip_to, mode, channels)
 
         assert len(mappings) == 2, 'FiLM has to contain 2 modules: map., that produce weights and biases.'
         # TODO: implement assertions to check correctness of the mappings
@@ -96,7 +110,7 @@ class StandardSkip(SkipLike):
     def __init__(self, mapping: torch.nn.Module, skip_from: int, skip_to: Tuple[int, int], mode: Literal['i', 'a'],
                  channels: Tuple[int], combinator: Callable = torch.add, combinator_args: tuple = None,
                  combinator_kwargs: dict = None) -> None:
-        super().__init__(skip_from, skip_to, mode)
+        super().__init__(skip_from, skip_to, mode, channels)
         # TODO: add signature inspection for combinator function and a mapping  
 
         if combinator_args is None:
@@ -113,7 +127,6 @@ class StandardSkip(SkipLike):
 
         self._mapping = mapping
         self._combinator = combinator
-        self._channels = channels
 
     def forward(self, F: torch.Tensor, x: torch.Tensor, output_shape: Tuple[int] = None) -> torch.Tensor:
         x = self._mapping(x)

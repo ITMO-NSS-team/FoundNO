@@ -1,6 +1,11 @@
 from functools import singledispatch
+import warnings
+from typing import Dict, Callable, List, Tuple, Set
+
+import torch
 from torch.utils.data import Dataset, DataLoader
 
+from muno.layers.skips import SkipLike
 from muno.data.benchmarks.pipeline import (
     resolve_split,
     resolve_trajectory_indices,
@@ -218,22 +223,38 @@ def get_loader_channels(loader):
     batch = next(iter(loader))
     return batch["x"].shape[1], batch["y"].shape[1]
 
+def getSkipsChannel(skips: Dict[int, SkipLike], condition: Callable[[SkipLike,], bool] = None) -> Set[int]:
+    if condition is None:
+        condition = lambda x: True # lambda x: x.origin == -2
+
+    skipped_channels = set()
+    for skip in skips.values():
+        if condition(skip):
+            skipped_channels = skipped_channels | set(skip.channels)
+    
+    return skipped_channels
+
+def filterChannelsBySkips(batch: torch.Tensor, skips: Dict[int, SkipLike]) -> int:
+    dim = batch.shape[1]
+    skipped_channels = getSkipsChannel(skips, lambda x: x.origin == -2)
+
+    return dim - len(skipped_channels)
 
 @singledispatch
 def get_loaders_channels(loaders):
     raise NotImplementedError('Calling get_loaders_channels of a default unimplemented type.')
 
 @get_loaders_channels.register
-def _(loaders: list):
+def _(loaders: list, skips: List[Dict[int, SkipLike]]) -> List[List[Tuple[int, int]]]:
+    warnings.warn("Calling legacy implementation of get_loaders_channels, unexpected behavior.")
+
     assert all([isinstance(loader, DataLoader) for loader in loaders]), 'Loaders have to be a list of DataLoader objects.'
-    return [get_loader_channels(loader) for loader in loaders]
+    return [get_loader_channels(loader, skips[idx]) for idx, loader in enumerate(loaders)]
 
 @get_loaders_channels.register
-def _(loaders: DataLoader):
+def _(loaders: DataLoader, skips: Dict[int, SkipLike]) -> List[Tuple[int, int]]:
     batch = next(iter(loaders))
     assert isinstance(batch, dict), \
         'loader has to return a dict with keys - multiphysics problems idx, values - dicts {"x": torch.Tensor, "y": ...}.'
 
-    # print('batch is ', batch)
-    # print('Shapes are: ', [(subbatch['eq_idx'], subbatch["x"].shape, subbatch["y"].shape) for subbatch in batch.values()])
-    return [(subbatch["x"].shape[1], subbatch["y"].shape[1]) for subbatch in batch.values()]
+    return [(filterChannelsBySkips(subbatch["x"], skips), subbatch["y"].shape[1]) for subbatch in batch.values()]
