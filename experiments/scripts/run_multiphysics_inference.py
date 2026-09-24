@@ -35,7 +35,7 @@ from muno.data.benchmarks.multiphysics_loaders import (
 
 from muno.utils.metrics import compute_metrics
 from muno.utils.metrics_physical import compute_physical_metrics
-from muno.utils.metrics_uq import compute_uq_metrics
+from muno.uncertainty.metrics_uq import compute_uq_metrics
 from muno.data.benchmarks.evaluation import filter_physical_metric_configs
 
 from muno.data.benchmarks.datasets import MultiPhysicsDataset

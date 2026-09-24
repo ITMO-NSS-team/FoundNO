@@ -37,10 +37,10 @@ tasks:
       physics_name: 2d_cfd
 
     split:
-      type: ratios
-      train: 0.8
-      val: 0.1
-      test: 0.1
+      type: explicit
+      train: [0, 10]
+      val: [11, 21]
+      test: [22, 32]
 
     loaders:
       train:
