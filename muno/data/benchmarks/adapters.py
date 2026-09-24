@@ -1,6 +1,5 @@
 import torch
 
-
 SPATIAL_AXIS_NAMES = ("X", "Y", "Z", "H", "W")
 
 
@@ -64,17 +63,68 @@ def _ensure_2d(x, y, ensure_2d):
     return x, y
 
 
+def _validate_extra_channel_config(extra_config):
+    if "name" not in extra_config:
+        raise ValueError("extra_channels entry must define a name")
+
+
+def _constant_channel_like(tensor, value):
+    return tensor.new_full((1, *tensor.shape[1:]), float(value))
+
+
+# def _coordinate_channel_like(tensor, axis, has_time_axis=True, normalize=True, value_range=None):
+
+
+def _coordinate_channel_like(tensor, axis, has_time_axis=True,
+                             normalize=True, value_range=None):
+    axis = axis.lower()
+    base_shape = tensor.shape[1:]  # [T, X, Y, Z] or [X, Y, Z]
+
+    axis_to_dim = {
+        "t": 0,
+        "x": 1 if has_time_axis else 0,
+        "y": 2 if has_time_axis else 1,
+        "z": 3 if has_time_axis else 2,
+    }
+
+    if axis not in axis_to_dim:
+        raise ValueError(f"Unknown coordinate axis: {axis}")
+
+    dim = axis_to_dim[axis]
+    if dim >= len(base_shape):
+        raise ValueError(
+            f"Cannot create coordinate axis '{axis}' for tensor shape {tuple(tensor.shape)}"
+        )
+
+    size = base_shape[dim]
+    if value_range is not None:
+        start, end = value_range
+        values = torch.linspace(start, end, size, dtype=tensor.dtype, device=tensor.device)
+    elif normalize:
+        values = torch.linspace(0.0, 1.0, size, dtype=tensor.dtype, device=tensor.device)
+    else:
+        raise ValueError(
+            f"Coordinate axis '{axis}' requires either normalize=True "
+            f"or ranges['{axis}']=[start, end]."
+        )
+
+    view_shape = [1] * (1 + len(base_shape))
+    view_shape[1 + dim] = size
+
+    return values.reshape(view_shape).expand(1, *base_shape)
+
+
 class IndexAdapter:
     def __init__(
-        self,
-        input_indices,
-        output_indices,
-        variable_name=None,
-        data_order="CHW",
-        benchmark_name=None,
-        physics_name=None,
-        metadata=None,
-        ensure_2d=False,
+            self,
+            input_indices,
+            output_indices,
+            variable_name=None,
+            data_order="CHW",
+            benchmark_name=None,
+            physics_name=None,
+            metadata=None,
+            ensure_2d=False,
     ):
         self.input_indices = input_indices
         self.output_indices = output_indices
@@ -104,23 +154,24 @@ class IndexAdapter:
 
 class TemporalAdapter:
     def __init__(
-        self,
-        variable_name=None,
-        variable_names=None,
-        data_order="TCHW",
-        temporal_mode="window",
-        input_time_indices=None,
-        output_time_indices=None,
-        window_start_indices=None,
-        input_time_index=0,
-        input_channel_indices=None,
-        output_channel_indices=None,
-        static_inputs=None,
-        benchmark_name=None,
-        physics_name=None,
-        metadata=None,
-        ensure_2d=False,
-        flatten_time_to_channels=True,
+            self,
+            variable_name=None,
+            variable_names=None,
+            data_order="TCHW",
+            temporal_mode="window",
+            input_time_indices=None,
+            output_time_indices=None,
+            window_start_indices=None,
+            input_time_index=0,
+            input_channel_indices=None,
+            output_channel_indices=None,
+            static_inputs=None,
+            benchmark_name=None,
+            physics_name=None,
+            metadata=None,
+            ensure_2d=False,
+            flatten_time_to_channels=True,
+            extra_channels=None,
     ):
         self.variable_name = variable_name
         self.variable_names = variable_names
@@ -140,6 +191,7 @@ class TemporalAdapter:
         self.metadata = {} if metadata is None else metadata
         self.ensure_2d = ensure_2d
         self.flatten_time_to_channels = flatten_time_to_channels
+        self.extra_channels = [] if extra_channels is None else extra_channels
 
     def canonize(self, sample, window_start=None):
         data = self._read_temporal_data(sample)
@@ -161,14 +213,27 @@ class TemporalAdapter:
         for static_config in self.static_inputs:
             x, y = self._append_static_input(sample, x, y, static_config)
 
+        for extra_config in self.extra_channels:
+            x, y = self._append_extra_channel(sample, x, y, extra_config)
+
         x, y = _ensure_2d(x, y, self.ensure_2d)
+
+        metadata = dict(self.metadata)
+
+        if isinstance(sample, dict) and isinstance(sample.get("metadata"), dict):
+            metadata.update(sample["metadata"])
+
+        metadata["extra_channel_names"] = [
+            extra_config["name"]
+            for extra_config in self.extra_channels
+        ]
 
         return {
             "x": x.float(),
             "y": y.float(),
             "benchmark_name": self.benchmark_name,
             "physics_name": self.physics_name,
-            "metadata": self.metadata,
+            "metadata": metadata,
         }
 
     def _read_temporal_data(self, sample):
@@ -255,18 +320,79 @@ class TemporalAdapter:
 
         return x, y
 
+    def _make_extra_channels(self, tensor, sample, extra_config):
+        _validate_extra_channel_config(extra_config)
+
+        channel_type = extra_config["type"]
+
+        if channel_type == "constant":
+            source = extra_config.get("source", "custom")
+
+            if source == "custom":
+                value = extra_config["value"]
+            elif source == "metadata":
+                if not isinstance(sample, dict) or "metadata" not in sample:
+                    raise ValueError(
+                        f"Cannot create metadata extra channel '{extra_config['name']}': "
+                        "sample has no metadata"
+                    )
+
+                metadata = sample["metadata"]
+                key = extra_config["key"]
+
+                if key not in metadata:
+                    raise KeyError(
+                        f"Metadata key '{key}' not found for extra channel "
+                        f"'{extra_config['name']}'. Available keys: {list(metadata.keys())}"
+                    )
+
+                value = metadata[key]
+            else:
+                raise ValueError(f"Unknown constant extra channel source: {source}")
+
+            return [_constant_channel_like(tensor, value)]
+        elif channel_type == "coordinates":
+            ranges = extra_config.get("ranges") or {}
+            return [
+                _coordinate_channel_like(
+                    tensor,
+                    axis=axis,
+                    has_time_axis=not self.flatten_time_to_channels,
+                    normalize=extra_config.get("normalize", True),
+                    value_range=ranges.get(axis, None),
+                )
+                for axis in extra_config["axes"]
+            ]
+        else:
+            raise ValueError(f"Unknown extra channel type: {channel_type}")
+
+    def _append_extra_channel(self, sample, x, y, extra_config):
+        target = extra_config.get("target", "x")
+
+        if target == "x":
+            x = torch.cat([x, *self._make_extra_channels(x, sample, extra_config)], dim=0)
+        elif target == "y":
+            y = torch.cat([y, *self._make_extra_channels(y, sample, extra_config)], dim=0)
+        elif target == "both":
+            x = torch.cat([x, *self._make_extra_channels(x, sample, extra_config)], dim=0)
+            y = torch.cat([y, *self._make_extra_channels(y, sample, extra_config)], dim=0)
+        else:
+            raise ValueError(f"Unknown extra channel target: {target}")
+
+        return x, y
+
 
 class InputOutputAdapter:
     def __init__(
-        self,
-        input_variable_name,
-        output_variable_name,
-        input_order="CHW",
-        output_order="CHW",
-        benchmark_name=None,
-        physics_name=None,
-        metadata=None,
-        ensure_2d=False,
+            self,
+            input_variable_name,
+            output_variable_name,
+            input_order="CHW",
+            output_order="CHW",
+            benchmark_name=None,
+            physics_name=None,
+            metadata=None,
+            ensure_2d=False,
     ):
         self.input_variable_name = input_variable_name
         self.output_variable_name = output_variable_name

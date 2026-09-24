@@ -1,6 +1,4 @@
 ﻿import torch
-import random
-import numpy as np
 
 from muno.data.benchmarks.sources import (
     NetCDFSource,
@@ -25,7 +23,8 @@ from muno.data.benchmarks.pipeline_utils import (
     validate_batch,
     resolve_index_split,
     resolve_split,
-    resolve_trajectory_indices
+    resolve_trajectory_indices,
+    get_split_seed
 )
 
 
@@ -309,6 +308,7 @@ def build_adapter(config):
             output_channel_indices=config.get("output_channel_indices"),
             static_inputs=config.get("static_inputs"),
             flatten_time_to_channels=config.get("flatten_time_to_channels", True),
+            extra_channels=config.get("extra_channels"),
             **common_kwargs,
         )
     if adapter_type == "input_output":
@@ -323,7 +323,7 @@ def build_adapter(config):
     raise ValueError(f"Unknown adapter {adapter_type}. Allowed adapters: {allowed_adapters}")
 
 
-def build_datasets(source, adapter, split):
+def build_datasets(source, adapter, split, seed=None, eq_idx=0):
     window_start_indices = getattr(adapter, "window_start_indices", None)
 
     if window_start_indices is None:
@@ -335,32 +335,39 @@ def build_datasets(source, adapter, split):
             "window_start_indices": window_start_indices,
         }
 
+    train_seed = get_split_seed(seed, eq_idx, "train")
+    val_seed = get_split_seed(seed, eq_idx, "val")
+    test_seed = get_split_seed(seed, eq_idx, "test")
+
     train_dataset = dataset_cls(
         source,
         adapter,
         start=split["train"][0],
         end=split["train"][1],
-        **dataset_kwargs,
+        seed=train_seed,
+        **dataset_kwargs
     )
     val_dataset = dataset_cls(
         source,
         adapter,
         start=split["val"][0],
         end=split["val"][1],
-        **dataset_kwargs,
+        seed=val_seed,
+        **dataset_kwargs
     )
     test_dataset = dataset_cls(
         source,
         adapter,
         start=split["test"][0],
         end=split["test"][1],
-        **dataset_kwargs,
+        seed=test_seed,
+        **dataset_kwargs
     )
 
     return train_dataset, val_dataset, test_dataset
 
 
-def build_indexed_datasets(source, adapter, split):
+def build_indexed_datasets(source, adapter, split, seed=None, eq_idx=0):
     window_start_indices = getattr(adapter, "window_start_indices", None)
 
     if window_start_indices is None:
@@ -372,22 +379,29 @@ def build_indexed_datasets(source, adapter, split):
             "window_start_indices": window_start_indices,
         }
 
+    train_seed = get_split_seed(seed, eq_idx, "train")
+    val_seed = get_split_seed(seed, eq_idx, "val")
+    test_seed = get_split_seed(seed, eq_idx, "test")
+
     train_dataset = dataset_cls(
         source,
         adapter,
         indices=split["train"],
+        seed=train_seed,
         **dataset_kwargs,
     )
     val_dataset = dataset_cls(
         source,
         adapter,
         indices=split["val"],
+        seed=val_seed,
         **dataset_kwargs,
     )
     test_dataset = dataset_cls(
         source,
         adapter,
         indices=split["test"],
+        seed=test_seed,
         **dataset_kwargs,
     )
 
@@ -415,21 +429,25 @@ def build_loader(dataset, loader_config, seed=None):
     )
 
 
-def build_loaders(train_dataset, val_dataset, test_dataset, config, seed=None):
+def build_loaders(train_dataset, val_dataset, test_dataset, config, seed=None, eq_idx=0):
+    train_seed = get_split_seed(seed, eq_idx, "train")
+    val_seed = get_split_seed(seed, eq_idx, "val")
+    test_seed = get_split_seed(seed, eq_idx, "test")
+
     train_loader = build_loader(
         train_dataset,
         config["train"],
-        seed=None if seed is None else int(seed) + 0,
+        seed=train_seed,
     )
     val_loader = build_loader(
         val_dataset,
         config["val"],
-        seed=None if seed is None else int(seed) + 1,
+        seed=val_seed,
     )
     test_loader = build_loader(
         test_dataset,
         config["test"],
-        seed=None if seed is None else int(seed) + 2,
+        seed=test_seed,
     )
 
     validate_batch(train_loader)

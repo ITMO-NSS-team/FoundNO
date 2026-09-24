@@ -35,11 +35,7 @@ def _selector_from_config(config):
 def _normalize_axis_selection(axis_selection):
     if axis_selection is None:
         return {}
-
-    return {
-        int(axis): _selector_from_config(config)
-        for axis, config in axis_selection.items()
-    }
+    return {int(axis): _selector_from_config(config) for axis, config in axis_selection.items()}
 
 
 def _apply_axis_selection(selection, axis_selection, sample_dim=None):
@@ -51,9 +47,7 @@ def _apply_axis_selection(selection, axis_selection, sample_dim=None):
             dataset_axis = axis
         else:
             dataset_axis = axis if axis < sample_dim else axis + 1
-
         selection[dataset_axis] = axis_selector
-
     return selection
 
 
@@ -66,9 +60,7 @@ class DictSource:
         return self.data[key].shape[0]
 
     def get_sample(self, idx):
-        return {
-            key: value[idx] for key, value in self.data.items()
-        }
+        return {key: value[idx] for key, value in self.data.items()}
 
 
 class NetCDFSource:
@@ -268,9 +260,21 @@ class HDF5Source:
 
         return torch.from_numpy(dataset[tuple(selection)]).float()
 
+    def close(self):
+        file = getattr(self, "_file", None)
+        if file is None:
+            return
+
+        try:
+            file.close()
+        finally:
+            self._file = None
+
     def __del__(self):
-        if self._file is not None:
-            self._file.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class HDF5GroupSource:
@@ -350,9 +354,21 @@ class HDF5GroupSource:
 
         return torch.from_numpy(dataset[tuple(selection)]).float()
 
+    def close(self):
+        file = getattr(self, "_file", None)
+        if file is None:
+            return
+
+        try:
+            file.close()
+        finally:
+            self._file = None
+
     def __del__(self):
-        if self._file is not None:
-            self._file.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 # The Well processing: description
@@ -397,9 +413,21 @@ class TheWellHDF5Source:
         file = self._open()
         return int(file.attrs["n_trajectories"])
 
+    def close(self):
+        file = getattr(self, "_file", None)
+        if file is None:
+            return
+
+        try:
+            file.close()
+        finally:
+            self._file = None
+
     def __del__(self):
-        if self._file is not None:
-            self._file.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _decode_name(self, name):
         if isinstance(name, bytes):
@@ -557,13 +585,31 @@ class TheWellHDF5Source:
 
         self.channel_names = channel_names
 
+        metadata = {
+            "dataset_name": self._decode_name(file.attrs.get("dataset_name", "")),
+            "grid_type": self._decode_name(file.attrs.get("grid_type", "")),
+            "n_spatial_dims": n_spatial_dims,
+            "path": self.path,
+        }
+
+        constant_scalar_names = []
+        if "scalars" in file:
+            constant_scalar_names = [
+                self._decode_name(name)
+                for name in file["scalars"].attrs.get("field_names", [])
+            ]
+
+        metadata["constant_scalar_names"] = constant_scalar_names
+
+        for scalar_name in constant_scalar_names:
+            if scalar_name in file.attrs:
+                value = file.attrs[scalar_name]
+                if hasattr(value, "item"):
+                    value = value.item()
+                metadata[scalar_name] = value
+
         return {
             self.output_key: data,
             "channel_names": channel_names,
-            "metadata": {
-                "dataset_name": self._decode_name(file.attrs.get("dataset_name", "")),
-                "grid_type": self._decode_name(file.attrs.get("grid_type", "")),
-                "n_spatial_dims": n_spatial_dims,
-                "path": self.path,
-            },
+            "metadata": metadata,
         }
