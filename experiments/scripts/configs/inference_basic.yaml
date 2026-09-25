@@ -38,7 +38,7 @@ tasks:
 
     split:
       type: explicit
-      train: [0, 10]
+      train: [0, 1]
       val: [11, 21]
       test: [22, 32]
 

@@ -10,7 +10,18 @@ from .lino_ops import (
     SymmetricLowRank,
 )
 
-
+def _print_mem(tag, device=None):
+    """Печатает CUDA-память: allocated / reserved / свободно от total."""
+    if not torch.cuda.is_available():
+        return
+    if device is None:
+        device = torch.cuda.current_device()
+    alloc = torch.cuda.memory_allocated(device) / 1024**2
+    reserved = torch.cuda.memory_reserved(device) / 1024**2
+    total = torch.cuda.get_device_properties(device).total_memory / 1024**2
+    print(f"[mem:{tag}] allocated={alloc:.1f} MiB, reserved={reserved:.1f} MiB, "
+          f"free_from_total={total - alloc:.1f} MiB")
+    
 class LastFNOBlockWeightJacobian(LinearOperator):
     """Linearized map w -> f(x; w) for the last FNO block weights.
 
@@ -30,6 +41,7 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         num_output_channels: int | None = None,
         output_grid_shape: tuple[int, ...] | None = None,
         vjp_chunk: int = 64,
+        vjp_refresh_every: int = 50,
     ):
         self._model_fn = model_fn
         self._x = x
@@ -37,17 +49,35 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         self._num_output_channels = num_output_channels
         self._output_grid_shape = output_grid_shape
         self._vjp_chunk = vjp_chunk
+        self._vjp_refresh_every = vjp_refresh_every
         self._diag_JJT_cache = None
 
         flat_fn = lambda w: model_fn(x, w).reshape(-1)
+        self._flat_fn = flat_fn
         self._fx = flat_fn(w0)
         self._vjp_fn = torch.func.vjp(flat_fn, w0)[1]
-        self._vjp_rows = torch.vmap(lambda c: self._vjp_fn(c)[0], in_dims=0)
+        self._vjp_rows = torch.vmap(
+            lambda c: self._vjp_fn(c, create_graph=False)[0], in_dims=0
+        )
         self._vjp_cols = torch.vmap(
-            lambda c: self._vjp_fn(c)[0], in_dims=-1, out_dims=-1
+            lambda c: self._vjp_fn(c, create_graph=False)[0], in_dims=-1, out_dims=-1
         )
 
         super().__init__()
+
+    def _rebuild_vjp(self):
+        """Пересоздаёт forward-граф и VJP-примитивы (сбрасывает удержанную память)."""
+        flat_fn = self._flat_fn
+        torch.cuda.empty_cache()
+        self._fx = flat_fn(self._w0)
+        self._vjp_fn = torch.func.vjp(flat_fn, self._w0)[1]
+        self._vjp_rows = torch.vmap(
+            lambda c: self._vjp_fn(c, create_graph=False)[0], in_dims=0
+        )
+        self._vjp_cols = torch.vmap(
+            lambda c: self._vjp_fn(c, create_graph=False)[0], in_dims=-1, out_dims=-1
+        )
+        torch.cuda.empty_cache()
 
     @property
     def fx(self) -> torch.Tensor:
@@ -61,6 +91,7 @@ class LastFNOBlockWeightJacobian(LinearOperator):
     def _chunked_rows(self):
         """Yield (slice, rows) with rows = J[slice, :] built via reverse-mode."""
         m = self._fx.numel()
+        nchunks = 0
         for c0 in range(0, m, self._vjp_chunk):
             c1 = min(c0 + self._vjp_chunk, m)
             cnt = c1 - c0
@@ -69,7 +100,11 @@ class LastFNOBlockWeightJacobian(LinearOperator):
                 cot = torch.eye(m, dtype=self._w0.dtype, device=self._w0.device)
             else:
                 cot[torch.arange(cnt), torch.arange(c0, c1)] = 1.0
+            nchunks += 1
+            if nchunks % self._vjp_refresh_every == 0:
+                self._rebuild_vjp()
             yield slice(c0, c1), self._vjp_rows(cot)
+            #_print_mem(f"_chunked_rows {c0}", self._w0.device)
 
     def _matmul(self, weights: torch.Tensor) -> torch.Tensor:
         """J w or J @ W (W shaped (d, k)) via chunked reverse passes."""
@@ -79,6 +114,7 @@ class LastFNOBlockWeightJacobian(LinearOperator):
             out = torch.empty(m, dtype=self._w0.dtype, device=self._w0.device)
             for sl, rows in self._chunked_rows():
                 out[sl] = rows @ weights
+                del rows; torch.cuda.empty_cache()
             return out
         k = weights.shape[-1]
         out = torch.empty(
@@ -86,6 +122,7 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         )
         for sl, rows in self._chunked_rows():
             out[sl] = rows @ weights
+            del rows; torch.cuda.empty_cache()
         return out
 
     def transpose(self) -> "LastFNOBlockTransposeWeightJacobian":
@@ -121,7 +158,7 @@ class LastFNOBlockTransposeWeightJacobian(LinearOperator):
 
     def _matmul(self, outputs: torch.Tensor) -> torch.Tensor:
         if outputs.dim() == 1:
-            return self._jacobian._vjp_fn(outputs.to(self._jacobian._w0))[0]
+            return self._jacobian._vjp_fn(outputs.to(self._jacobian._w0), create_graph=False)[0]
         return self._jacobian._vjp_cols(outputs.to(self._jacobian._w0))
 
     def transpose(self) -> LastFNOBlockWeightJacobian:

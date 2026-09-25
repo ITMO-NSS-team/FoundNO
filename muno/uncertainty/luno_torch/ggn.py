@@ -7,7 +7,6 @@ import torch
 from .jacobian import LastFNOBlockWeightJacobian
 from .lino_ops import LinearOperator
 
-
 @dataclass
 class LowRankTerms:
     """Low-rank Gaussian-Newton curvature terms: A ~= U diag(S) U^T."""
@@ -16,7 +15,18 @@ class LowRankTerms:
     S: torch.Tensor
     scalar: torch.Tensor | float = 0.0
 
-
+def _print_mem(tag, device=None):
+    """Печатает CUDA-память: allocated / reserved / свободно от total."""
+    if not torch.cuda.is_available():
+        return
+    if device is None:
+        device = torch.cuda.current_device()
+    alloc = torch.cuda.memory_allocated(device) / 1024**2
+    reserved = torch.cuda.memory_reserved(device) / 1024**2
+    total = torch.cuda.get_device_properties(device).total_memory / 1024**2
+    print(f"[mem:{tag}] allocated={alloc:.1f} MiB, reserved={reserved:.1f} MiB, "
+          f"free_from_total={total - alloc:.1f} MiB")
+    
 class GGNMatvec(LinearOperator):
     """Generalized Gauss-Newton matvec of the last FNO block weights.
 
@@ -125,73 +135,42 @@ def skerch_low_rank(
 ) -> LowRankTerms:
     """Low-rank estimate of a symmetric positive matvec using skerch if available.
 
-    Falls back to a randomized eigendecomposition when skerch is not installed.
-    Supports multiple skerch APIs:
-      * legacy ``skerch.decompositions.seigh`` (returns a 3-tuple (Q, U, S));
-      * modern ``skerch.algorithms.seigh`` (returns ``(Lambda, Q)`` with
-        ``A ~= Q diag(Lambda) Q^H``, keyword ``outer_dims``);
-      * ``skerch.seigh`` (same numpy-style modern API).
+    Uses the modern ``skerch.algorithms.seigh`` API, which returns the pair
+    ``(Lambda, Q)`` with ``A ~= Q diag(Lambda) Q^H``. Falls back to a
+    randomized eigendecomposition only when skerch is not installed.
     """
     if inner_rank is None:
         inner_rank = rank
     try:
-        import skerch.linops as _ll  # noqa: F401 — ensures skerch is importable
+        from skerch.algorithms import seigh
 
         class TorchOp:
-            def __init__(self, shape, dtype_):
+            def __init__(self, shape):
                 self.shape = shape
-                self.dtype = dtype_
+                self.dtype = dtype
                 self.device = torch.device(device)
 
             def __matmul__(self, x):
-                return mv._matmul(x.to(device=mv.device))
+                y = mv._matmul(x.to(device=mv.device, dtype=mv.dtype))
+                return y.to(dtype=self.dtype, device=self.device)
 
             def __rmatmul__(self, x):
-                return x.to(device=mv.device) @ mv
+                # Hermitian operator: x @ A == (A @ x.H).H
+                y = mv._matmul(x.conj().T.to(device=mv.device, dtype=mv.dtype))
+                return y.conj().T.to(dtype=self.dtype, device=self.device)
 
-        op = TorchOp(mv.shape(), dtype)
-        try:
-            from skerch.algorithms import seigh
-
-            res = seigh(
-                op,
-                lop_device=device,
-                lop_dtype=dtype,
-                outer_dims=rank
-            )
-            U = res[0] @ res[1]
-            S = res[2]
-            U, S = U.to(dtype=dtype), S.to(dtype=dtype)
-        except ImportError:
-            try:
-                from skerch.algorithms import seigh
-            except ImportError:
-                from skerch import seigh
-            try:
-                res = seigh(
-                    op,
-                    op_device=device,
-                    op_dtype=dtype,
-                    outer_dims=rank,
-                )
-            except TypeError:
-                res = seigh(
-                    op,
-                    op_device=device,
-                    op_dtype=dtype,
-                    outer_dims=rank,
-                    inner_dims=inner_rank,
-                    recovery_type="nystrom",
-                )
-            try:
-                evals, evecs = res
-            except (TypeError, ValueError):
-                evals, evecs = res[1], res[0]
-            S = evals[:, :rank] if evals.dim() == 2 else evals[:rank]
-            U = evecs[:, :rank]
-        S = S.clamp_min(0.0)
+        op = TorchOp(mv.shape())
+        lam, qq = seigh(
+            op,
+            lop_device=device,
+            lop_dtype=dtype,
+            outer_dims=rank,
+            recovery_type = "nystrom"
+        )
+        S = lam[:rank].clamp_min(0.0).to(dtype=dtype)
+        U = qq[:, :rank].to(dtype=dtype, device=torch.device(device))
         return LowRankTerms(U=U, S=S, scalar=0.0)
-    except Exception as e:  # noqa: BLE001
+    except ImportError as e:
         import warnings
 
         warnings.warn(

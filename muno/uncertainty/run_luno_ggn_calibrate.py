@@ -25,6 +25,11 @@
         --proj-checkpoint-dir <dir> \
         --in-normalizers <dir> --out-normalizers <dir> \
         --output-root <root> --run-name <name>
+
+При OOM из-за фрагментации CUDA-памяти можно включить сегменты расширяемого
+размера (переменная окружения должна быть выставлена ДО импорта torch):
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    #   python muno/uncertainty/run_luno_ggn_calibrate.py ...
 """
 
 from __future__ import annotations
@@ -119,6 +124,19 @@ def _cast_to_double(sample):
         if "mask" in sub:
             sub["mask"] = sub["mask"].to(DTYPE)
     return sample
+
+
+def _print_mem(tag, device=None):
+    """Печатает CUDA-память: allocated / reserved / свободно от total."""
+    if not torch.cuda.is_available():
+        return
+    if device is None:
+        device = torch.cuda.current_device()
+    alloc = torch.cuda.memory_allocated(device) / 1024**2
+    reserved = torch.cuda.memory_reserved(device) / 1024**2
+    total = torch.cuda.get_device_properties(device).total_memory / 1024**2
+    print(f"[mem:{tag}] allocated={alloc:.1f} MiB, reserved={reserved:.1f} MiB, "
+          f"free_from_total={total - alloc:.1f} MiB")
 
 
 def _get_channelwise_reduce_dims(batch_tensor):
@@ -307,6 +325,8 @@ def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor):
         model_fn, w0, xs, loss_fn="mse", factor=1.0,
         vjp_chunk=args.vjp_chunk,
     )
+    _print_mem("ggn_mv", w0.device)
+
     low_rank = skerch_low_rank(
         ggn_mv,
         rank=args.max_rank,
@@ -467,20 +487,20 @@ def main():
     model_fn_wrap, w0 = split_wrapper(wrapper)
     print(f"[split] w0: d={w0.numel()}, dtype={w0.dtype}, device={w0.device}")
 
-    keys = discover_last_block_keys(core)
-    print("\n[последний фурье-слой core]:")
-    for label in ("R", "W", "b"):
-        path, cls, attr = _resolve_key_owner(core, keys[label])
-        print(f"    {label}: layer='{path}' ({cls}, attr='{attr}')")
-    R, W, b = ref_state_dict(core, keys)
-    print(f"    R: {tuple(R.shape)} (complex -> R.real | R.imag)")
-    print(f"    W: {tuple(W.shape)}")
-    print(f"    b: {tuple(b.shape) if b is not None else None}")
-    assert torch.is_complex(R), (
-        "Спектральный вес R стал некомплексным (мнимая часть потеряна из-за "
-        "core.to(dtype=...)). Не кастать core целиком в float64; см. комментарий"
-        " к переносу core на device в main."
-    )
+    # keys = discover_last_block_keys(core)
+    # print("\n[последний фурье-слой core]:")
+    # for label in ("R", "W", "b"):
+    #     path, cls, attr = _resolve_key_owner(core, keys[label])
+    #     print(f"    {label}: layer='{path}' ({cls}, attr='{attr}')")
+    # R, W, b = ref_state_dict(core, keys)
+    # print(f"    R: {tuple(R.shape)} (complex -> R.real | R.imag)")
+    # print(f"    W: {tuple(W.shape)}")
+    # print(f"    b: {tuple(b.shape) if b is not None else None}")
+    # assert torch.is_complex(R), (
+    #     "Спектральный вес R стал некомплексным (мнимая часть потеряна из-за "
+    #     "core.to(dtype=...)). Не кастать core целиком в float64; см. комментарий"
+    #     " к переносу core на device в main."
+    # )
 
     # Верификация сплита (реконструкция весов core из w0).
     base = wrapper._base_state_dict()
@@ -491,6 +511,7 @@ def main():
     )
     status = "SPLIT OK" if max_diff == 0 else f"SPLIT NOT OK (max diff={max_diff:.3e})"
     print(f"    [проверка] max |reconstruct(w0) - base| = {max_diff:.3e} -> {status}")
+    _print_mem("after_split_w0", device)
 
     # model_fn: лифтинг -> core(с w) -> проекция (фиксированы лифтинг и проекция).
     model_fn = make_model_fn(wrapper, lifting, projection)
