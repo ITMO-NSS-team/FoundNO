@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from .progress import tqdm
+
 
 def nll_gaussian(mean: torch.Tensor, std: torch.Tensor, target: torch.Tensor, scaled: bool = True) -> torch.Tensor:
     """Negative log-likelihood under a diagonal Gaussian predictive.
@@ -25,6 +27,23 @@ def nll_gaussian(mean: torch.Tensor, std: torch.Tensor, target: torch.Tensor, sc
     return nll.sum()
 
 
+def chi_squared(pred_mean, pred_std, target, *, averaged=True):
+    """Эквивалент laplax ``chi_squared``: (y - mean)^2 / std^2.
+
+    ``averaged=True`` -- среднее по элементам, иначе сумма.
+    """
+    pm = pred_mean.reshape(-1)
+    ps = pred_std.reshape(-1)
+    tg = target.reshape(-1)
+    val = (pm - tg) ** 2 / ps**2
+    return val.mean() if averaged else val.sum()
+
+
+def chi_squared_zero(pred_mean, pred_std, target, *, averaged=True):
+    """Калибровочный критерий ``|chi_squared - 1|`` (laplax ``chi_squared_zero``)."""
+    return torch.abs(chi_squared(pred_mean, pred_std, target, averaged=averaged) - 1)
+
+
 def evaluate_for_given_prior_arguments(
     prob_predictive: callable,
     prior_args: dict,
@@ -44,6 +63,8 @@ def grid_search(
     objective: callable,
     patience: int = 5,
     maximize: bool = False,
+    progress: bool = False,
+    desc: str = "grid_search",
 ) -> tuple:
     """Grid search with early stopping after ``patience`` non-improving steps.
 
@@ -52,17 +73,26 @@ def grid_search(
     best_value = -torch.inf if maximize else torch.inf
     best_idx: int = 0
     bad = 0
-    for i, value in enumerate(range_values):
-        val = float(objective(value))
-        improved = val > best_value if maximize else val < best_value
-        if improved:
-            best_value = val
-            best_idx = i
-            bad = 0
-        else:
-            bad += 1
-            if bad >= patience:
-                return best_value, best_idx
+    bar = tqdm(
+        total=len(range_values), desc=f"[{desc}]", unit="val", leave=False
+    ) if progress else None
+    try:
+        for i, value in enumerate(range_values):
+            val = float(objective(value))
+            improved = val > best_value if maximize else val < best_value
+            if improved:
+                best_value = val
+                best_idx = i
+                bad = 0
+            else:
+                bad += 1
+                if bad >= patience:
+                    return best_value, best_idx
+            if bar is not None:
+                bar.update(1)
+    finally:
+        if bar is not None:
+            bar.close()
     return best_value, best_idx
 
 

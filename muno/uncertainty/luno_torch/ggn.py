@@ -6,6 +6,7 @@ import torch
 
 from .jacobian import LastFNOBlockWeightJacobian
 from .lino_ops import LinearOperator
+from .progress import tqdm
 
 @dataclass
 class LowRankTerms:
@@ -81,10 +82,16 @@ class GGNMatvec(LinearOperator):
         single = v.dim() == 1
         vv = v.unsqueeze(-1) if single else v
         g = torch.zeros_like(vv)
+        bar = tqdm(
+            total=len(self._jacobians), desc="[GGN] сэмплы", unit="smp",
+            leave=False, position=0,
+        )
         for jac in self._jacobians:
             Jv = jac._matmul(vv)
             cot = 2.0 * Jv
             g = g + jac._vjp_cols(cot)
+            bar.update(1)
+        bar.close()
         g = self._factor * g
         return g.squeeze(-1) if single else g
 

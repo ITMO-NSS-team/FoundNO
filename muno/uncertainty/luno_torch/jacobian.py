@@ -9,6 +9,7 @@ from .lino_ops import (
     PositiveDiagonalPlusSymmetricLowRank,
     SymmetricLowRank,
 )
+from .progress import tqdm, write
 
 def _print_mem(tag, device=None):
     """Печатает CUDA-память: allocated / reserved / свободно от total."""
@@ -19,7 +20,7 @@ def _print_mem(tag, device=None):
     alloc = torch.cuda.memory_allocated(device) / 1024**2
     reserved = torch.cuda.memory_reserved(device) / 1024**2
     total = torch.cuda.get_device_properties(device).total_memory / 1024**2
-    print(f"[mem:{tag}] allocated={alloc:.1f} MiB, reserved={reserved:.1f} MiB, "
+    write(f"[mem:{tag}] allocated={alloc:.1f} MiB, reserved={reserved:.1f} MiB, "
           f"free_from_total={total - alloc:.1f} MiB")
     
 class LastFNOBlockWeightJacobian(LinearOperator):
@@ -91,20 +92,28 @@ class LastFNOBlockWeightJacobian(LinearOperator):
     def _chunked_rows(self):
         """Yield (slice, rows) with rows = J[slice, :] built via reverse-mode."""
         m = self._fx.numel()
+        nchunks_total = (m + self._vjp_chunk - 1) // self._vjp_chunk
+        bar = tqdm(
+            total=nchunks_total, desc="чанки", unit="chunk", leave=False, position=1
+        )
         nchunks = 0
-        for c0 in range(0, m, self._vjp_chunk):
-            c1 = min(c0 + self._vjp_chunk, m)
-            cnt = c1 - c0
-            cot = torch.zeros(cnt, m, dtype=self._w0.dtype, device=self._w0.device)
-            if cnt == m:
-                cot = torch.eye(m, dtype=self._w0.dtype, device=self._w0.device)
-            else:
-                cot[torch.arange(cnt), torch.arange(c0, c1)] = 1.0
-            nchunks += 1
-            if nchunks % self._vjp_refresh_every == 0:
-                self._rebuild_vjp()
-            yield slice(c0, c1), self._vjp_rows(cot)
-            #_print_mem(f"_chunked_rows {c0}", self._w0.device)
+        try:
+            for c0 in range(0, m, self._vjp_chunk):
+                c1 = min(c0 + self._vjp_chunk, m)
+                cnt = c1 - c0
+                cot = torch.zeros(cnt, m, dtype=self._w0.dtype, device=self._w0.device)
+                if cnt == m:
+                    cot = torch.eye(m, dtype=self._w0.dtype, device=self._w0.device)
+                else:
+                    cot[torch.arange(cnt), torch.arange(c0, c1)] = 1.0
+                nchunks += 1
+                bar.update(1)
+                if nchunks % self._vjp_refresh_every == 0:
+                    self._rebuild_vjp()
+                yield slice(c0, c1), self._vjp_rows(cot)
+                #_print_mem(f"_chunked_rows {c0}", self._w0.device)
+        finally:
+            bar.close()
 
     def _matmul(self, weights: torch.Tensor) -> torch.Tensor:
         """J w or J @ W (W shaped (d, k)) via chunked reverse passes."""

@@ -62,10 +62,11 @@ from luno_torch.adapter import (
     ref_state_dict,
     split_wrapper,
 )
-from luno_torch.calibrate import grid_search, nll_gaussian
+from luno_torch.calibrate import chi_squared, chi_squared_zero, grid_search, nll_gaussian
 from luno_torch.factory import create_luno_cov
 from luno_torch.ggn import GGNMatvec, skerch_low_rank
 from luno_torch.jacobian import LastFNOBlockWeightJacobian, var_of_congruence
+from luno_torch.progress import set_enabled, tqdm
 
 import run_multiphysics_inference as rmi
 
@@ -107,6 +108,11 @@ def parse_args():
     p.add_argument("--calib-grid-max", type=float, default=3.0)
     p.add_argument("--calib-grid-size", type=int, default=50)
     p.add_argument("--calib-patience", type=int, default=5)
+    p.add_argument("--calib-objective", choices=["chi2", "nll"], default="chi2",
+                   help="Objective калибровки: 'chi2' -- |chi_squared - 1| "
+                        "(дефолт, как в laplax), 'nll' -- NLL.")
+    p.add_argument("--no-progress", action="store_true",
+                   help="Отключить прогресс-бары (tqdm).")
     return p.parse_args()
 
 
@@ -315,7 +321,13 @@ def raw_from_normalized(mean_norm, std_norm, out_normalizer, out_shape):
 
 def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor):
     xs = []
-    for sample in iter_samples(train_loader, args.max_num_samples):
+    for sample in tqdm(
+        iter_samples(train_loader, args.max_num_samples),
+        total=args.max_num_samples,
+        desc="[GGN] загрузка сэмплов",
+        unit="smp",
+        leave=False,
+    ):
         sample = preprocess_sample(data_processor, sample)
         xs.append(sample[0]["x"])
     print(f"[GGN] собрано {len(xs)} сэмплов из train loader.")
@@ -356,10 +368,12 @@ def _batch_predictive_stats(model_fn, w0, weight_cov, x, out_normalizer,
 
 
 def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
-                         out_normalizer, val_loader):
+                         out_normalizer, val_loader, objective_name="chi2"):
     """Калибровка scalar prior_prec на первом val-батче (как luno_experiments).
 
     Jacobian на входе кэшируется один раз; по гриду меняется только cov.
+    ``objective_name``: "chi2" -- |chi_squared - 1| (как дефолт в laplax),
+    "nll" -- negative log-likelihood.
     """
     calib_sample = next(iter(val_loader))
     calib_sample = preprocess_sample(data_processor, calib_sample)
@@ -386,12 +400,18 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
         mean_raw, std_raw = raw_from_normalized(
             mean_norm, std_norm, out_normalizer, out_shape
         )
+        if objective_name == "chi2":
+            return chi_squared_zero(mean_raw, std_raw, target)
         return nll_gaussian(mean_raw, std_raw, target, scaled=True)
 
-    best_value, best_idx = grid_search(grid, objective, patience=args.calib_patience)
+    best_value, best_idx = grid_search(
+        grid, objective, patience=args.calib_patience,
+        progress=True, desc="calibrate: prior_prec",
+    )
     best_prec = grid[best_idx]
-    print(f"[calibrate] best prior_prec={best_prec.item():.6e}, nll={best_value:.6e}")
-    return {"prior_prec": best_prec}
+    print(f"[calibrate] best prior_prec={best_prec.item():.6e}, "
+          f"{objective_name}={best_value:.6e}")
+    return {"prior_prec": best_prec, "objective": objective_name}
 
 
 def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
@@ -399,6 +419,7 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
     cov = create_luno_cov(low_rank, prior_args)
     nll_sum = torch.tensor(0.0, dtype=DTYPE)
     rmse_sum = torch.tensor(0.0, dtype=DTYPE)
+    chi2_sum = torch.tensor(0.0, dtype=DTYPE)
     n_elements = 0
     n_samples = 0
 
@@ -412,14 +433,16 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
         )
         nll_sum = nll_sum + nll_gaussian(mean_raw, std_raw, target, scaled=False)
         rmse_sum = rmse_sum + torch.sqrt(torch.mean((mean_raw - target) ** 2))
+        chi2_sum = chi2_sum + chi_squared(mean_raw, std_raw, target, averaged=False)
         n_elements += target.numel()
         n_samples += 1
 
     nll = (nll_sum / n_elements).item() if n_elements else float("nan")
     rmse = (rmse_sum / n_samples).item() if n_samples else float("nan")
-    print(f"[eval:{task_name}] nll={nll:.6e} rmse={rmse:.6e} "
+    chi2 = (chi2_sum / n_elements).item() if n_elements else float("nan")
+    print(f"[eval:{task_name}] nll={nll:.6e} rmse={rmse:.6e} chi2={chi2:.6e} "
           f"(samples={n_samples}, elements={n_elements})")
-    return {"nll": nll, "rmse": rmse, "samples": n_samples}
+    return {"nll": nll, "rmse": rmse, "chi2": chi2, "samples": n_samples}
 
 
 # ----------------------------------------------------------------------------
@@ -428,6 +451,8 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
 
 def main():
     args = parse_args()
+
+    set_enabled(not args.no_progress)
 
     if args.dtype == "float64":
         global DTYPE, CDTYPE
@@ -531,6 +556,7 @@ def main():
     prior_args = calibrate_prior_prec(
         args, model_fn, w0, low_rank, wrapper, data_processor,
         data_processor.out_normalizer, pipeline["val_loader"],
+        objective_name=args.calib_objective,
     )
 
     out_normalizer = data_processor.out_normalizer
@@ -548,6 +574,7 @@ def main():
 
     results = {
         "prior_prec": prior_args["prior_prec"].item(),
+        "calib_objective": prior_args.get("objective", args.calib_objective),
         "val": val_metrics,
         "test": test_metrics,
         "max_rank": args.max_rank,
