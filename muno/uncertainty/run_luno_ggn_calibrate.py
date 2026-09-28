@@ -53,6 +53,11 @@ from torch.func import functional_call
 from torch.utils.data import DataLoader
 
 from muno.data.benchmarks.datasets import MultiPhysicsDataset
+from muno.data.benchmarks.inspections import (
+    _inference_time_index,
+    canonical_image,
+    save_image,
+)
 from muno.data.data.transforms.data_processors import DefaultDataProcessor
 from muno.data.data.transforms.normalizers import MultiphysicsUnitGaussianNormalizer
 
@@ -414,19 +419,54 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
     return {"prior_prec": best_prec, "objective": objective_name}
 
 
+def save_luno_images(pred, band, target, output_prefix, batch_idx):
+    """Картинки LUNO: target / predict (mean_raw) / std_raw / sqrt(chi2).
+
+    sqrt(chi2) = |target - mean_raw| / std_raw -- калиброванная стандартизованная
+    ошибка по элементам. Имена файлов: <prefix>_<key>_<idx>_<suffix>_.png.
+    """
+    for key in pred.keys():
+        time_index = _inference_time_index(pred[key])
+        p, b, t = pred[key], band[key], target[key]
+        eps = torch.finfo(p.dtype).eps
+        sqrt_chi2 = (t - p).abs() / b.clamp_min(eps)
+
+        save_image(canonical_image(t, channel_index=0, time_index=time_index),
+                   output_prefix.with_name(output_prefix.name + f"{key}_{batch_idx}_target_.png"),
+                   "luno target")
+        save_image(canonical_image(p, channel_index=0, time_index=time_index),
+                   output_prefix.with_name(output_prefix.name + f"{key}_{batch_idx}_predict_.png"),
+                   "luno predict")
+        save_image(canonical_image(b, channel_index=0, time_index=time_index),
+                   output_prefix.with_name(output_prefix.name + f"{key}_{batch_idx}_std_raw_.png"),
+                   "luno std_raw")
+        save_image(canonical_image(sqrt_chi2, channel_index=0, time_index=time_index),
+                   output_prefix.with_name(output_prefix.name + f"{key}_{batch_idx}_sqrt_chi2_.png"),
+                   "luno sqrt(chi2)")
+
+
 def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
-                  data_processor, out_normalizer, task_name, max_samples):
+                  data_processor, out_normalizer, task_name, max_samples,
+                  metrics_config=None, output_dir=None):
     cov = create_luno_cov(low_rank, prior_args)
     nll_sum = torch.tensor(0.0, dtype=DTYPE)
     rmse_sum = torch.tensor(0.0, dtype=DTYPE)
     chi2_sum = torch.tensor(0.0, dtype=DTYPE)
+    cfg_sums = {}
     n_elements = 0
     n_samples = 0
+
+    output_prefix = None
+    if output_dir is not None:
+        output_prefix = Path(output_dir) / f"inspections_luno_{task_name}"
+        output_prefix.mkdir(parents=True, exist_ok=True)
+        output_prefix = Path.joinpath(output_prefix, "luno_")
 
     for sample in iter_samples(loader, max_samples):
         sample = preprocess_sample(data_processor, sample)
         x = sample[0]["x"]
-        target = sample[0]["y"].reshape(-1)
+        target_raw = sample[0]["y"]
+        target = target_raw.reshape(-1)
         mean_raw, std_raw = _batch_predictive_stats(
             model_fn, w0, cov, x, out_normalizer, wrapper.num_output_channels,
             vjp_chunk=args.vjp_chunk,
@@ -437,12 +477,42 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
         n_elements += target.numel()
         n_samples += 1
 
+        out_shape = target_raw.shape
+        pred = {0: mean_raw.reshape(out_shape)}
+        band = {0: std_raw.reshape(out_shape)}
+        target_dict = {0: target_raw}
+
+        if output_prefix is not None:
+            save_luno_images(pred, band, target_dict, output_prefix, n_samples - 1)
+
+        if metrics_config:
+            batch_metrics = rmi.compute_batch_metrics(
+                pred,
+                band,
+                target_dict,
+                metrics_config=metrics_config,
+                task_name=task_name,
+            )
+            for name, value in batch_metrics[0].items():
+                cfg_sums[name] = cfg_sums.get(name, 0.0) + float(value)
+
     nll = (nll_sum / n_elements).item() if n_elements else float("nan")
     rmse = (rmse_sum / n_samples).item() if n_samples else float("nan")
     chi2 = (chi2_sum / n_elements).item() if n_elements else float("nan")
-    print(f"[eval:{task_name}] nll={nll:.6e} rmse={rmse:.6e} chi2={chi2:.6e} "
+
+    cfg_metrics = {name: value / n_samples for name, value in cfg_sums.items()}
+    metrics = {
+        **cfg_metrics,
+        "luno_nll": nll,
+        "luno_rmse": rmse,
+        "luno_chi2": chi2,
+        "samples": n_samples,
+    }
+    cfg_str = " ".join(f"{k}={v:.6e}" for k, v in cfg_metrics.items())
+    print(f"[eval:{task_name}] luno_nll={nll:.6e} luno_rmse={rmse:.6e} "
+          f"luno_chi2={chi2:.6e} {cfg_str} "
           f"(samples={n_samples}, elements={n_elements})")
-    return {"nll": nll, "rmse": rmse, "chi2": chi2, "samples": n_samples}
+    return metrics
 
 
 # ----------------------------------------------------------------------------
@@ -563,13 +633,17 @@ def main():
 
     # --- финальные метрики после калибровки ---
     print("\n[metrics] финальные метрики после калибровки:")
-    val_metrics = evaluate_luno(
-        args, pipeline["val_loader"], model_fn, w0, low_rank, prior_args, wrapper,
-        data_processor, out_normalizer, "val", args.max_eval_samples,
-    )
+    # val_metrics = evaluate_luno(
+    #     args, pipeline["val_loader"], model_fn, w0, low_rank, prior_args, wrapper,
+    #     data_processor, out_normalizer, "val", args.max_eval_samples,
+    #     metrics_config=pipeline["config"].get("metrics", {}),
+    #     output_dir=output_dir,
+    # )
     test_metrics = evaluate_luno(
         args, pipeline["test_loader"], model_fn, w0, low_rank, prior_args, wrapper,
         data_processor, out_normalizer, "test", args.max_eval_samples,
+        metrics_config=pipeline["config"].get("metrics", {}),
+        output_dir=output_dir,
     )
 
     results = {

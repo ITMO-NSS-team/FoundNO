@@ -37,10 +37,10 @@ tasks:
       physics_name: 2d_cfd
 
     split:
-      type: explicit
-      train: [0, 1]
-      val: [11, 21]
-      test: [22, 32]
+      type: ratios
+      train: 0.8
+      val: 0.1
+      test: 0.1
 
     loaders:
       train:
@@ -70,10 +70,10 @@ normalization:
   max_fit_batches: 32
 
 model:
-  type: adapted_fno_no_mamba
+  type: adapted_fno #adapted_fno_no_mamba
   n_dim: 3
   hidden_channels: 60
-  lifting_layers: 1
+  lifting_layers: 2
   projection_layers: 2
   core_layers: 4
   n_modes: [8, 30, 30]
@@ -129,8 +129,8 @@ metrics:
       tasks: all
     - name: band_spectral_nrmse_2d
       tasks: all
-  uncertainty:
-    - name: coverage_rate
-      tasks: all
-    - name: normalized_avg_bandwidth
-      tasks: all
+  # uncertainty:
+  #   - name: coverage_rate
+  #     tasks: all
+  #   - name: normalized_avg_bandwidth
+  #     tasks: all
