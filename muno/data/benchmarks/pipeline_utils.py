@@ -3,6 +3,26 @@ import numpy as np
 import random
 
 
+SEED_TASK_STEP = 1000
+
+SPLIT_SEED = {
+    "train": 0,
+    "val": 1,
+    "test": 2
+}
+
+
+def get_split_seed(base_seed, eq_idx, split_name):
+    if base_seed is None:
+        return None
+    if not isinstance(base_seed, int):
+        raise ValueError(f"base_seed must be int, got {type(base_seed)}")
+    if split_name not in SPLIT_SEED:
+        raise ValueError(f"Unknown split name: {split_name}! Available split names: {list(SPLIT_SEED)}")
+
+    return base_seed + SPLIT_SEED[split_name] + SEED_TASK_STEP * eq_idx
+
+
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2 ** 32
     np.random.seed(worker_seed)
@@ -39,28 +59,36 @@ def get_config_value(key, *configs):
     return None
 
 
+def validate_single_batch(single_batch):
+    assert "x" in single_batch
+    assert "y" in single_batch
+    assert "benchmark_name" in single_batch
+    assert "physics_name" in single_batch
+
+    assert isinstance(single_batch["x"], torch.Tensor)
+    assert isinstance(single_batch["y"], torch.Tensor)
+
+    assert single_batch["x"].dtype == torch.float32
+    assert single_batch["y"].dtype == torch.float32
+
+    assert single_batch["x"].ndim >= 3
+    assert single_batch["y"].ndim >= 3
+
+    assert single_batch["x"].shape[0] == single_batch["y"].shape[0]
+    assert single_batch["x"].shape[2:] == single_batch["y"].shape[2:]
+
+    assert len(single_batch["benchmark_name"]) == single_batch["x"].shape[0]
+    assert len(single_batch["physics_name"]) == single_batch["x"].shape[0]
+
+
 def validate_batch(loader):
     batch = next(iter(loader))
 
-    assert "x" in batch
-    assert "y" in batch
-    assert "benchmark_name" in batch
-    assert "physics_name" in batch
-
-    assert isinstance(batch["x"], torch.Tensor)
-    assert isinstance(batch["y"], torch.Tensor)
-
-    assert batch["x"].dtype == torch.float32
-    assert batch["y"].dtype == torch.float32
-
-    assert batch["x"].ndim >= 3
-    assert batch["y"].ndim >= 3
-
-    assert batch["x"].shape[0] == batch["y"].shape[0]
-    assert batch["x"].shape[2:] == batch["y"].shape[2:]
-
-    assert len(batch["benchmark_name"]) == batch["x"].shape[0]
-    assert len(batch["physics_name"]) == batch["x"].shape[0]
+    if "x" in batch:
+        validate_single_batch(batch)
+    else:
+        for single_batch in batch.values():
+            validate_single_batch(single_batch)
 
 
 def validate_split_keys(split):
