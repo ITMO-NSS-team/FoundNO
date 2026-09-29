@@ -26,15 +26,14 @@
         --in-normalizers <dir> --out-normalizers <dir> \
         --output-root <root> --run-name <name>
 
-При OOM из-за фрагментации CUDA-памяти можно включить сегменты расширяемого
-размера (переменная окружения должна быть выставлена ДО импорта torch):
-    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    #   python muno/uncertainty/run_luno_ggn_calibrate.py ...
+При OOM из-за фрагментации CUDA-памяти скрипт сам выставляет
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (до импорта torch, см. ниже).
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import pickle
 import sys
 from datetime import datetime
@@ -47,6 +46,12 @@ UNCERTAINTY_DIR = Path(__file__).resolve().parent
 for _p in (str(PROJECT_ROOT), str(EXPERIMENTS_SCRIPTS), str(UNCERTAINTY_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+# expandable_segments снижает фрагментацию CUDA-памяти (крупным аллокациям вроде
+# rows = vjp_chunk*d проще найти место). Окружение должно быть выставлено ДО
+# импорта torch / инициализации CUDA-аллокатора.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 
 import torch
 from torch.func import functional_call
@@ -105,6 +110,10 @@ def parse_args():
                         "Пик на чанк ~ vjp_chunk * d * itemsize (при d=27.6M, float32, "
                         "chunk=16 это ~1.8 GiB).")
     p.add_argument("--max-rank", type=int, default=10, help="Low-rank rank for GGN.")
+    p.add_argument("--sketch-blocksize", type=int, default=32,
+                   help="Сколько столбцов скетча skerch подавать в GGN-matvec за раз "
+                        "(meas_blocksize). Меньше значение = меньше пиковая память; "
+                        "память матвека перестаёт расти с rank.")
     p.add_argument("--max-num-samples", type=int, default=25,
                    help="Макс. число сэмплов для GGN (как max_num_of_samples в luno).")
     p.add_argument("--max-eval-samples", type=int, default=2,
@@ -349,6 +358,7 @@ def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor):
         rank=args.max_rank,
         device=str(w0.device),
         dtype=w0.dtype,
+        sketch_blocksize=args.sketch_blocksize,
     )
     print(f"[GGN] low-rank terms: U={tuple(low_rank.U.shape)} S={tuple(low_rank.S.shape)}")
     return low_rank

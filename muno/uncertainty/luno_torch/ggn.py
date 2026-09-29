@@ -87,9 +87,14 @@ class GGNMatvec(LinearOperator):
             leave=False, position=0,
         )
         for jac in self._jacobians:
+            # Лениво строим граф ТОЛЬКО для текущего сэмпла и сразу освобождаем:
+            # в памяти живёт не более одного удержанного forward-графа за матвек
+            # (иначе max_num_samples графов ~ OOM).
+            jac._ensure_vjp()
             Jv = jac._matmul(vv)
             cot = 2.0 * Jv
             g = g + jac._vjp_cols(cot)
+            jac._release_vjp()
             bar.update(1)
         bar.close()
         g = self._factor * g
@@ -139,12 +144,19 @@ def skerch_low_rank(
     inner_rank: int | None = None,
     device: str = "cpu",
     dtype: torch.dtype = torch.float64,
+    sketch_blocksize: int | None = None,
 ) -> LowRankTerms:
     """Low-rank estimate of a symmetric positive matvec using skerch if available.
 
     Uses the modern ``skerch.algorithms.seigh`` API, which returns the pair
     ``(Lambda, Q)`` with ``A ~= Q diag(Lambda) Q^H``. Falls back to a
     randomized eigendecomposition only when skerch is not installed.
+
+    ``sketch_blocksize`` ограничивает число столбцов скетча, подаваемых в
+    ``lop @ block`` одновременно (meas_blocksize в seigh). По умолчанию seigh
+    материализует весь блок (d, rank) разом -- с большим ``rank`` это OOM;
+    меньший blocksize (например 32) держит память матвека постоянной, не завися
+    от ``rank``.
     """
     if inner_rank is None:
         inner_rank = rank
@@ -167,12 +179,16 @@ def skerch_low_rank(
                 return y.conj().T.to(dtype=self.dtype, device=self.device)
 
         op = TorchOp(mv.shape())
+        kw = {}
+        if sketch_blocksize is not None:
+            kw["meas_blocksize"] = sketch_blocksize
         lam, qq = seigh(
             op,
             lop_device=device,
             lop_dtype=dtype,
             outer_dims=rank,
-            recovery_type = "nystrom"
+            recovery_type="nystrom",
+            **kw,
         )
         S = lam[:rank].clamp_min(0.0).to(dtype=dtype)
         U = qq[:, :rank].to(dtype=dtype, device=torch.device(device))

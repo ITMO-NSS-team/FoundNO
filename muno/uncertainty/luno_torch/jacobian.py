@@ -53,44 +53,58 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         self._vjp_refresh_every = vjp_refresh_every
         self._diag_JJT_cache = None
 
-        flat_fn = lambda w: model_fn(x, w).reshape(-1)
-        self._flat_fn = flat_fn
-        self._fx = flat_fn(w0)
-        self._vjp_fn = torch.func.vjp(flat_fn, w0)[1]
-        self._vjp_rows = torch.vmap(
-            lambda c: self._vjp_fn(c, create_graph=False)[0], in_dims=0
-        )
-        self._vjp_cols = torch.vmap(
-            lambda c: self._vjp_fn(c, create_graph=False)[0], in_dims=-1, out_dims=-1
-        )
+        # Ленивая сборка: forward/VJP строятся только при первом использовании,
+        # а после — освобождаются (_release_vjp). Это JAX-подобная семантика
+        # пересчёта: граф одного сэмпла не удерживается в памяти между матвеками,
+        # иначе max_num_samples * (размер графа) упирается в CUDA-память.
+        self._flat_fn = None
+        self._fx = None
+        self._vjp_fn = None
+        self._vjp_rows = None
+        self._vjp_cols = None
 
         super().__init__()
 
-    def _rebuild_vjp(self):
-        """Пересоздаёт forward-граф и VJP-примитивы (сбрасывает удержанную память)."""
-        flat_fn = self._flat_fn
-        torch.cuda.empty_cache()
-        self._fx = flat_fn(self._w0)
-        self._vjp_fn = torch.func.vjp(flat_fn, self._w0)[1]
+    def _ensure_vjp(self):
+        """Строит forward и VJP-примитивы лениво (no-op, если уже построены)."""
+        if self._vjp_fn is not None:
+            return self
+        self._flat_fn = lambda w: self._model_fn(self._x, w).reshape(-1)
+        self._fx = self._flat_fn(self._w0)
+        self._vjp_fn = torch.func.vjp(self._flat_fn, self._w0)[1]
         self._vjp_rows = torch.vmap(
             lambda c: self._vjp_fn(c, create_graph=False)[0], in_dims=0
         )
         self._vjp_cols = torch.vmap(
             lambda c: self._vjp_fn(c, create_graph=False)[0], in_dims=-1, out_dims=-1
         )
+        return self
+
+    def _release_vjp(self):
+        """Освобождает удержанный forward-граф; следующий вызов пересчитает его."""
+        self._fx = None
+        self._vjp_fn = None
+        self._vjp_rows = None
+        self._vjp_cols = None
         torch.cuda.empty_cache()
+        return self
+
+    def _rebuild_vjp(self):
+        """Пересоздаёт forward-граф и VJP-примитивы (сбрасывает удержанную память)."""
+        return self._release_vjp()._ensure_vjp()
 
     @property
     def fx(self) -> torch.Tensor:
-        return self._fx
+        return self._ensure_vjp()._fx
 
     def shape(self) -> tuple[int, int]:
         d = self._w0.numel()
-        m = self._fx.numel()
+        m = self._ensure_vjp()._fx.numel()
         return m, d
 
     def _chunked_rows(self):
         """Yield (slice, rows) with rows = J[slice, :] built via reverse-mode."""
+        self._ensure_vjp()
         m = self._fx.numel()
         nchunks_total = (m + self._vjp_chunk - 1) // self._vjp_chunk
         bar = tqdm(
@@ -118,6 +132,7 @@ class LastFNOBlockWeightJacobian(LinearOperator):
     def _matmul(self, weights: torch.Tensor) -> torch.Tensor:
         """J w or J @ W (W shaped (d, k)) via chunked reverse passes."""
         weights = weights.to(self._w0)
+        self._ensure_vjp()
         m = self._fx.numel()
         if weights.dim() == 1:
             out = torch.empty(m, dtype=self._w0.dtype, device=self._w0.device)
@@ -151,6 +166,7 @@ class LastFNOBlockWeightJacobian(LinearOperator):
     def diag_JJT_times(self, diag: torch.Tensor) -> torch.Tensor:
         """Row-wise ``diag(J D J^T)`` for a weight-space diagonal D."""
         diag = diag.to(self._w0)
+        self._ensure_vjp()
         out = torch.empty(self._fx.numel(), dtype=self._w0.dtype, device=self._w0.device)
         for sl, rows in self._chunked_rows():
             out[sl] = (rows**2) @ diag
@@ -166,6 +182,7 @@ class LastFNOBlockTransposeWeightJacobian(LinearOperator):
         return d, m
 
     def _matmul(self, outputs: torch.Tensor) -> torch.Tensor:
+        self._jacobian._ensure_vjp()
         if outputs.dim() == 1:
             return self._jacobian._vjp_fn(outputs.to(self._jacobian._w0), create_graph=False)[0]
         return self._jacobian._vjp_cols(outputs.to(self._jacobian._w0))
