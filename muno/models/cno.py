@@ -228,6 +228,7 @@ class CFNO(FNO):
         #              масштабом alpha (нулевая инициализация => старт как
         #              у базовой модели, сравнение честное);
         #   only     — вместо спектрального стека (чистый CNO, FFT-free).
+        
         assert local_branch in LOCAL_MODES
         self.local_branch = local_branch
         if local_branch != 'off':
