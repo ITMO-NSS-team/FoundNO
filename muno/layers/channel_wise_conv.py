@@ -384,13 +384,7 @@ def weightsOuterProduct(x: torch.Tensor,
                         weights_s: List[List[torch.nn.Parameter]],
                         weights_t: List[torch.nn.Parameter],
                         mixer: torch.nn.Module): # Presumably, Linear is enough, a check for rank -> 1 inputs needed. 
-                        # complex_data: bool = False):
     spatial_dim = x.ndim - 3
-
-    # if complex_data:
-    #     trunc_idx = [-1 for _ in weights_s]
-    # else:
-    #     trunc_idx = [(weights_s[0][idx].size(dim=-1)//2+1) for idx in range(len(weights_s[0]))] # assuming, all modes are the same 
 
     einsum_symbols_local = 'abdefghijk'
     left_symb, right_symb = [], 'c'
@@ -400,9 +394,6 @@ def weightsOuterProduct(x: torch.Tensor,
         right_symb += einsum_symbols_local[dim_idx]
 
     equation = ','.join(left_symb) + '->' + right_symb
-
-    # einsum_operands = [[weights_t[rank_idx],] + [weights_s[dim_idx][rank_idx] for dim_idx in range(spatial_dim-1)] + 
-    #                    [weights_s[spatial_dim][rank_idx][:, :trunc_idx[rank_idx]],] for rank_idx in range(len(weights_t))]
 
     einsum_operands = [[weights_t[rank_idx],] + [weights_s[dim_idx][rank_idx] for dim_idx in range(spatial_dim)]
                        for rank_idx in range(len(weights_t))]
@@ -429,6 +420,12 @@ class FactorizedDimensionSpectralConv(BaseSpectralConv):
                  init_std: str = "auto",
                  fft_norm: str = "forward",                 
                  device: Union[str, torch.device] = None, *args, **kwargs):
+        if len(args) != 0 or len(kwargs) != 0:
+            print('Unsupported arguments of SpectralConv: ', end = '')
+            for key in kwargs.keys():
+                print(key, end = ' ')
+            print(f' with {len(args)} args.')
+        
         super(FactorizedDimensionSpectralConv, self).__init__(device)
 
         err_txt: str = 'n_modes have to be a dict, similar to {"t": 16, "x": 32}'
@@ -467,7 +464,6 @@ class FactorizedDimensionSpectralConv(BaseSpectralConv):
             self.separable = True
 
         # torch.nn.ModuleList
-        print()
         self.weights_t = [torch.empty(chan_shape + [self._n_modes_dict["t"],], device = device),] * self.rank
         for tensor_idx in range(self.rank):
             torch.nn.init.xavier_normal_(self.weights_t[tensor_idx])
@@ -486,16 +482,11 @@ class FactorizedDimensionSpectralConv(BaseSpectralConv):
             self.weights_x[dim_idx] = nn.ParameterList(self.weights_x[dim_idx])
 
         self.weights_x = nn.ParameterList(self.weights_x)
-        # print(f'self.weights_t type is {type(self.weights_t)}, and self.weights_x type - {type(self.weights_x)}')
-
 
         self.weigths_mixer = torch.nn.Linear(self.rank, 1)
 
         self._contract = _contract_dense # as the tensor factorization is already considered in the block
 
-        # if bias:
-        #     self.bias = nn.Parameter(init_std * torch.randn(*(tuple([self.out_channels]) + (1,) * self.order)))
-        # else:
         self.bias = None
 
     def transform(self, x, output_shape=None):
@@ -659,22 +650,14 @@ class FactorizedDimensionSpectralConv(BaseSpectralConv):
         else:
             slices_x[-1] = slice(None)
 
-        # if self.complex_data:
-        #     trunc_idx = [-1 for _ in weights_s]
-        # else:
-        #     trunc_idx = [(weights_s[0][idx].size(dim=-1)//2+1) for idx in range(len(weights_s[0]))] # assuming, all modes are the same 
-
         for c_idx, weights in enumerate(weights_repeated):
             slices_x[1] = slice(c_idx * weights_single.shape[0], (c_idx + 1) * weights_single.shape[0])
 
             slices_tupled = tuple(slices_x)
 
             if not self.complex_data:
-                weights = weights[..., : weights.shape[-1] // 2 + 2]
+                weights = weights[..., : weights.shape[-1] // 2 + 1]
 
-            # print(f'slices_tupled is: {slices_tupled}')
-            # print(f'In contraction: {out_fft[slices_tupled].shape} vs {x[slices_tupled].shape} vs {weights.shape}')
-            # # raise NotImplementedError('...')
             out_fft[slices_tupled] = self._contract(x[slices_tupled], weights, separable=self.separable)
 
         if self.resolution_scaling_factor is not None and output_shape is None:

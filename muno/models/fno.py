@@ -12,12 +12,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from tensordict import TensorDict
 
 # Set warning filter to show each warning only once
 import warnings
 
 warnings.filterwarnings("once", category=UserWarning)
-
 
 from neuralop.layers.embeddings import GridEmbeddingND, GridEmbedding2D
 from neuralop.layers.spectral_convolution import SpectralConv
@@ -221,11 +221,12 @@ class FNO(BaseModel, name="FNO"):
         self.n_layers = n_layers
 
         # init lifting and projection channels using ratios w.r.t hidden channels
-        self.lifting_channel_ratio = lifting_channel_ratio
-        self.lifting_channels = int(lifting_channel_ratio * self.hidden_channels)
+        if not self._disable_lifting_and_projection:
+            self.lifting_channel_ratio = lifting_channel_ratio
+            self.lifting_channels = int(lifting_channel_ratio * self.hidden_channels)
 
-        self.projection_channel_ratio = projection_channel_ratio
-        self.projection_channels = int(projection_channel_ratio * self.hidden_channels)
+            self.projection_channel_ratio = projection_channel_ratio
+            self.projection_channels = int(projection_channel_ratio * self.hidden_channels)
 
         self.non_linearity = non_linearity
         self.rank = rank
@@ -371,15 +372,14 @@ class FNO(BaseModel, name="FNO"):
             if self.complex_data:
                 self.projection = ComplexValued(self.projection)
 
-    def addSkips(self, skips: Union[List[SkipLike], Dict[int, SkipLike]]):
-        self.fno_blocks.addSkips(skips)
-
     def get_run_function(self, block_idx):
         def get_block(*inputs):
-            return self.fno_blocks(inputs[0], inputs[1], block_idx, output_shape=inputs[2])
+            return self.fno_blocks(inputs[0], block_idx, inputs[1], inputs[2], output_shape=inputs[2])
         return get_block
 
-    def forward(self, x, skips: Dict[int, torch.Tensor], output_shape=None, **kwargs):
+    def forward(self, x, skips: Dict[int, Union[torch.Tensor, TensorDict]], 
+                skip_handlers: Dict[Tuple[int, int, int, str], SkipLike] = None, 
+                output_shape=None, **kwargs):
         """FNO's forward pass
 
         1. Applies optional positional encoding
@@ -434,9 +434,9 @@ class FNO(BaseModel, name="FNO"):
         # print(f'FNO BLOCK INPUT: {x.shape}')
         for layer_idx in range(self.n_layers):
             if self._checkpointing:
-                x, skips = checkpoint(self.get_run_function(layer_idx), x, skips, output_shape[layer_idx])
+                x, skips = checkpoint(self.get_run_function(layer_idx), x, skips, skip_handlers, output_shape[layer_idx])
             else:
-                x, skips = self.fno_blocks(x, layer_idx, skips, output_shape=output_shape[layer_idx])
+                x, skips = self.fno_blocks(x, layer_idx, skips, skip_handlers, output_shape=output_shape[layer_idx])
 
         if not self._disable_lifting_and_projection:
             if self.domain_padding is not None:

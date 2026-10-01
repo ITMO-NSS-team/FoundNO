@@ -1,25 +1,21 @@
 import warnings
 import inspect
 
-from typing import Tuple, Any, Callable, Literal, Final, List
+from typing import Tuple, Any, Callable, Literal, Final, List, Union
 from types import BuiltinFunctionType
 from functools import singledispatch
 
 import numpy as np
 
 import torch
+from tensordict import TensorDict
 
 def checkSkipRequirements(core: torch.nn.Module) -> bool:
     try:
         sgn = inspect.signature(core.__class__.forward)
-        # sgn.parameters.
     except AttributeError:
         warnings.warn(f'Alert of unexpected behavior! Core of type {type(core)} for some reason misses .forward method!')
         return False
-
-# class GenericSkip(torch.nn.Module):
-#     def __init__(self, layer_from: int, layer_to: int):
-#         super().__init__()
 
 SKIP_MAX = 1e3
 ALL_IDS = list(np.arange(SKIP_MAX))
@@ -36,7 +32,7 @@ class SkipLike(torch.nn.Module):
         self._channels = channels
 
         cur_availible = np.setdiff1d(ALL_IDS, USED_IDS)
-        self._ID      = np.random.choice(cur_availible)
+        self._ID      = int(np.random.choice(cur_availible))
 
     @property
     def origin(self) -> int:
@@ -46,23 +42,26 @@ class SkipLike(torch.nn.Module):
     def target(self) -> Tuple[int, str]:
         return (self._to, self._mode)
 
-    def __hash__(self):
-        return (self._ID, self._from, self._to) # super().__hash__()
+    def info(self):
+        return (self._ID, self._from, self._to, self._mode) # super().__hash__()
 
-def generateDefaultFiLMMapping(scalars_num: int,
+    def __hash__(self):
+        return hash(self.info())
+
+    def forward(self, F: torch.Tensor, x: Union[torch.Tensor, TensorDict], output_shape: Tuple[int] = None) -> torch.Tensor:
+        return F
+
+def generateDefaultFiLMMapping(input_channels: Union[Tuple[int], List[int]],
                                output_channels: int, 
                                num_layers: int = 1,
-                               layers_widths: List[int] = [10,],
-                               activation = torch.nn.GELU,
-                               channels: List[int] = None):
-    if channels is None:
-        raise RuntimeError('FiLMs must be associated with specific channels, that will be omitted from data!')
-        # channels = []
+                               layers_widths: Union[int, List[int]] = 10,
+                               activation = torch.nn.GELU):
+    if isinstance(layers_widths, int): # 'layers_widths must be passed as a list'
+        layers_widths = [layers_widths,] * num_layers 
+    else:
+        assert len(layers_widths) == num_layers, 'length of layers_widths must be equal to the num_layers value'
 
-    assert isinstance(layers_widths, list), 'layers_widths must be passed as a list'
-    assert len(layers_widths) == num_layers, 'length of layers_widths must be equal to the num_layers value'
-
-    layers_widths.insert(0, scalars_num)
+    layers_widths.insert(0, len(input_channels))
     layers = []
     for i in range(num_layers):
         layers.append(torch.nn.Linear(layers_widths[i], layers_widths[i+1]))
@@ -87,7 +86,11 @@ class FiLM(SkipLike):
         self.gamma = mappings[0] 
         self.beta  = mappings[1]
 
-    def forward(self, F: torch.Tensor, x: torch.Tensor, output_shape: Tuple[int] = None):
+    def forward(self, F: torch.Tensor, x: Union[torch.Tensor, TensorDict], output_shape: Tuple[int] = None):
+        if isinstance(x, TensorDict):
+            x = torch.concat([value for key, value in x.items() if int(key) in self._channels], dim = 1)
+            assert x.shape[1] == len(self._channels), 'Mismatch in tensordict, passed in SkipLike.' # len(x.keys())
+
         gamma_val, beta_val = self.gamma(x), self.beta(x)
 
         # gamma_val & beta_val shapes: [B, C_{hidden}] + [1,] * (spatial_dim + time) as films are constant across the domain. 
@@ -96,8 +99,8 @@ class FiLM(SkipLike):
             gamma_val = gamma_val.unsqueeze(-1)
             beta_val  = beta_val.unsqueeze(-1)
 
-        gamma_val = gamma_val.view_as(F)
-        beta_val  = beta_val.view_as(F)
+        gamma_val = gamma_val.expand(*[-1, -1] + [F.shape[-idx] for idx in range(ax_diff, 0, -1)])
+        beta_val  = beta_val.expand(*[-1, -1] + [F.shape[-idx] for idx in range(ax_diff, 0, -1)])
 
         F = gamma_val * F + beta_val
         if output_shape is not None:
@@ -107,7 +110,8 @@ class FiLM(SkipLike):
 
 
 class StandardSkip(SkipLike):
-    def __init__(self, mapping: torch.nn.Module, skip_from: int, skip_to: Tuple[int, int], mode: Literal['i', 'a'],
+    def __init__(self, mapping: Union[torch.nn.Module, List[torch.nn.Module]],
+                 skip_from: int, skip_to: Tuple[int, int], mode: Literal['i', 'a'],
                  channels: Tuple[int], combinator: Callable = torch.add, combinator_args: tuple = None,
                  combinator_kwargs: dict = None) -> None:
         super().__init__(skip_from, skip_to, mode, channels)
@@ -125,11 +129,34 @@ class StandardSkip(SkipLike):
                                 combinator_args = self._combinator_args,
                                 combinator_kwargs = self._combinator_kwargs)
 
-        self._mapping = mapping
+        if isinstance(mapping, torch.nn.Module):
+            self._mapping = mapping
+        else:
+            self._mapping = torch.nn.Sequential(*mapping)
+
         self._combinator = combinator
 
-    def forward(self, F: torch.Tensor, x: torch.Tensor, output_shape: Tuple[int] = None) -> torch.Tensor:
+    def forward(self, F: torch.Tensor, x: Union[torch.Tensor, TensorDict], output_shape: Tuple[int] = None) -> torch.Tensor:
+        if isinstance(x, TensorDict):
+            x = torch.concat([value for key, value in x.items() if int(key) in self._channels], dim = 1)
+            assert x.shape[1] == len(self._channels), 'Mismatch in tensordict, passed in SkipLike' # len(x.keys())
+
+        time_axis_dropped = False
+        if isinstance(self._mapping, torch.nn.Conv2d) and x.ndim == 5:
+            t_steps = x.shape[2]
+            x = x[:, :, 0, :, :]
+            time_axis_dropped = True
+        elif isinstance(self._mapping, torch.nn.Conv3d) and x.ndim == 6:
+            t_steps = x.shape[2]
+            x = x[:, :, 0, :, :, :]
+            time_axis_dropped = True
+        else:
+            print(f'No need to alter dims.: {self._mapping}: {isinstance(self._mapping, torch.nn.Conv2d)}, {x.ndim}')
+
         x = self._mapping(x)
+        if time_axis_dropped:
+            x = x.unsqueeze(2).repeat([1, 1, t_steps,] + [1]*(F.ndim - 3))
+
         ax_diff = F.dim() - x.dim()
         for _ in range(ax_diff):
             x = x.unsqueeze(-1)
@@ -145,90 +172,6 @@ class StandardSkip(SkipLike):
         assert inspect.isfunction(combinator) or isinstance(combinator, BuiltinFunctionType), \
             f'Combinator in skip is {type(combinator)}, while expected a function or builtin_function_or_method.'
 
-
-NAMED_SKIP_MAPS: Final = ('skip', 'dno') # TODO: unet, cno
-# SKIPS_TYPES = Literal[NAMED_SKIP_MAPS]
-
-def generateDNOSkips(model: torch.nn.Module, **kwargs) -> List[SkipLike]:
-    from muno.layers.embeddings import GridEmbeddingND
-    assert 'grid_channels' in kwargs.keys(), 'generateDNOskip requires explicitly set geometry channels'
-
-    skips = []
-    try:
-        model.n_layers
-    except AttributeError:
-        raise RuntimeError(f'Incorrect model loaded into DNO skip generator: expected something like FNO, instead got {type(model)}')
-
-    for i in range(model.n_layers):
-        skips.append(StandardSkip(torch.nn.Identity, -2, i, mode = 'i', channels = kwargs['grid_channels'], ))
-
-    common_embedding = GridEmbeddingND()
-    for i in range(model.n_layers):
-        skips.append(StandardSkip(common_embedding, -2, i, mode = 'i', channels = kwargs['grid_channels'], ))
-
-    return skips
-
-def generateFiLMSkips(model: torch.nn.Module, **kwargs):
-    film_scalar_inputs = kwargs.get('scalar_inputs', ())
-
-    assert isinstance(film_scalar_inputs, tuple) and all([isinstance(inp_idx, int) for inp_idx in film_scalar_inputs]), \
-        f'Argument film_scalar_inputs have to be passed as a tuple of integers, instead got {type(film_scalar_inputs)}'
-    
-    if len(film_scalar_inputs) == 0:
-        warnings.warn('FiLM inputs have not been initialized due to absence of arguments.')
-        return []
-
-    try:
-        model.n_layers
-    except AttributeError:
-        raise RuntimeError(f'Incorrect model loaded into DNO skip generator: expected something like FNO, instead got {type(model)}')
-
-    skips = []
-    film_gen_func   = kwargs.get('film_gen_func', generateDefaultFiLMMapping)
-    film_gen_kwargs = kwargs.get('film_gen_kwargs', generateDefaultFiLMMapping)
-
-    REQUIRED_FILM_ARGS = ['scalars_num', 'num_layers', 'layers_widths']  # 'output_channels', 
-    # Do not mistake num_layers and layers_widths of the FiLM mapping with neural operators'
-    # 'output_channels' are expected to be parsed from the model's layer  
-    
-    assert isinstance(film_gen_kwargs, dict), \
-        f'Mandatory film_gen_kwargs argument is not a dict, as it must be, but {type(film_gen_kwargs)}.'
-    assert all([arg in film_gen_kwargs.keys() for arg in REQUIRED_FILM_ARGS]), \
-        f'Required FiLM args are missing: expected {REQUIRED_FILM_ARGS}, instead got {film_gen_kwargs.keys()} keys.'
-
-    def inspectGenFuncArgs(func: Any):
-        sig: inspect.Signature = inspect.signature(func)
-        return all([arg in sig.parameters for arg in REQUIRED_FILM_ARGS])
-
-    assert inspect.isfunction(film_gen_func) and inspectGenFuncArgs(film_gen_func)
-    hidden_channels = model.hidden_channels
-
-    for i in range(model.n_layers):
-        skips.append(FiLM((film_gen_func(scalars_num     = film_gen_kwargs["scalars_num"],
-                                         output_channels = hidden_channels,               # film_gen_kwargs["output_channels"],
-                                         num_layers      = film_gen_kwargs["num_layers"],
-                                         layers_widths   = film_gen_kwargs["layers_widths"]),
-                           film_gen_func(scalars_num     = film_gen_kwargs["scalars_num"],
-                                         output_channels = hidden_channels,               # film_gen_kwargs["output_channels"],
-                                         num_layers      = film_gen_kwargs["num_layers"],
-                                         layers_widths   = film_gen_kwargs["layers_widths"])),
-                          skip_from=-2, skip_to=i))
-    
-
-@singledispatch
-def skipGeneration(pattern, model: torch.nn.Module) -> List[SkipLike]: #  Union[dict, SKIPS_TYPES]
-    raise NotImplementedError(f'Unsupported type of skip patterns: expected dict or str, got {type(pattern)}: {pattern}.')
-
-@singledispatch
-def skipGeneration(pattern: str, model: torch.nn.Module) -> List[SkipLike]:
-    assert pattern in NAMED_SKIP_MAPS, \
-        f'Incorrect type string, expected something from {NAMED_SKIP_MAPS}, instead got {pattern}.'
-    match pattern:
-        case 'skip':
-            return "Success"
-        case _:
-            warnings.warn(f"Incorrect string of pattern: {pattern}")
-            return "Unknown Status"
 
 
 # class SkipGenerator(object):

@@ -1,4 +1,4 @@
-from typing import Tuple, List, Union, Literal, Dict, Any
+from typing import Tuple, List, Union, Literal, Dict, Any, Final
 from types import BuiltinFunctionType
 
 import numpy as np
@@ -19,6 +19,8 @@ from torch.nn.parameter import Parameter
 
 from muno.layers.skips import SkipLike
 from muno.data.benchmarks.multiphysics_loaders import getSkipsChannel
+from muno.layers.embeddings import GridEmbeddingND
+
         
         # sig = inspect.signature(combinator)
         # assert 
@@ -41,9 +43,14 @@ class Muno(nn.Module):
     _empty: bool = True
 
     def __init__(self, liftings: List[torch.nn.Module] = None, core: torch.nn.Module = None,
-                 projections: List[torch.nn.Module] = None, single_model: torch.nn.Module = None) -> None:
+                 projections: List[torch.nn.Module] = None, single_model: torch.nn.Module = None, 
+                 rollover_mode: Literal['autoreg', 'rollout'] = 'autoreg',
+                 autoreg_training_mode: Literal['full', 'rolling_origin'] = 'rolling_origin') -> None:
         assert single_model is None or (liftings is None and core is None and projections is None), \
             'incorrect setting of the Muno model: either single_model or liftings, core and projections have to be None'
+
+        self._rollover_mode: Final = rollover_mode
+        self._training_mode = autoreg_training_mode
 
         super().__init__()
         if single_model is None and core is not None:
@@ -97,11 +104,25 @@ class Muno(nn.Module):
             
             self._skip_handlers.append(skip)
 
+    def setSkips(self, skips: List[Union[List[SkipLike], Dict[Any, SkipLike]]]):
+        assert len(skips) == len(self._liftings), \
+            'Length of passed skips does not match the number of adapteres'
+        if all([isinstance(skip, list) for skip in skips]):
+            self._skip_handlers = [{hash(single_skip): single_skip for single_skip in skip} for skip in skips]
+        elif all([isinstance(skip, dict) for skip in skips]):
+            self._skip_handlers = skips #[list(skip.values()) for skip in skips]
+        else:
+            raise TypeError("Incorrect type of skips passed into Muno.setSkips!")
+
     def to(self, device):
         if not self._single_model:
             for idx, _ in enumerate(self._liftings):
                 self._liftings[idx].to(device=device)
                 self._projections[idx].to(device=device)
+                
+                if len(self._skip_handlers) != 0 and self._skip_handlers[idx] is not None:
+                    for key in self._skip_handlers[idx].keys():
+                        self._skip_handlers[idx][key].to(device)
 
         self._core.to(device=device)
 
@@ -114,6 +135,10 @@ class Muno(nn.Module):
         for proj in self._projections:
             yield from proj.parameters(recurse=recurse)
 
+        for adapter_skips in self._skip_handlers:
+            for skip in adapter_skips:
+                yield from skip.parameters(recurse=recurse)
+
         yield from ()
 
     def named_parameters(self, prefix = '', recurse = True, remove_duplicate = True):
@@ -124,6 +149,10 @@ class Muno(nn.Module):
 
         for proj in self._projections:
             yield from proj.named_parameters(prefix = prefix, recurse = recurse, remove_duplicate = remove_duplicate)
+
+        for adapter_skips in self._skip_handlers:
+            for skip in adapter_skips:
+                yield from skip.named_parameters(prefix = prefix, recurse = recurse, remove_duplicate = remove_duplicate)
 
         yield from ()
 
@@ -153,32 +182,60 @@ class Muno(nn.Module):
             return to_slice, TensorDict({})
         
         remaining_idxs = torch.tensor([idx for idx in list(range(to_slice.shape[axis])) 
-                                       if idx not in cutout_idxs]).to(torch.int32)
+                                        if idx not in cutout_idxs]).to(torch.int32).to(to_slice.device)
 
         def prepareSkipTensor(tensor: torch.Tensor, axis: int, key: int):
             tensor_slice = torch.select(tensor, axis, key).unsqueeze(axis)
             assert tensor_slice.shape[1] == 1, \
                 f'Tensors must represent single channels of the input, instead got {tensor_slice.shape[1]} chan. at once.'
 
-            if all([torch.unique(tensor[traj_idx:traj_idx+1, 0:1, ...]).ndim == 1 for traj_idx in range(tensor_slice.shape[0])]):
+            if all([len(torch.unique(tensor_slice[traj_idx:traj_idx+1, 0:1, ...])) == 1 for traj_idx in range(tensor_slice.shape[0])]):
                 tensor_slice = torch.unique(tensor_slice[:, 0:1, ...]).unsqueeze(axis)
+
             return tensor_slice
 
         with torch.no_grad(): # torch.select(to_slice, axis, key).unsqueeze(axis)
-            skip_args = make_tensordict({str(key): prepareSkipTensor(to_slice, axis, key) for key in cutout_idxs}, 
+            skip_args = make_tensordict({str(key): prepareSkipTensor(to_slice, axis, key) for key in cutout_idxs}, # 
                                         batch_size=[to_slice.shape[0],],
                                         device = to_slice.device)
             to_slice = to_slice.index_select(axis, remaining_idxs)
         
         return to_slice, skip_args
 
+
     @singledispatchmethod
     def forward(self, x, adapter_idx: int = 0, output_shape = None, **kwargs):
         raise NotImplementedError('Default generic singledispatch method is not available.')
 
     @forward.register
+    def _(self, x: dict, adapter_idx: int = None, output_shape = None, **kwargs) -> Dict[int, torch.Tensor]:
+        # Argument x is expected to have forms of Dict[int, torch.Tensor]
+        assert len(x) == len(self._liftings), 'Mismatching adapters and problems in forward inputs.'
+        if adapter_idx is not None:
+            warnings.warn(f"Calling dict-mapped forward desipte having explicitly passed adapter index: {adapter_idx}.")
+        # if len(self._skip_handlers) != 0:
+        #     self._skip_handlers = [None,] * len(self._liftings) 
+
+        return {adapter_idx: self.forward(inp_tensor, adapter_idx = adapter_idx) for adapter_idx, inp_tensor in x.items()}
+
+    @forward.register
     def _(self, x: torch.Tensor, adapter_idx: int = 0, output_shape = None, **kwargs) -> torch.Tensor:
-        if any([-2 == skip_hash[1] for skip_hash in self._skip_handlers[adapter_idx]]):
+        if self._rollover_mode == 'rollout':
+            return self._forward_simple(x, adapter_idx=adapter_idx, output_shape=output_shape, **kwargs)
+        elif self._rollover_mode == 'autoreg':
+            autoreg_training_mode = kwargs.get('autoreg_training_mode', self._training_mode)
+            return self._forward_autoreg(x, adapter_idx=adapter_idx, output_shape=output_shape, 
+                                         autoreg_training_mode = autoreg_training_mode, **kwargs)
+        else:
+            raise RuntimeError(f'Incorrect modes selected for training: {self._mode} and {self._training_mode}')
+
+
+    def _forward_simple(self, x: torch.Tensor, adapter_idx: int = 0, output_shape = None, **kwargs):
+        #  skip_handlers: List[Dict[Tuple[int, int, int, str], SkipLike]] = None,
+        if len(self._skip_handlers) == 0 or self._skip_handlers is None: # len(self._skip_handlers) != 0 and 
+            self._skip_handlers = [{} for _ in self._liftings]
+            
+        if any([-2 == skip.info()[1] for skip in self._skip_handlers[adapter_idx].values()]): # len(self._skip_handlers) != 0 and 
             skips_channels = getSkipsChannel(self._skip_handlers[adapter_idx], lambda x: x.origin == -2)
 
             x, skip_from_init = self.splitChannels(skips_channels, x, axis = 1)
@@ -192,11 +249,27 @@ class Muno(nn.Module):
             raise RuntimeError('Trying to call an unprepared model')
 
         if not self._single_model:
-            x = self._liftings[adapter_idx](x) # add **kwargs processor 
+            if isinstance(self._liftings[adapter_idx], torch.nn.Module):
+                x = self._liftings[adapter_idx](x) # add **kwargs processor 
+                if any([-1 == skip.info()[1] for skip in self._skip_handlers[adapter_idx].values()]):
+                    skip_tensors[-1] = torch.clone(x)    
 
-        if any([-1 == skip_hash[1] for skip_hash in self._skip_handlers]):
-            skip_tensors[-1] = torch.clone(x)
+            elif isinstance(self._liftings[adapter_idx], (list, tuple)):
+                assert len(self._liftings[adapter_idx], 2), 'Liftings must be no more, than 2 sequential models.'
+                x = self._liftings[adapter_idx][0](x)
 
+                if isinstance(self._liftings[adapter_idx][0], GridEmbeddingND): # Hardcoded DNO block
+                    if any([-1 == skip.info()[1] for skip in self._skip_handlers[adapter_idx].values()]):
+                        grid = self._liftings[adapter_idx][0].grids[None, :, None, ...]
+                        expanding_shape = [-1] * x.ndim
+                        expanding_shape[0] = x.shape[0] # to match the batches
+                        expanding_shape[2] = x.shape[2]
+
+                        grid = grid.expand(*expanding_shape)
+                        skip_tensors[-1] = torch.clone(grid)
+                
+
+        # print(f'skip_tensors: {skip_tensors}')
         x = self._core(x, skip_tensors, self._skip_handlers[adapter_idx])
 
         if not self._single_model:
@@ -204,32 +277,62 @@ class Muno(nn.Module):
 
         return x
 
-    @forward.register
-    def _(self, x: tuple, adapter_idx: int = 0, output_shape = None, **kwargs) -> torch.Tensor:
-        # Argument x is expected to have forms of Tuple[torch.Tensor]
-        if output_shape is not None:
-            raise NotImplementedError('Unexpected behavior, output shape has to be None')
-        if self._empty or not self._adapters_set:
-            raise RuntimeError('Trying to call an unprepared model')
+    def _forward_autoreg(self, x: torch.Tensor, adapter_idx: int = 0, output_shape = None, **kwargs):
+        assert 'autoreg_training_mode' in kwargs.keys(), \
+             'autoreg_training_mode needs to be explicitly set for _forward_autoreg' # self._training_mode
 
-        if not self._single_model:
-            x[0] = self._liftings[adapter_idx](x[0]) # add **kwargs processor 
+        # _training_mode =
+        t_max = kwargs.get('t_max', x.shape[2])
+        t_step = kwargs.get('t_step', 1./x.shape[2])
 
-        x[0] = self._core(x[0])
+        if len(self._skip_handlers) != 0 and self._skip_handlers is None:
+            self._skip_handlers = [{} for _ in self._liftings]
+        if len(self._skip_handlers) != 0 and any([-2 == skip.info()[1] for skip in self._skip_handlers[adapter_idx].values()]):
+            skips_channels = getSkipsChannel(self._skip_handlers[adapter_idx], lambda x: x.origin == -2)
+        else:
+            skips_channels = set()
 
-        if not self._single_model:
-            x[0] = self._projections[adapter_idx](x[0]) # add **kwargs processor 
+        modelled_channels = tuple([i for i in range(x.shape[1]) if i not in skips_channels])
+        with torch.no_grad():        
+            pred = x[:, modelled_channels, 0:1, ...].repeat(*[1, 1, t_max] + [1,]*(x.ndim-3))
 
-        return x[0]
+        for t_idx in range(1, t_max): # Asserting, that we need to start from idx 0, may be subject to change
+            if kwargs["autoreg_training_mode"] == 'rolling_origin':
+                pred[:, :, t_idx:t_idx+1, ...] = x[:, modelled_channels, t_idx-1:t_idx, ...] + \
+                                                 t_step * self._forward_simple(x[:, :, t_idx-1:t_idx, ...],
+                                                                               adapter_idx=adapter_idx,
+                                                                               output_shape=output_shape,
+                                                                               **kwargs)
 
-    @forward.register
-    def _(self, x: dict, adapter_idx: int = None, output_shape = None, **kwargs) -> Dict[int, torch.Tensor]:
-        # Argument x is expected to have forms of Dict[int, torch.Tensor]
-        assert len(x) == len(self._liftings), 'Mismatching adapters and problems in forward inputs.'
-        if adapter_idx is not None:
-            warnings.warn(f"Calling dict-mapped forward desipte having explicitly passed adapter index: {adapter_idx}.")
+            elif kwargs["autoreg_training_mode"] == 'full':
+                with torch.no_grad():
+                    x_modified = x[:, :, t_idx-1:t_idx, ...]
+                    # replacing modelled channels, leaving forcings, and other features
+                    x_modified[:, modelled_channels, ...] = pred[:, :, t_idx-1:t_idx, ...] 
 
-        return {adapter_idx: self.forward(inp_tensor, adapter_idx = adapter_idx) for adapter_idx, inp_tensor in x.items()}
+                pred[:, :, t_idx:t_idx+1, ...] = pred[:, :, t_idx-1:t_idx] + t_step * self._forward_simple(x_modified,
+                                                                                                           adapter_idx=adapter_idx,
+                                                                                                           output_shape=output_shape,
+                                                                                                           **kwargs)                
+            else:
+                raise RuntimeError("kwargs['autoreg_training_mode'] argument is missing from _forward_autoreg")
+
+        return pred
+
+
+    # def _forward_autoreg_full(self, x: torch.Tensor, adapter_idx: int = 0, output_shape = None, **kwargs):
+    #     pass
+                # with torch.no_grad():
+                #     x_modified = x[:, :, t_idx-1:t_idx, ...]
+                #     prev_pred = x[:, modelled_channels, t_idx-1:t_idx, ...]
+                # pred[:, :, t_idx:t_idx+1, ...] = prev_pred + t_step * self._forward_simple(x_modified,
+                #                                                                            adapter_idx=adapter_idx,
+                #                                                                            output_shape=output_shape,
+                #                                                                            **kwargs)
+
+                # with torch.no_grad():
+                #     x_modified = x[:, :, t_idx-1:t_idx, ...]
+                #     prev_pred = x[:, modelled_channels, t_idx-1:t_idx, ...]    
 
     @classmethod
     def load(cls, model_path: Union[str, Tuple[Union[None, str, Tuple[str]]]], _SAVE_LOAD_PARAMS: dict = {}):

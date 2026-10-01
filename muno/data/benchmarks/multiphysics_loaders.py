@@ -65,9 +65,9 @@ class EqIndexDataset(Dataset):
 
 def build_multitask_datasets(task_configs, seed=None):
     train_datasets = []
-    val_datasets = []
-    test_datasets = []
-    task_metadata = []
+    val_datasets   = []
+    test_datasets  = []
+    task_metadata  = []
 
     for eq_idx, task_config in enumerate(task_configs):
         task_name = task_config.get("name", f"task_{eq_idx}")
@@ -192,204 +192,55 @@ def build_multitask_loaders(task_configs, seed=None):
     return train_loader, val_loader, test_loader, task_metadata
 
 
-# def build_multitask_loaders_old(task_configs, seed=None):
-#     train_loaders = []
-#     val_loaders = []
-#     test_loaders = []
-#     task_metadata = []
-#
-#     for eq_idx, task_config in enumerate(task_configs):
-#         task_name = task_config.get("name", f"task_{eq_idx}")
-#
-#         print(f"\n[{task_name}]")
-#         print(f"  eq_idx: {eq_idx}")
-#
-#         source = build_source(task_config["source"])
-#         adapter = build_adapter(task_config["adapter"])
-#
-#         source_length = len(source)
-#         selected_trajectory_count = source_length
-#
-#         if "trajectory_selection" in task_config:
-#             trajectory_indices = resolve_trajectory_indices(
-#                 source,
-#                 task_config.get("trajectory_selection"),
-#             )
-#             selected_trajectory_count = len(trajectory_indices)
-#             split = resolve_index_split(
-#                 trajectory_indices,
-#                 task_config["split"],
-#                 task_config.get("max_samples_per_split"),
-#             )
-#             train_dataset, val_dataset, test_dataset = build_indexed_datasets(
-#                 source,
-#                 adapter,
-#                 split,
-#             )
-#         else:
-#             split = resolve_split(
-#                 source,
-#                 task_config["split"],
-#                 task_config.get("max_samples_per_split"),
-#             )
-#             train_dataset, val_dataset, test_dataset = build_datasets(
-#                 source,
-#                 adapter,
-#                 split,
-#             )
-#
-#         train_dataset = EqIndexDataset(train_dataset, eq_idx)
-#         val_dataset = EqIndexDataset(val_dataset, eq_idx)
-#         test_dataset = EqIndexDataset(test_dataset, eq_idx)
-#
-#         loader_seed = None if seed is None else int(seed) + eq_idx
-#
-#         train_loader, val_loader, test_loader = build_loaders(
-#             train_dataset,
-#             val_dataset,
-#             test_dataset,
-#             task_config["loaders"],
-#             seed=loader_seed
-#         )
-#
-#         first_batch = next(iter(train_loader))
-#
-#         print(f"  train batch x: {tuple(first_batch['x'].shape)}")
-#         print(f"  train batch y: {tuple(first_batch['y'].shape)}")
-#         print(f"  benchmark_name: {first_batch['benchmark_name'][0]}")
-#         print(f"  physics_name: {first_batch['physics_name'][0]}")
-#         print(f"  trajectories_full: {source_length}")
-#         print(f"  trajectories_selection: {task_config.get('trajectory_selection')}")
-#         print(f"  selected_trajectory_count: {selected_trajectory_count}")
-#
-#         train_loaders.append(train_loader)
-#         val_loaders.append(val_loader)
-#         test_loaders.append(test_loader)
-#
-#         task_metadata.append({
-#             "eq_idx": eq_idx,
-#             "name": task_config.get("name", f"task_{eq_idx}"),
-#             "source": task_config["source"],
-#             "adapter": task_config["adapter"],
-#             "trajectory_selection": task_config.get("trajectory_selection"),
-#             "source_length": source_length,
-#             "selected_trajectory_count": selected_trajectory_count,
-#             "dataset_lengths": {
-#                 "train": len(train_dataset),
-#                 "val": len(val_dataset),
-#                 "test": len(test_dataset),
-#             },
-#         })
-#
-#     return train_loaders, val_loaders, test_loaders, task_metadata
-
-
-# def get_loader_channels(loader):
+# def get_loader_channels(loader, skips=None):
 #     batch = next(iter(loader))
-#     return batch["x"].shape[1], batch["y"].shape[1]
+#     print([key for key in batch.keys()])
+
+#     in_channels = batch["x"].shape[1]
+
+#     if skips:
+#         in_channels = filterChannelsBySkips(batch["x"], skips)
+
+#     return in_channels, batch["y"].shape[1]
 
 
-def get_loader_channels(loader, skips=None):
-    batch = next(iter(loader))
-    in_channels = batch["x"].shape[1]
-
-    if skips:
-        in_channels = filterChannelsBySkips(batch["x"], skips)
-
-    return in_channels, batch["y"].shape[1]
-
-
-def getSkipsChannel(skips: Dict[int, SkipLike], condition: Callable[[SkipLike, ], bool] = None) -> Set[int]:
+def getSkipsChannel(skips: Dict[int, SkipLike] = None, condition: Callable[[SkipLike,], bool] = None) -> Set[int]:
+    if skips is None:
+        return set()
+    
     if condition is None:
-        condition = lambda x: True  # lambda x: x.origin == -2
+        condition = lambda x: True # lambda x: x.origin == -2
 
     skipped_channels = set()
     for skip in skips.values():
         if condition(skip):
-            skipped_channels = skipped_channels | set(skip.channels)
+            skipped_channels = skipped_channels | set(skip._channels)
 
     return skipped_channels
 
-
-def filterChannelsBySkips(batch: torch.Tensor, skips: Dict[int, SkipLike]) -> int:
+def filterChannelsBySkips(batch: torch.Tensor, skips: Dict[int, SkipLike] = None) -> int:
     dim = batch.shape[1]
     skipped_channels = getSkipsChannel(skips, lambda x: x.origin == -2)
 
     return dim - len(skipped_channels)
 
-
-# @singledispatch
-# def get_loaders_channels(loaders):
-#     raise NotImplementedError('Calling get_loaders_channels of a default unimplemented type.')
-#
-#
-# @get_loaders_channels.register
-# def _(loaders: list, skips: List[Dict[int, SkipLike]]) -> List[List[Tuple[int, int]]]:
-#     warnings.warn("Calling legacy implementation of get_loaders_channels, unexpected behavior.")
-#
-#     assert all(
-#         [isinstance(loader, DataLoader) for loader in loaders]), 'Loaders have to be a list of DataLoader objects.'
-#     return [get_loader_channels(loader, skips[idx]) for idx, loader in enumerate(loaders)]
-#
-#
-# @get_loaders_channels.register
-# def _(loaders: DataLoader, skips: Dict[int, SkipLike]) -> List[Tuple[int, int]]:
-#     batch = next(iter(loaders))
-#     assert isinstance(batch, dict), \
-#         'loader has to return a dict with keys - multiphysics problems idx, values - dicts {"x": torch.Tensor, "y": ...}.'
-#
-#     return [(filterChannelsBySkips(subbatch["x"], skips), subbatch["y"].shape[1]) for subbatch in batch.values()]
-
-
-# TODO: Revisit skip-connection support here.
-# This compatibility path was added only to keep channel inference working
-# while testing unrelated extra-channel functionality.
-
 @singledispatch
-def get_loaders_channels(loaders):
-    raise NotImplementedError('Calling get_loaders_channels of a default unimplemented type.')
+def getLoadersChannels(loaders):
+    raise NotImplementedError('Calling getLoadersChannels of a default unimplemented type.')
 
+@getLoadersChannels.register
+def _(loaders: list, skips: List[Dict[int, SkipLike]] = None) -> List[List[Tuple[int, int]]]:
+    warnings.warn("Calling legacy implementation of getLoadersChannels, unexpected behavior.")
 
-@get_loaders_channels.register
-def _(loaders: list, skips=None) -> List[Tuple[int, int]]:
-    warnings.warn("Calling legacy implementation of get_loaders_channels, unexpected behavior.")
-
-    assert all(
-        [isinstance(loader, DataLoader) for loader in loaders]
-    ), 'Loaders have to be a list of DataLoader objects.'
-
+    assert all([isinstance(loader, DataLoader) for loader in loaders]), 'Loaders have to be a list of DataLoader objects.'
     if skips is None:
-        skips = [None] * len(loaders)
-    elif isinstance(skips, dict):
-        skips = [skips] * len(loaders)
-    elif len(skips) != len(loaders):
-        raise ValueError(
-            f"Number of skips configs ({len(skips)}) does not match "
-            f"number of loaders ({len(loaders)})."
-        )
+        skips = [None,] * len(loaders)
+    return [getLoadersChannels(loader, skips[idx]) for idx, loader in enumerate(loaders)]
 
-    return [get_loader_channels(loader, skips[idx]) for idx, loader in enumerate(loaders)]
-
-
-@get_loaders_channels.register
-def _(loaders: DataLoader, skips=None) -> List[Tuple[int, int]]:
+@getLoadersChannels.register
+def _(loaders: DataLoader, skips: Dict[int, SkipLike] = None) -> List[Tuple[int, int]]:
     batch = next(iter(loaders))
-    assert isinstance(batch, dict), (
-        'loader has to return a dict with keys - multiphysics problems idx, '
-        'values - dicts {"x": torch.Tensor, "y": ...}.'
-    )
+    assert isinstance(batch, dict), \
+        'loader has to return a dict with keys - multiphysics problems idx, values - dicts {"x": torch.Tensor, "y": ...}.'
 
-    if "x" in batch and "y" in batch:
-        in_channels = batch["x"].shape[1]
-        if skips:
-            in_channels = filterChannelsBySkips(batch["x"], skips)
-        return [(in_channels, batch["y"].shape[1])]
-
-    channels = []
-    for subbatch in batch.values():
-        in_channels = subbatch["x"].shape[1]
-        if skips:
-            in_channels = filterChannelsBySkips(subbatch["x"], skips)
-        channels.append((in_channels, subbatch["y"].shape[1]))
-
-    return channels
+    return [(filterChannelsBySkips(subbatch["x"], skips), subbatch["y"].shape[1]) for subbatch in batch.values()]

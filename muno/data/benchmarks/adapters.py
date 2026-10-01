@@ -1,5 +1,6 @@
 import torch
 
+
 SPATIAL_AXIS_NAMES = ("X", "Y", "Z", "H", "W")
 
 
@@ -116,15 +117,15 @@ def _coordinate_channel_like(tensor, axis, has_time_axis=True,
 
 class IndexAdapter:
     def __init__(
-            self,
-            input_indices,
-            output_indices,
-            variable_name=None,
-            data_order="CHW",
-            benchmark_name=None,
-            physics_name=None,
-            metadata=None,
-            ensure_2d=False,
+        self,
+        input_indices,
+        output_indices,
+        variable_name=None,
+        data_order="CHW",
+        benchmark_name=None,
+        physics_name=None,
+        metadata=None,
+        ensure_2d=False,
     ):
         self.input_indices = input_indices
         self.output_indices = output_indices
@@ -154,24 +155,24 @@ class IndexAdapter:
 
 class TemporalAdapter:
     def __init__(
-            self,
-            variable_name=None,
-            variable_names=None,
-            data_order="TCHW",
-            temporal_mode="window",
-            input_time_indices=None,
-            output_time_indices=None,
-            window_start_indices=None,
-            input_time_index=0,
-            input_channel_indices=None,
-            output_channel_indices=None,
-            static_inputs=None,
-            benchmark_name=None,
-            physics_name=None,
-            metadata=None,
-            ensure_2d=False,
-            flatten_time_to_channels=True,
-            extra_channels=None,
+        self,
+        variable_name=None,
+        variable_names=None,
+        data_order="TCHW",
+        temporal_mode="window",
+        input_time_indices=None,
+        output_time_indices=None,
+        window_start_indices=None,
+        input_time_index=0,
+        input_channel_indices=None,
+        output_channel_indices=None,
+        static_inputs=None,
+        benchmark_name=None,
+        physics_name=None,
+        metadata=None,
+        ensure_2d=False,
+        flatten_time_to_channels=True,
+        extra_channels=None,
     ):
         self.variable_name = variable_name
         self.variable_names = variable_names
@@ -384,15 +385,15 @@ class TemporalAdapter:
 
 class InputOutputAdapter:
     def __init__(
-            self,
-            input_variable_name,
-            output_variable_name,
-            input_order="CHW",
-            output_order="CHW",
-            benchmark_name=None,
-            physics_name=None,
-            metadata=None,
-            ensure_2d=False,
+        self,
+        input_variable_name,
+        output_variable_name,
+        input_order="CHW",
+        output_order="CHW",
+        benchmark_name=None,
+        physics_name=None,
+        metadata=None,
+        ensure_2d=False,
     ):
         self.input_variable_name = input_variable_name
         self.output_variable_name = output_variable_name

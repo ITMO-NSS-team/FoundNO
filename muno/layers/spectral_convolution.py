@@ -1,6 +1,6 @@
 from typing import List, Optional, Tuple, Union
 
-from ..utils import validate_scaling_factor
+from neuralop.utils import validate_scaling_factor
 
 import torch
 from torch import nn
@@ -9,9 +9,9 @@ import tensorly as tl
 from tensorly.plugins import use_opt_einsum
 from tltorch.factorized_tensors.core import FactorizedTensor
 
-from .einsum_utils import einsum_complexhalf
-from .base_spectral_conv import BaseSpectralConv
-from .resample import resample
+from neuralop.layers.einsum_utils import einsum_complexhalf
+from neuralop.layers.base_spectral_conv import BaseSpectralConv
+from neuralop.layers.resample import resample
 
 tl.set_backend("pytorch")
 use_opt_einsum("optimal")

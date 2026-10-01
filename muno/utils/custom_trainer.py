@@ -594,16 +594,18 @@ class Trainer(object):
                 if isinstance(training_loss, list):
                     loss = reduce(torch.add, [reduce(torch.add, 
                                                      [loss_func(out[bkey], sample[bkey]["y"], mask[bkey]) for loss_func in training_loss]) 
-                                  for bkey in sample.keys()])
+                                  for bkey in sample.keys()]) / len(sample.keys())
                 else:
-                    loss = reduce(torch.add, [training_loss(out[bkey], sample[bkey]["y"], mask[bkey]) for bkey in sample.keys()]) 
+                    loss = reduce(torch.add, [training_loss(out[bkey], sample[bkey]["y"], mask[bkey]) for bkey in sample.keys()])/\
+                        len(sample.keys())
         else:
             if isinstance(training_loss, list):
                 loss = reduce(torch.add, [reduce(torch.add,
-                                                 [loss_func(out[bkey], sample[bkey]["y"], mask[bkey]) for loss_func in training_loss]) 
-                              for bkey in sample.keys()])
+                                                 [loss_func(out[bkey], sample[bkey]["y"], mask[bkey]) for loss_func in training_loss])\
+                              for bkey in sample.keys()]) / len(sample.keys())
             else:
-                loss = reduce(torch.add, [training_loss(out[bkey], sample[bkey]["y"], mask[bkey]) for bkey in sample.keys()]) 
+                loss = reduce(torch.add, [training_loss(out[bkey], sample[bkey]["y"], mask[bkey]) for bkey in sample.keys()])/\
+                    len(sample.keys())
 
         return loss
 

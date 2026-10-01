@@ -3,21 +3,28 @@ import inspect
 
 import glob
 import dill
+from functools import singledispatch
 
 from pathlib import Path
 import warnings
 
-from typing import Union, List
+from typing import Union, List, Final, Any
 
 import torch
 
 from neuralop.layers.channel_mlp import ChannelMLP
-from neuralop.layers.spectral_convolution import SpectralConv
-from neuralop.models import UNO, FNO
+# from neuralop.layers.spectral_convolution import SpectralConv
+from muno.layers.spectral_convolution import SpectralConv
+from neuralop.models import UNO #, FNO
 
 from muno.utils.training_utils import validateOperator
 
+from muno.layers.skips import SkipLike, StandardSkip, FiLM, generateDefaultFiLMMapping
 from muno.layers.channel_wise_conv import FactorizedDimensionSpectralConv
+from muno.layers.embeddings import GridEmbeddingND
+from muno.models.muno import Muno
+from muno.models.fno import FNO
+from muno.models.cno import CFNO
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -106,7 +113,7 @@ MODEL_REGISTRY = {
         "model": [_post_lift_mamba_lifting, FNO, ChannelMLP],
         "params": [
             {
-                "width": 20,
+                "width": 32,
                 "use_mamba_kwargs": None,
                 "mamba_fallback_kernel": 9,
                 "padding": 0,
@@ -114,20 +121,50 @@ MODEL_REGISTRY = {
                 "non_linearity": torch.nn.functional.gelu,
             },
             {
-                "hidden_channels": 20,
+                "hidden_channels": 32,
                 "n_layers": 4,
-                "n_modes": {"t": 10, "x": 32}, # [10, 40, 40],
+                "n_modes": {"t": 1, "x": 32}, # [10, 40, 40],
                 "disable_lifting_and_projection": True,
-                "conv_module": FactorizedDimensionSpectralConv
+                "conv_module": SpectralConv # FactorizedDimensionSpectralConv # SpectralConv # 
             }, 
             {
-                "hidden_channels": 20,
+                "hidden_channels": 32,
                 "n_layers": 2,
                 "n_dim": 3,
                 "non_linearity": torch.nn.functional.gelu,
             },
         ],
     },
+    "adapted_cfno": {
+        "kind": "adapter_core_adapter",
+        "model": [_post_lift_mamba_lifting, CFNO, ChannelMLP],
+        "params": [
+            {
+                "width": 80,
+                "use_mamba_kwargs": None,
+                "mamba_fallback_kernel": 9,
+                "padding": 0,
+                "n_dim": 3,
+                "non_linearity": torch.nn.functional.gelu,
+            },
+            {
+                "hidden_channels": 80,
+                "n_layers": 4,
+                "n_modes": {"t": 10, "x": 32}, # [10, 40, 40],
+                "disable_lifting_and_projection": True,
+                "local_branch": "parallel",
+                "diff_kernels": "parallel",
+                "arch": "temporal",
+                "conv_module": SpectralConv
+            }, 
+            {
+                "hidden_channels": 80,
+                "n_layers": 2,
+                "n_dim": 3,
+                "non_linearity": torch.nn.functional.gelu,
+            },
+        ],
+    },    
     "adapted_fno_no_mamba": {
         "kind": "adapter_core_adapter",
         "model": [ChannelMLP, FNO, ChannelMLP],
@@ -143,7 +180,7 @@ MODEL_REGISTRY = {
                 "n_layers": 4,
                 "n_modes": {"t": 10, "x": 32}, # [20, 42, 42],
                 "disable_lifting_and_projection": True,
-                "conv_module": FactorizedDimensionSpectralConv
+                "conv_module": SpectralConv # FactorizedDimensionSpectralConv # SpectralConv # 
             },
             {
                 "hidden_channels": 32,
@@ -153,6 +190,31 @@ MODEL_REGISTRY = {
             },
         ],
     },
+    "dno": {
+        "kind": "adapter_core_adapter",
+        "model": [ChannelMLP, FNO, ChannelMLP],
+        "params": [
+            {
+                "hidden_channels": 32,
+                "n_layers": 2,
+                "n_dim": 3,
+                "non_linearity": torch.nn.functional.gelu,
+            },
+            {
+                "hidden_channels": 32,
+                "n_layers": 4,
+                "n_modes": {"t": 10, "x": 32}, # [20, 42, 42],
+                "disable_lifting_and_projection": True,
+                "conv_module": SpectralConv # FactorizedDimensionSpectralConv
+            },
+            {
+                "hidden_channels": 32,
+                "n_layers": 2,
+                "n_dim": 3,
+                "non_linearity": torch.nn.functional.gelu,
+            },
+        ],
+    },    
 }
 
 
@@ -265,7 +327,7 @@ def load_from_dir(dir: str, SAVE_LOAD_ARGS = None):
     return [torch.load(file, pickle_module=dill, **SAVE_LOAD_ARGS) for file in files]
    
 
-def build_model(loader_channels, model_config,
+def build_model(loader_channels, model_config, 
                 pretr_core: torch.nn.Module = None,
                 pretr_liftings: List[torch.nn.Module] = None,
                 pretr_projections: List[torch.nn.Module] = None):
@@ -285,7 +347,11 @@ def build_model(loader_channels, model_config,
         params = _filter_init_params(model_cls, resolved["params"])
         validateOperator(model_cls, ["in_channels", "out_channels"] + list(params.keys()))
 
-        in_channels, out_channels = loader_channels[0]
+        if isinstance(loader_channels[0], int):
+            in_channels, out_channels = loader_channels[0]
+        else:    
+            in_channels, out_channels = loader_channels[0][0], loader_channels[0][1]
+
         return model_cls(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -297,8 +363,15 @@ def build_model(loader_channels, model_config,
         params = resolved["params"]
 
         lifting_cls, core_cls, projection_cls = model_classes
-        if not isinstance(lifting_cls, type):
-            lifting_cls = lifting_cls()
+        if isinstance(lifting_cls, list):
+            if not isinstance(lifting_cls[0], type):
+                lifting_cls[0] = lifting_cls[0]()
+            if not isinstance(lifting_cls[1], type):
+                lifting_cls[1] = lifting_cls[1]()
+        else:
+            if not isinstance(lifting_cls, type):
+                lifting_cls = lifting_cls()
+
         if not isinstance(core_cls, type):
             core_cls = core_cls()
         if not isinstance(projection_cls, type):
@@ -306,24 +379,37 @@ def build_model(loader_channels, model_config,
 
         lifting_params, core_params, projection_params = params
 
-        hidden_channels = core_params["hidden_channels"]
+        if core_params["conv_module"] == FactorizedDimensionSpectralConv:
+            hidden_channels = 2 * core_params["hidden_channels"]
+        else:
+            hidden_channels = core_params["hidden_channels"]
 
         liftings = []
         projections = []
 
         for in_channels, out_channels in loader_channels:
             current_lifting_params = dict(lifting_params)
-            if lifting_cls.__name__ == "PostLiftMambaLifting":
+            if not isinstance(lifting_cls, list) and lifting_cls.__name__ == "PostLiftMambaLifting":
                 current_lifting_params.pop("hidden_channels", None)
             current_lifting_params = _filter_init_params(lifting_cls, current_lifting_params)
 
-            liftings.append(
-                lifting_cls(
-                    in_channels=in_channels,
-                    out_channels=hidden_channels,
-                    **current_lifting_params,
-                )
-            )
+            if isinstance(lifting_cls, list):
+                assert lifting_cls[0] == GridEmbeddingND, \
+                    'Multiple models in projections are allowed only in a scenario, where the 1st model is GridEmbeddingND'
+                if "grid_boundaries" in current_lifting_params.keys():
+                    bnds = current_lifting_params.pop("grid_boundaries", None)
+                else:
+                    bnds = [0, 1]
+                NDIM = 2
+
+                lft = torch.nn.Sequential([lifting_cls[0](NDIM, bnds), 
+                                           lifting_cls[1](in_channels  =in_channels, 
+                                                          out_channels =hidden_channels,
+                                                          **current_lifting_params)])
+            else:
+                lft = lifting_cls(in_channels=in_channels, out_channels=hidden_channels, **current_lifting_params)
+
+            liftings.append(lft)
 
             current_projection_params = _filter_init_params(projection_cls, projection_params)
             projections.append(
@@ -368,11 +454,10 @@ def build_model(loader_channels, model_config,
                 
 
         current_core_params = _filter_init_params(core_cls, core_params)
-        core = core_cls(
-            in_channels=hidden_channels,
-            out_channels=hidden_channels,
-            **current_core_params,
-        )
+        core = core_cls(in_channels=core_params["hidden_channels"],
+                        out_channels=core_params["hidden_channels"],
+                        **current_core_params,
+                        )
 
         if pretr_core is not None:
                 if core.state_dict().keys() != pretr_core.state_dict().keys():
@@ -391,6 +476,131 @@ def build_model(loader_channels, model_config,
         return liftings, core, projections
 
     raise ValueError(f"Unsupported model kind: {resolved['kind']}")
+
+
+NAMED_SKIP_MAPS: Final = ('skip', 'dno') # TODO: unet, cno
+# SKIPS_TYPES = Literal[NAMED_SKIP_MAPS]
+
+def generateDNOSkips(model: torch.nn.Module, **kwargs) -> List[SkipLike]: # core_is_factorized: bool = True, 
+    # from muno.layers.embeddings import GridEmbeddingND
+    assert 'grid_channels' in kwargs.keys(), 'generateDNOskip requires explicitly set geometry channels'
+
+    skips = []
+    try:
+        if isinstance(model, Muno):
+            n_layers        = model._core.n_layers
+            hidden_channels = model._core.hidden_channels
+            if (model._core.fno_blocks.convSignature[0] == FactorizedDimensionSpectralConv and 
+                model._core.fno_blocks.convSignature[1]):
+                hidden_channels *= 2 # TODO: add variable hc multiplier, with respect to proj. dim
+        else:
+            n_layers        = model.n_layers
+            hidden_channels = model.hidden_channels
+            if (model.fno_blocks.convSignature[0] == FactorizedDimensionSpectralConv and 
+                model.fno_blocks.convSignature[1]):
+                hidden_channels *= 2 # TODO: add variable hc multiplier, with respect to proj. dim
+
+    except AttributeError:
+        raise RuntimeError(f'Incorrect model loaded into DNO skip generator: expected something like FNO, instead got {type(model)}')
+
+    for i in range(n_layers):
+        skips.append(StandardSkip(torch.nn.Conv2d(len(kwargs['grid_channels']), hidden_channels, 1), -2, i, # torch.nn.Identity()
+                                  mode = 'i', channels = kwargs['grid_channels'], ))
+
+    for i in range(n_layers):
+        skips.append(StandardSkip(torch.nn.Conv2d(len(kwargs['grid_channels']), hidden_channels, 1), # [common_embedding, ],
+                                  -2, i, mode = 'i', channels = kwargs['grid_channels'], ))
+
+    return skips
+
+def generateFiLMSkips(model: torch.nn.Module, **kwargs):
+    film_scalar_inputs = kwargs.get('scalar_inputs', ())
+    # Tuple of channel-like entries of the film layers from the skips tensordict (keys) or tensor (idxs along axis №1)
+
+    assert isinstance(film_scalar_inputs, tuple) and all([isinstance(inp_idx, int) for inp_idx in film_scalar_inputs]), \
+        f'Argument film_scalar_inputs have to be passed as a tuple of integers, instead got {type(film_scalar_inputs)}'
+    
+    # if len(input_channels) == 0:
+    #     warnings.warn('FiLM inputs have not been initialized due to absence of arguments.')
+    #     return []
+
+    try:
+        if isinstance(model, Muno):
+            n_layers = model._core.n_layers
+        else:
+            n_layers = model.n_layers
+    except AttributeError:
+        raise RuntimeError(f'Incorrect model loaded into DNO skip generator: expected something like FNO, instead got {type(model)}')
+
+    skips = []
+    film_gen_func   = kwargs.get('film_gen_func', generateDefaultFiLMMapping)
+    film_gen_kwargs = kwargs.get('film_gen_kwargs', {}) # "input_channels": 0
+
+    REQUIRED_FILM_ARGS = ['input_channels', 'num_layers', 'layers_widths']  # 'output_channels', 
+    # Do not mistake num_layers and layers_widths of the FiLM mapping with neural operators'
+    # 'output_channels' are expected to be parsed from the model's layer  
+    
+    assert isinstance(film_gen_kwargs, dict), \
+        f'Mandatory film_gen_kwargs argument is not a dict, as it must be, but {type(film_gen_kwargs)}.'
+    assert all([arg in film_gen_kwargs.keys() for arg in REQUIRED_FILM_ARGS]), \
+        f'Required FiLM args are missing: expected {REQUIRED_FILM_ARGS}, instead got {film_gen_kwargs.keys()} keys.'
+
+    def inspectGenFuncArgs(func: Any):
+        sig: inspect.Signature = inspect.signature(func)
+        return all([arg in sig.parameters for arg in REQUIRED_FILM_ARGS])
+
+    assert inspect.isfunction(film_gen_func) and inspectGenFuncArgs(film_gen_func)
+
+    if isinstance(model, Muno):
+        hidden_channels = model._core.hidden_channels
+        if (model._core.fno_blocks.convSignature[0] == FactorizedDimensionSpectralConv and 
+            model._core.fno_blocks.convSignature[1]):
+            hidden_channels *= 2        
+    else:
+        hidden_channels = model.hidden_channels
+        if (model.fno_blocks.convSignature[0] == FactorizedDimensionSpectralConv and 
+            model.fno_blocks.convSignature[1]):
+            hidden_channels *= 2
+
+    for i in range(n_layers):
+        skips.append(FiLM((film_gen_func(input_channels  = film_gen_kwargs["input_channels"],
+                                         output_channels = hidden_channels,               # film_gen_kwargs["output_channels"],
+                                         num_layers      = film_gen_kwargs["num_layers"],
+                                         layers_widths   = film_gen_kwargs["layers_widths"]),
+                           film_gen_func(input_channels  = film_gen_kwargs["input_channels"],
+                                         output_channels = hidden_channels,               # film_gen_kwargs["output_channels"],
+                                         num_layers      = film_gen_kwargs["num_layers"],
+                                         layers_widths   = film_gen_kwargs["layers_widths"])),
+                          skip_from=-2, skip_to=i, mode = 'a', 
+                          channels = film_gen_kwargs["input_channels"]))
+    return skips
+    
+
+@singledispatch
+def skipGeneration(pattern, model: torch.nn.Module, **kwargs) -> List[SkipLike]: #  Union[dict, SKIPS_TYPES]
+    raise NotImplementedError(f'Unsupported type of skip patterns: expected dict or str, got {type(pattern)}: {pattern}.')
+
+@skipGeneration.register
+def _(pattern: str, model: torch.nn.Module, **kwargs) -> List[SkipLike]:
+    assert pattern in NAMED_SKIP_MAPS, \
+        f'Incorrect type string, expected something from {NAMED_SKIP_MAPS}, instead got {pattern}.'
+    
+    match pattern:
+        case 'film':
+            for argname in ['scalars_num', 'num_layers', 'layers_widths']:
+                assert argname in kwargs.keys(), \
+                    f'Missing {argname} argument from kwargs for skip generation.'
+
+            return generateFiLMSkips(model, **kwargs)
+        case 'skips':
+            for argname in ['grid_channels',]:
+                assert argname in kwargs.keys(), \
+                    f'Missing {argname} argument from kwargs for skip generation.'
+
+            return generateDNOSkips(model, **kwargs)
+        case _:
+            warnings.warn(f"Incorrect string of pattern: {pattern}")
+            return "Unknown Status"
 
 
 def passModelToDevice(model: Union[torch.nn.Module, torch.nn.DataParallel, tuple], device: str = 'cuda') \
@@ -414,31 +624,3 @@ def passModelToDevice(model: Union[torch.nn.Module, torch.nn.DataParallel, tuple
 def addSkips(model: torch.nn.Module, skips_pattern):
     skips = skips_pattern.create_skips(model)
     model.addSkips(skips)
-
-# def modelToDefaultParallel(model: torch.nn.Module,
-# 
-#  devices: Union[int, List[int]] = []) -> torch.nn.Module:
-#     if isinstance(devices, (list, tuple)) and len(devices) == 0:
-#         if torch.cuda.is_available():
-#             passModelToDevice(model, 'cuda')
-#             return model
-#         else:
-#             raise RuntimeError('For some reasons the module is not able to access pytorch cuda.')
-
-#     if isinstance(model, torch.nn.Module):
-#         model = torch.nn.DataParallel(model, device_ids=devices)
-#     elif isinstance(model, tuple):
-#         if not (isinstance(model[0], list) and isinstance(model[1], torch.nn.Module) and isinstance(model[2], list)):
-#             raise RuntimeError('Adapted model does not respect requred format of liftings-core-projections.')
-
-#         adapters, projections = [], []
-#         core = torch.nn.DataParallel(model[1], device_ids=devices)
-#         for idx, _ in enumerate(model[0]):
-#             model[0][idx].to(device)
-#             model[2][idx].to(device)
-
-#         model = (adapters, core, projections)
-         
-#     passModelToDevice(model, device=devices) if isinstance(devices, int) else passModelToDevice(model, device=devices[0])
-    
-#     return model
