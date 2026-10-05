@@ -13,7 +13,14 @@ from .factory import (
     luno_samples,
     set_luno_predictive,
 )
-from .ggn import GGNMatvec, LowRankTerms, low_rank_curvature, randomized_eigh, skerch_low_rank
+from .ggn import (
+    GGNMatvec,
+    LowRankTerms,
+    low_rank_curvature,
+    low_rank_ggn,
+    plan_low_rank_ggn,
+    randomized_eigh,
+)
 from .gp import FNOGPLastLayer, ParametricGaussianProcess
 from .jacobian import LastFNOBlockWeightJacobian, var_of_congruence
 from .lino_ops import (

@@ -70,7 +70,7 @@ normalization:
   max_fit_batches: 32
 
 model:
-  type: adapted_fno #adapted_fno_no_mamba
+  type: adapted_fno_no_mamba #adapted_fno_no_mamba
   n_dim: 3
   hidden_channels: 60
   lifting_layers: 2

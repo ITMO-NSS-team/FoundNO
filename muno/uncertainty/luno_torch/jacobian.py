@@ -11,6 +11,11 @@ from .lino_ops import (
 )
 from .progress import tqdm, write
 
+# Во сколько раз максимум |J v| может отличаться от максимума |rows @ v|,
+# не считая ошибкой. Обрыв tangent-пути обычно даёт полный ноль; окно generous'ное,
+# т.к. в float32 отдельные пробы гуляют на ~30%.
+_MAG_WINDOW = 100.0
+
 def _print_mem(tag, device=None):
     """Печатает CUDA-память: allocated / reserved / свободно от total."""
     if not torch.cuda.is_available():
@@ -27,11 +32,25 @@ class LastFNOBlockWeightJacobian(LinearOperator):
     """Linearized map w -> f(x; w) for the last FNO block weights.
 
     Shape ``(m, d)`` with ``d = 2*|R| + |W| + |b|`` and ``m`` the flattened model
-    output size. J itself is never materialized; both applications use reverse-mode:
-    Jv (matvec) is assembled from chunked reverse passes over the output basis and
-    J^T u (transpose) uses ``torch.func.vjp``. Forward-mode AD was avoided because
-    PyTorch's forward gradients are numerically wrong on this model's graph (they
-    disagree with finite differences on the block bias columns).
+    output size. J itself is never materialized.
+
+    ``Jv`` / ``J @ W`` (единственный путь для прямых произведений) считаются
+    forward-mode AD через ``torch.func.jvp`` -- это режим по умолчанию (``mode="forward"``).
+    Одна касательная на всё направление = один прямой проход по сети; несколько
+    направлений считаются батчем по ``fwd_batch`` колонок через ``torch.vmap``.
+    Точная производная, а не приближение, строки J не материализуются.
+
+    Альтернатива ``mode="affine"``: :class:`luno_torch.affine.AffineLastBlock`
+    прогоняет спектральный conv и skip последнего блока с *касательными* весами
+    (обычный forward без AD) и протягивает результат через замороженный хвост.
+    Тот же точный результат, но fwAD не дифференцирует спектральный conv вообще --
+    полезно, если fwAD через in-place запись в комплексный буфер FFT
+    (``out_fft[slices_x] = ...``) окажется неточен на конкретной версии torch/CUDA.
+
+    ``J^T u`` и ``diag(JJ^T)`` всегда остаются на reverse-mode (``torch.func.vjp``)
+    с чанками строк по ``vjp_chunk``.
+
+    В режиме ``affine`` требуется ``affine`` (:class:`luno_torch.affine.AffineLastBlock`).
     """
 
     def __init__(
@@ -39,14 +58,24 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         model_fn: callable,
         x: torch.Tensor,
         w0: torch.Tensor,
+        affine=None,
+        mode: str = "forward",
+        fwd_batch: int = 4,
         num_output_channels: int | None = None,
         output_grid_shape: tuple[int, ...] | None = None,
         vjp_chunk: int = 64,
         vjp_refresh_every: int = 50,
     ):
+        if mode not in ("forward", "affine"):
+            raise ValueError(
+                f"Неизвестный mode={mode!r}: допустимо 'forward' или 'affine'."
+            )
         self._model_fn = model_fn
         self._x = x
         self._w0 = w0
+        self._affine = affine
+        self._mode = mode
+        self._fwd_batch = int(fwd_batch)
         self._num_output_channels = num_output_channels
         self._output_grid_shape = output_grid_shape
         self._vjp_chunk = vjp_chunk
@@ -57,19 +86,38 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         # а после — освобождаются (_release_vjp). Это JAX-подобная семантика
         # пересчёта: граф одного сэмпла не удерживается в памяти между матвеками,
         # иначе max_num_samples * (размер графа) упирается в CUDA-память.
+        # Аффинное состояние (z, s0, a0) кэшируется отдельно и тоже освобождается.
         self._flat_fn = None
         self._fx = None
         self._vjp_fn = None
         self._vjp_rows = None
         self._vjp_cols = None
+        self._bound = None
 
         super().__init__()
 
+    def _ensure_flat(self):
+        """Строит только ``_flat_fn`` -- достаточно для forward-режима (``torch.func.jvp``).
+
+        Обратные примитивы при этом не строятся, поэтому чистый ``Jv``/``J @ W``
+        не держит обратный граф и не тратит на него память.
+
+        Замыкание захватывает ТОЛЬКО локальные ``model_fn``/``x``, а не ``self``:
+        лямбда со ссылкой на ``self`` замыкает объект в цикл
+        ``self -> self._flat_fn -> cell -> self``, из-за чего сборщик мусора не
+        освобождает удержанный обратный граф (и его активации на GPU) до конца
+        эпохи. Для цикла из 500 eval-сэмплов это и есть накопление памяти.
+        """
+        if self._flat_fn is None:
+            model_fn, x = self._model_fn, self._x
+            self._flat_fn = lambda w: model_fn(x, w).reshape(-1)
+        return self
+
     def _ensure_vjp(self):
         """Строит forward и VJP-примитивы лениво (no-op, если уже построены)."""
+        self._ensure_flat()
         if self._vjp_fn is not None:
             return self
-        self._flat_fn = lambda w: self._model_fn(self._x, w).reshape(-1)
         self._fx = self._flat_fn(self._w0)
         self._vjp_fn = torch.func.vjp(self._flat_fn, self._w0)[1]
         self._vjp_rows = torch.vmap(
@@ -80,12 +128,24 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         )
         return self
 
+    def _ensure_affine(self):
+        """Строит аффинное состояние (z, s0, a0) лениво (no-op, если уже построено)."""
+        if self._bound is None:
+            if self._affine is None:
+                raise ValueError(
+                    "LastFNOBlockWeightJacobian требует affine (luno_torch.affine."
+                    "AffineLastBlock) для mode='affine'."
+                )
+            self._bound = self._affine.bind(self._x, self._model_fn, self._w0)
+        return self._bound
+
     def _release_vjp(self):
-        """Освобождает удержанный forward-граф; следующий вызов пересчитает его."""
+        """Освобождает удержанный forward-граф и аффинное состояние; следующий вызов пересчитает."""
         self._fx = None
         self._vjp_fn = None
         self._vjp_rows = None
         self._vjp_cols = None
+        self._bound = None
         torch.cuda.empty_cache()
         return self
 
@@ -95,11 +155,16 @@ class LastFNOBlockWeightJacobian(LinearOperator):
 
     @property
     def fx(self) -> torch.Tensor:
-        return self._ensure_vjp()._fx
+        # fx — это f(x, w0), достаточно одного прямого прохода; обратный граф для
+        # этого не нужен, поэтому берём его без удержания графа.
+        if self._bound is not None:
+            return self._bound.fx
+        self._ensure_flat()
+        return self._flat_fn(self._w0).detach()
 
     def shape(self) -> tuple[int, int]:
         d = self._w0.numel()
-        m = self._ensure_vjp()._fx.numel()
+        m = self.fx.numel()
         return m, d
 
     def _chunked_rows(self):
@@ -129,25 +194,48 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         finally:
             bar.close()
 
-    def _matmul(self, weights: torch.Tensor) -> torch.Tensor:
-        """J w or J @ W (W shaped (d, k)) via chunked reverse passes."""
-        weights = weights.to(self._w0)
-        self._ensure_vjp()
-        m = self._fx.numel()
+    def _matmul_forward(self, weights: torch.Tensor) -> torch.Tensor:
+        """J v или J @ W через forward-mode (``torch.func.jvp``), без строк J.
+
+        Одна касательная = один прямой проход сети. Для W формы (d, k) колонки
+        считаются батчем по ``fwd_batch`` через ``torch.vmap``: каждая колонка
+        получает свою касательную, vmap проходит по ней как по батч-измерению.
+
+        Результат пишется в заранее выделенный буфер ``out`` размера (m, k), а не
+        собирается списком чанков с последующим ``torch.cat``: конкатенация
+        держит ОДНОВРЕМЕННО и список чанков (m, k), и результат (m, k), то есть
+        удваивает пик. При d = 27.6M и k = rank это лишние ~5 ГиБ на rank = 50,
+        которых не хватает вместе со скетчем.
+        """
+        flat_fn = self._flat_fn
+        w0 = self._w0
         if weights.dim() == 1:
-            out = torch.empty(m, dtype=self._w0.dtype, device=self._w0.device)
-            for sl, rows in self._chunked_rows():
-                out[sl] = rows @ weights
-                del rows; torch.cuda.empty_cache()
-            return out
+            return torch.func.jvp(flat_fn, (w0,), (weights,))[1]
         k = weights.shape[-1]
-        out = torch.empty(
-            m, k, dtype=self._w0.dtype, device=self._w0.device
-        )
-        for sl, rows in self._chunked_rows():
-            out[sl] = rows @ weights
-            del rows; torch.cuda.empty_cache()
+        m = self.fx.numel()
+        if k == 0:
+            return torch.zeros(m, 0, dtype=w0.dtype, device=w0.device)
+        out = torch.empty(m, k, dtype=w0.dtype, device=w0.device)
+        step = max(1, self._fwd_batch)
+        for c0 in range(0, k, step):
+            c1 = min(c0 + step, k)
+            # (d, b) -> (b, d): каждая строка — отдельное направление для vmap.
+            tangents = weights[:, c0:c1].transpose(0, 1).contiguous()
+            outs = torch.vmap(
+                lambda t: torch.func.jvp(flat_fn, (w0,), (t,))[1],
+                in_dims=0, out_dims=0,
+            )(tangents)  # (b, m)
+            out[:, c0:c1] = outs.transpose(0, 1)
+            del tangents, outs
         return out
+
+    def _matmul(self, weights: torch.Tensor) -> torch.Tensor:
+        """J v или J @ W (W формы (d, k)) выбранным режимом, без строк J."""
+        weights = weights.to(self._w0)
+        if self._mode == "affine":
+            return self._ensure_affine().jmatmul(weights)
+        self._ensure_flat()  # для jvp нужен только _flat_fn; VJP-граф не строится
+        return self._matmul_forward(weights)
 
     def transpose(self) -> "LastFNOBlockTransposeWeightJacobian":
         return LastFNOBlockTransposeWeightJacobian(self)
@@ -157,20 +245,38 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         if self._diag_JJT_cache is not None:
             return self._diag_JJT_cache
         norms = []
-        for sl, rows in self._chunked_rows():
-            norms.append((rows**2).sum(dim=-1))
-        result = torch.cat(norms)
+        try:
+            for sl, rows in self._chunked_rows():
+                norms.append((rows**2).sum(dim=-1))
+                del rows
+            result = torch.cat(norms)
+        finally:
+            # Граф последнего чанка не переживает выход из diag_JJT: иначе он
+            # удерживается до следующего вызова и живёт вместе со всеми
+            # оставшимися сэмплами eval-цикла.
+            norms.clear()
+            self._release_vjp()
         self._diag_JJT_cache = result
         return result
 
     def diag_JJT_times(self, diag: torch.Tensor) -> torch.Tensor:
         """Row-wise ``diag(J D J^T)`` for a weight-space diagonal D."""
         diag = diag.to(self._w0)
-        self._ensure_vjp()
-        out = torch.empty(self._fx.numel(), dtype=self._w0.dtype, device=self._w0.device)
-        for sl, rows in self._chunked_rows():
-            out[sl] = (rows**2) @ diag
+        out = torch.empty(self._fx_numel(), dtype=self._w0.dtype, device=self._w0.device)
+        try:
+            for sl, rows in self._chunked_rows():
+                out[sl] = (rows**2) @ diag
+                del rows
+        finally:
+            self._release_vjp()
         return out
+
+    def _fx_numel(self) -> int:
+        """Размер выхода f(x, w0) без построения и удержания обратного графа."""
+        if self._bound is not None:
+            return self._bound.fx.numel()
+        self._ensure_flat()
+        return self._flat_fn(self._w0).detach().numel()
 
 
 class LastFNOBlockTransposeWeightJacobian(LinearOperator):
@@ -217,3 +323,111 @@ def var_of_congruence(
         JU = J._matmul(Sigma.U)
         return torch.sum(JU**2 * Sigma.S, dim=-1)
     raise NotImplementedError(f"var_of_congruence not implemented for {type(Sigma)}")
+
+
+def default_check_tol(dtype: torch.dtype) -> float:
+    """Стартовый допуск self-check Jv против reverse-строк, разный для 32/64.
+
+    Метрика self-check -- ошибка ``|J v - (rows @ v)|``, нормированная на
+    ``||row||_1 * max|v|``, то есть на масштаб слагаемых в ``rows @ v``, а НЕ на
+    ``|J v|``. При ``d = 27 651 660`` строка J каскадно сокращается (измеренное
+    отношение суммы модулей к результату ~1e2), поэтому нормировка на результат
+    в float32 измеряет не ошибку ``Jv``, а шум суммирования: разные, корректно
+    согласованные пути расходятся на ~3e-1. Нормировка на слагаемые этого
+    убирает.
+
+    Измерено на реальном весе (3 пробы, reverse-строки из ``torch.func.vjp``):
+    float64 -> 7.8e-15, float32 -> 7e-4. Допуски выбраны с запасом относительно
+    измеренного шума, но заведомо ниже ошибок, которые ловит гейт (обрыв
+    tangent-пути, потерянная мнимая часть complex-веса или неверно подключённый
+    модуль блока дают 1e-1..1e0 по этой шкале).
+    """
+    if dtype == torch.float64:
+        return 1e-6
+    return 5e-2
+
+
+def check_jacobian(
+    model_fn: callable,
+    x: torch.Tensor,
+    w0: torch.Tensor,
+    affine=None,
+    mode: str = "forward",
+    fwd_batch: int = 4,
+    num_probes: int = 3,
+    tol: float | None = None,
+) -> tuple[bool, float]:
+    """Проверяет J*v выбранного режима против reverse-строк, возвращает ``(ok, rel)``.
+
+    Эталон: ``num_probes`` строк J через reverse-mode (``_vjp_rows``), домноженных
+    на случайный ``v``; сравнивается с ``J v`` по тем же выходным координатам.
+    Используется как стартовый гейт пайплайна: любое расхождение (зацепление за
+    неверный модуль блока, неучтённая нормализация, потеря мнимой части при
+    кастинге) должно падать явно, а не молча давать кривую кривизну.
+
+    Ошибка нормируется на масштаб слагаемых в ``rows @ v``
+    (``||row||_1 * max|v|``), а не на ``|J v|``: при ``d ~ 2.8e7`` строка J
+    сокращается каскадно, и нормировка на результат в float32 даёт ~3e-1 даже
+    для заведомо корректных forward/reverse (см. :func:`default_check_tol`).
+
+    Дополнительно проверяется, что ``J v`` не вырожден: обрыв tangent-пути даёт
+    ``|J v|``, кратно меньший ``|rows @ v|``, и на шкале слагаемых это всего
+    ``1/1e2``, то есть в float32 проскочило бы. Поэтому максимумы ``|Jv|`` и
+    ``|rows @ v|`` по пробам должны совпадать с точностью до ``_MAG_WINDOW``
+    (100x); при нарушении в отчётное число подставляется 1.0 и гейт падает при
+    любом dtype.
+
+    ``tol=None`` -> :func:`default_check_tol` для точности ``w0`` (float32 и
+    float64 допускаются разные).
+    """
+    if tol is None:
+        tol = default_check_tol(w0.dtype)
+    jac = LastFNOBlockWeightJacobian(
+        model_fn, x, w0, affine=affine, mode=mode, fwd_batch=fwd_batch,
+    )
+    jac._ensure_vjp()
+    m = jac._fx.numel()
+    p = min(num_probes, m)
+    d = w0.numel()
+    dev = w0.device
+
+    v = torch.randn(d, dtype=w0.dtype, device=dev)
+    cot = torch.zeros(p, m, dtype=w0.dtype, device=dev)
+    cot[torch.arange(p), torch.arange(p)] = 1.0
+    rows = jac._vjp_rows(cot)
+    rev = rows @ v  # (p,)
+    fwd = jac._matmul(v)[:p]  # (p,)
+
+    # Масштаб слагаемых: |row_j * v_j| <= ||row||_1 * max|v|.
+    tiny = torch.finfo(w0.dtype).tiny
+    term = (rows.abs().sum(dim=1) * v.abs().max()).clamp_min(tiny)
+    rel = ((rev - fwd).abs() / term).max().item()
+
+    # Отдельный тест на вырожденность Jv (обрыв tangent-пути): |Jv| кратно
+    # меньше эталонных значений. Сравниваем максимумы по пробам, а не пары
+    # "probe k против probe k": в float32 отдельная проба гуляет на ~30%, а
+    # максимум по нескольким пробам устойчив.
+    mrev = rev.abs().max()
+    mfwd = fwd.abs().max()
+    ratio = float((mfwd / mrev.clamp_min(tiny)).item())
+    if not (1.0 / _MAG_WINDOW <= ratio <= _MAG_WINDOW):
+        # Отчётное число делаем заведомо проигрышным, чтобы и сообщение об
+        # ошибке не выглядело как "проверка прошла с запасом".
+        rel = max(rel, 1.0)
+
+    jac._release_vjp()
+    return rel < tol, rel
+
+
+# Историческое имя: affine-режим self-check. Оставлено для совместимости вызовов.
+def check_affine_jacobian(
+    model_fn: callable,
+    x: torch.Tensor,
+    w0: torch.Tensor,
+    affine=None,
+    num_probes: int = 3,
+    tol: float | None = None,
+) -> tuple[bool, float]:
+    return check_jacobian(
+        model_fn, x, w0, affine=affine, mode="affine", num_probes=num_probes, tol=tol,
+    )

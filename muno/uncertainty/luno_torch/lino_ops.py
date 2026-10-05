@@ -404,8 +404,14 @@ def linverse(a: LinearOperator) -> LinearOperator:
             alpha * (U.T @ D_inv_U)
             + torch.diag(1.0 / S)
         )
+        del U, S
         schur_eigvals, schur_eigvecs = torch.linalg.eigh(schur)
+        del schur
         M = D_inv_U @ schur_eigvecs / torch.sqrt(schur_eigvals)
+        del D_inv_U
+        # D_inv_U больше не нужен: дальше SVD держит M и свой результат
+        # одновременно, то есть 2 x (d, rank). Без del пик был бы 3 x (d, rank)
+        # (15.45 ГиБ при d = 27.6M, rank = 50).
         U2, sqrt_S2, _ = torch.linalg.svd(M, full_matrices=False)
         return PositiveDiagonalPlusSymmetricLowRank(
             D_inv,

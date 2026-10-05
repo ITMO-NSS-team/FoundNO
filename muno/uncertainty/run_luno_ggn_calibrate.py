@@ -26,8 +26,17 @@
         --in-normalizers <dir> --out-normalizers <dir> \
         --output-root <root> --run-name <name>
 
-При OOM из-за фрагментации CUDA-памяти скрипт сам выставляет
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (до импорта torch, см. ниже).
+По умолчанию (``--jv-mode forward``) Jv/J@W считаются forward-mode AD через
+torch.func.jvp: одна касательная на всё направление, один прямой проход сети, память
+как у одного графа; колонки J@W считаются батчем по --fwd-batch. Альтернатива
+(``--jv-mode affine``, luno_torch.affine) разбирает последний блок на спектральный
+conv + skip (касательные веса, обычный forward без AD) и замороженный хвост (jvp) --
+тоже точно, но fwAD не дифференцирует спектральный conv вовсе. Оба режима не
+материализуют строки J и заметно быстрее прежнего chunked reverse; обратные проходы
+в обоих режимах остаются для J^T u и diag(JJ^T).
+
+На старте Jv выбранного режима сверяется с reverse-строками на одном батче: при
+расхождении скрипт падает с явной ошибкой. Допуск разный для float32 и float64
 """
 
 from __future__ import annotations
@@ -72,10 +81,16 @@ from luno_torch.adapter import (
     ref_state_dict,
     split_wrapper,
 )
+from luno_torch.affine import AffineLastBlock
 from luno_torch.calibrate import chi_squared, chi_squared_zero, grid_search, nll_gaussian
 from luno_torch.factory import create_luno_cov
-from luno_torch.ggn import GGNMatvec, skerch_low_rank
-from luno_torch.jacobian import LastFNOBlockWeightJacobian, var_of_congruence
+from luno_torch.ggn import GGNMatvec, LowRankTerms, low_rank_ggn
+from luno_torch.jacobian import (
+    LastFNOBlockWeightJacobian,
+    check_jacobian,
+    default_check_tol,
+    var_of_congruence,
+)
 from luno_torch.progress import set_enabled, tqdm
 
 import run_multiphysics_inference as rmi
@@ -104,16 +119,39 @@ def parse_args():
     # --- LUNO-specific ---
     p.add_argument("--dtype", choices=["float32", "float64"], default="float32",
                    help="Точность всех вычислений (float32 вдвое экономит память).")
+    p.add_argument("--jv-mode", choices=["forward", "affine"], default="forward",
+                   help="Режим прямых произведений Jv/J@W: forward-mode AD "
+                        "(torch.func.jvp, по умолчанию) или аффинная декомпозиция "
+                        "последнего блока (conv/skip через прямой forward, хвост "
+                        "через jvp). Оба точны; выбирается по памяти/скорости.")
+    p.add_argument("--fwd-batch", type=int, default=4,
+                   help="Сколько колонок J@W считать одним батчем через vmap "
+                        "(только для --jv-mode forward). Больше -- быстрее, но "
+                        "кратно больше памяти.")
+    p.add_argument("--check-probes", type=int, default=3,
+                   help="Сколько строк J использовать в стартовом self-check.")
+    p.add_argument("--check-tol", type=float, default=None,
+                   help="Допуск стартового self-check Jv против reverse-строк. "
+                        "По умолчанию разный для float32/float64 "
+                        "(см. luno_torch.jacobian.default_check_tol).")
     p.add_argument("--vjp-chunk", type=int, default=16,
-                   help="Сколько выходных байтов J материализовать за раз; меньший "
-                        "чанк = меньше пиковая память в GGN-математике. "
-                        "Пик на чанк ~ vjp_chunk * d * itemsize (при d=27.6M, float32, "
-                        "chunk=16 это ~1.8 GiB).")
-    p.add_argument("--max-rank", type=int, default=10, help="Low-rank rank for GGN.")
-    p.add_argument("--sketch-blocksize", type=int, default=32,
-                   help="Сколько столбцов скетча skerch подавать в GGN-matvec за раз "
-                        "(meas_blocksize). Меньше значение = меньше пиковая память; "
-                        "память матвека перестаёт расти с rank.")
+                   help="Сколько выходных строк J материализовать за раз в обратном "
+                        "пути (diag JJ^T, transpose). На Jv/J@W не влияет: они "
+                        "считаются прямым режимом (--jv-mode), без строк J.")
+    p.add_argument("--max-rank", type=int, default=10, help="Low-rank rank для GGN.")
+    p.add_argument("--ggn-method", type=str, default="randomized",
+                   choices=["randomized", "skerch"],
+                   help="Метод низкоранговой аппроксимации GGN. "
+                        "'randomized' (по умолчанию) держит 2 полноразмерных "
+                        "буфера и доходит до rank ~50 на GPU ~16 ГиБ; 'skerch' "
+                        "(seigh) держит 3 буфера плюс блок шума, поэтому при "
+                        "rank >= 50 не помещается ни при каком размере блока.")
+    p.add_argument("--ggn-oversample", type=int, default=10,
+                   help="Число лишних случайных столбцов скетча: q = rank + "
+                        "oversample. Больше -- точнее и точнее сходимость, но "
+                        "пик памяти линейно растёт вместе с q. Единственный "
+                        "параметр, реально влияющий на память скетча: "
+                        "--sketch-blocksize у skerch на ro_sketch не влияет.")
     p.add_argument("--max-num-samples", type=int, default=25,
                    help="Макс. число сэмплов для GGN (как max_num_of_samples в luno).")
     p.add_argument("--max-eval-samples", type=int, default=2,
@@ -333,7 +371,8 @@ def raw_from_normalized(mean_norm, std_norm, out_normalizer, out_shape):
 # GGN / калибровка / метрики
 # ----------------------------------------------------------------------------
 
-def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor):
+def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor, affine,
+                         mode="forward", fwd_batch=4):
     xs = []
     for sample in tqdm(
         iter_samples(train_loader, args.max_num_samples),
@@ -348,24 +387,27 @@ def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor):
     assert xs, "No samples collected for GGN."
 
     ggn_mv = GGNMatvec(
-        model_fn, w0, xs, loss_fn="mse", factor=1.0,
-        vjp_chunk=args.vjp_chunk,
+        model_fn, w0, xs, affine=affine, mode=mode, fwd_batch=fwd_batch,
+        loss_fn="mse", factor=1.0, vjp_chunk=args.vjp_chunk,
     )
     _print_mem("ggn_mv", w0.device)
 
-    low_rank = skerch_low_rank(
+    low_rank = low_rank_ggn(
         ggn_mv,
         rank=args.max_rank,
+        oversample=args.ggn_oversample,
+        method=args.ggn_method,
         device=str(w0.device),
         dtype=w0.dtype,
-        sketch_blocksize=args.sketch_blocksize,
+        fwd_batch=fwd_batch,
     )
     print(f"[GGN] low-rank terms: U={tuple(low_rank.U.shape)} S={tuple(low_rank.S.shape)}")
     return low_rank
 
 
 def _batch_predictive_stats(model_fn, w0, weight_cov, x, out_normalizer,
-                            num_output_channels, vjp_chunk=64):
+                            num_output_channels, affine, mode="forward",
+                            fwd_batch=4, vjp_chunk=64):
     """(mean_raw, std_raw) для одного входного тензора x в raw-пространстве."""
     with torch.no_grad():
         out_shape = model_fn(x, w0).shape
@@ -373,17 +415,27 @@ def _batch_predictive_stats(model_fn, w0, weight_cov, x, out_normalizer,
         model_fn,
         x,
         w0,
+        affine=affine,
+        mode=mode,
+        fwd_batch=fwd_batch,
         num_output_channels=num_output_channels,
         vjp_chunk=vjp_chunk,
     )
-    mean_norm = jac.fx.reshape(-1)
-    var_norm = var_of_congruence(jac, weight_cov)
+    # Граф последнего чанка diag_JJT не должен пережить выход из функции: иначе
+    # он удерживается до конца эпохи, и на eval-цикле из 500 сэмплов память
+    # накапливается до OOM.
+    try:
+        mean_norm = jac.fx.reshape(-1)
+        var_norm = var_of_congruence(jac, weight_cov)
+    finally:
+        jac._release_vjp()
     std_norm = torch.sqrt(var_norm)
     return raw_from_normalized(mean_norm, std_norm, out_normalizer, out_shape)
 
 
 def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
-                         out_normalizer, val_loader, objective_name="chi2"):
+                         out_normalizer, val_loader, affine, objective_name="chi2",
+                         mode="forward", fwd_batch=4):
     """Калибровка scalar prior_prec на первом val-батче (как luno_experiments).
 
     Jacobian на входе кэшируется один раз; по гриду меняется только cov.
@@ -399,7 +451,8 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
         out_shape = model_fn(x, w0).shape
     num_output_channels = wrapper.num_output_channels
     jac = LastFNOBlockWeightJacobian(
-        model_fn, x, w0, num_output_channels=num_output_channels,
+        model_fn, x, w0, affine=affine, mode=mode, fwd_batch=fwd_batch,
+        num_output_channels=num_output_channels,
         vjp_chunk=args.vjp_chunk,
     )
     mean_norm = jac.fx.reshape(-1)
@@ -457,7 +510,8 @@ def save_luno_images(pred, band, target, output_prefix, batch_idx):
 
 def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
                   data_processor, out_normalizer, task_name, max_samples,
-                  metrics_config=None, output_dir=None):
+                  affine, metrics_config=None, output_dir=None,
+                  mode="forward", fwd_batch=4):
     cov = create_luno_cov(low_rank, prior_args)
     nll_sum = torch.tensor(0.0, dtype=DTYPE)
     rmse_sum = torch.tensor(0.0, dtype=DTYPE)
@@ -479,7 +533,7 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
         target = target_raw.reshape(-1)
         mean_raw, std_raw = _batch_predictive_stats(
             model_fn, w0, cov, x, out_normalizer, wrapper.num_output_channels,
-            vjp_chunk=args.vjp_chunk,
+            affine=affine, mode=mode, fwd_batch=fwd_batch, vjp_chunk=args.vjp_chunk,
         )
         nll_sum = nll_sum + nll_gaussian(mean_raw, std_raw, target, scaled=False)
         rmse_sum = rmse_sum + torch.sqrt(torch.mean((mean_raw - target) ** 2))
@@ -621,39 +675,80 @@ def main():
     # model_fn: лифтинг -> core(с w) -> проекция (фиксированы лифтинг и проекция).
     model_fn = make_model_fn(wrapper, lifting, projection)
 
+    # Стартовый гейт: Jv выбранного режима против reverse-строк на ОДНОМ батче.
+    # Эталон -- обратный режим (AD не трогает спектральный conv "изнутри"); при
+    # расхождении падаем явно, а не молча считаем кривую кривизну. Допуск зависит
+    # от точности: float32 набирает ошибку суммирования по 28M элементам, float64 --
+    # на три порядка точнее (см. default_check_tol).
+    probe = preprocess_sample(
+        data_processor, next(iter_samples(pipeline["train_loader"], 1))
+    )
+    affine = (
+        AffineLastBlock(wrapper.model, projection, wrapper.keys, dtype=DTYPE)
+        if args.jv_mode == "affine" else None
+    )
+    ok, rel = check_jacobian(
+        model_fn, probe[0]["x"], w0,
+        affine=affine, mode=args.jv_mode, fwd_batch=args.fwd_batch,
+        num_probes=args.check_probes, tol=args.check_tol,
+    )
+    tol_used = args.check_tol if args.check_tol is not None else default_check_tol(w0.dtype)
+    print(f"[{args.jv_mode}-JV] self-check vs reverse rows на 1 батче: "
+          f"{'OK' if ok else 'FAILED'} (max rel err={rel:.3e}, tol={tol_used:.1e}, "
+          f"dtype={w0.dtype}, torch={torch.__version__})")
+    if not ok:
+        raise RuntimeError(
+            f"Jv в режиме '{args.jv_mode}' не совпал с reverse-строками "
+            f"(max rel err={rel:.3e} > tol={tol_used:.1e}). Проверьте структуру "
+            "последнего FNO-блока (conv/skip/norm/transform), точность весов и "
+            "то, что complex-веса не потеряли мнимую часть при кастинге."
+        )
+    _print_mem("after_jv_check", device)
+
     # --- low-rank GGN на train ---
     print("\n[GGN] low-rank аппроксимация GGN последнего фурье-слоя (train loader):")
     low_rank = compute_low_rank_ggn(
-        args, model_fn, w0, pipeline["train_loader"], data_processor
+        args, model_fn, w0, pipeline["train_loader"], data_processor, affine,
+        mode=args.jv_mode, fwd_batch=args.fwd_batch,
     )
 
-    with open(output_dir / f"{run_prefix}_low_rank_terms.pkl", "wb") as f:
-        pickle.dump(low_rank, f)
-    print(f"[save] low_rank_terms -> {output_dir / f'{run_prefix}_low_rank_terms.pkl'}")
+    # U имеет форму (d, rank) -- при d = 27.6M и rank = 50 это 5.15 ГиБ. Пишем
+    # артефакт с CPU-копией: сам pickle всё равно такой размер, но GPU-копия
+    # продолжает жить в low_rank для калибровки и метрик.
+    low_rank_cpu = LowRankTerms(
+        U=low_rank.U.detach().to("cpu"), S=low_rank.S.detach().to("cpu"),
+        scalar=low_rank.scalar,
+    )
+    terms_path = output_dir / f"{run_prefix}_low_rank_terms.pkl"
+    with open(terms_path, "wb") as f:
+        pickle.dump(low_rank_cpu, f)
+    print(f"[save] low_rank_terms -> {terms_path} "
+          f"({terms_path.stat().st_size / 1024 ** 3:.2f} GiB)")
 
     # --- калибровка на первом val-батче ---
     print("\n[calibrate] оптимизация prior_prec на первом val-батче (val 0.1):")
     prior_args = calibrate_prior_prec(
         args, model_fn, w0, low_rank, wrapper, data_processor,
-        data_processor.out_normalizer, pipeline["val_loader"],
-        objective_name=args.calib_objective,
+        data_processor.out_normalizer, pipeline["val_loader"], affine,
+        objective_name=        args.calib_objective, mode=args.jv_mode, fwd_batch=args.fwd_batch,
     )
 
     out_normalizer = data_processor.out_normalizer
 
     # --- финальные метрики после калибровки ---
     print("\n[metrics] финальные метрики после калибровки:")
-    # val_metrics = evaluate_luno(
-    #     args, pipeline["val_loader"], model_fn, w0, low_rank, prior_args, wrapper,
-    #     data_processor, out_normalizer, "val", args.max_eval_samples,
-    #     metrics_config=pipeline["config"].get("metrics", {}),
-    #     output_dir=output_dir,
-    # )
+    # Оценка на val отключена: она удваивает время прогона (eval для каждого
+    # батча считает Jv по всем сэмплам), а решение о калибровке уже принято на
+    # val-батче выше. Ключ "val" в results остаётся None, чтобы потребители
+    # pkl-файла не ломались на отсутствующем ключе.
+    val_metrics = None
     test_metrics = evaluate_luno(
         args, pipeline["test_loader"], model_fn, w0, low_rank, prior_args, wrapper,
         data_processor, out_normalizer, "test", args.max_eval_samples,
+        affine=affine,
         metrics_config=pipeline["config"].get("metrics", {}),
         output_dir=output_dir,
+        mode=args.jv_mode, fwd_batch=args.fwd_batch,
     )
 
     results = {
@@ -662,6 +757,8 @@ def main():
         "val": val_metrics,
         "test": test_metrics,
         "max_rank": args.max_rank,
+        "ggn_method": args.ggn_method,
+        "ggn_oversample": args.ggn_oversample,
         "max_num_samples_ggn": args.max_num_samples,
     }
     with open(output_dir / "metrics" / "val_metrics.pkl", "wb") as f:
