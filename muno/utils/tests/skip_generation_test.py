@@ -69,7 +69,8 @@ if __name__ == "__main__":
     model_blocks: torch.nn.Module = build_model([(6, 6),], {'kind': 'adapter_core_adapter',
                                                             'name': 'adapted_cfno',
                                                             "params": [{}, {"n_modes": {"t": 1, "x": 32},
-                                                                            "domain_padding": 0.}, {}]}) # _no_mamba
+                                                                            "domain_padding": 0.,
+                                                                            "residual_u0": False}, {}]}) # "residual_u0": False # _no_mamba
                                                             # })
     try:
         print(type(model_blocks), model_blocks.in_channels, model_blocks.out_channels)
@@ -78,13 +79,13 @@ if __name__ == "__main__":
         
     if isinstance(model_blocks, tuple):
         model = Muno(liftings = model_blocks[0], core = model_blocks[1],
-                     projections = model_blocks[2], mode = 'autoreg', autoreg_training_mode='full') # autoreg vs rollout 
+                     projections = model_blocks[2], rollover_mode = 'autoreg', autoreg_training_mode='full') # autoreg vs rollout 
     else:
-        model = Muno(single_model = model_blocks, mode = 'autoreg', autoreg_training_mode='full') # rolling_origin vs full
+        model = Muno(single_model = model_blocks, rollover_mode = 'autoreg', autoreg_training_mode='full') # rolling_origin vs full
 
 
     dno_handlers  = generateDNOSkips(model, grid_channels = (4, 5)) # , core_is_factorized=False
-    film_handlers = generateFiLMSkips(model, film_gen_kwargs = {'input_channels': (2, 3), 
+    film_handlers = generateFiLMSkips(model, film_gen_kwargs = {'input_channels': (2, 3),
                                                                 'num_layers': 3,
                                                                 'layers_widths': 5})
 

@@ -113,7 +113,7 @@ MODEL_REGISTRY = {
         "model": [_post_lift_mamba_lifting, FNO, ChannelMLP],
         "params": [
             {
-                "width": 32,
+                "width": 80,
                 "use_mamba_kwargs": None,
                 "mamba_fallback_kernel": 9,
                 "padding": 0,
@@ -121,14 +121,14 @@ MODEL_REGISTRY = {
                 "non_linearity": torch.nn.functional.gelu,
             },
             {
-                "hidden_channels": 32,
+                "hidden_channels": 80,
                 "n_layers": 4,
                 "n_modes": {"t": 1, "x": 32}, # [10, 40, 40],
                 "disable_lifting_and_projection": True,
                 "conv_module": SpectralConv # FactorizedDimensionSpectralConv # SpectralConv # 
             }, 
             {
-                "hidden_channels": 32,
+                "hidden_channels": 80,
                 "n_layers": 2,
                 "n_dim": 3,
                 "non_linearity": torch.nn.functional.gelu,
@@ -150,12 +150,15 @@ MODEL_REGISTRY = {
             {
                 "hidden_channels": 80,
                 "n_layers": 4,
-                "n_modes": {"t": 10, "x": 32}, # [10, 40, 40],
+                "n_modes": {"t": 1, "x": 32}, # [10, 40, 40],
                 "disable_lifting_and_projection": True,
-                "local_branch": "parallel",
+                "local_branch": "parallel", # parallel
                 "diff_kernels": "parallel",
-                "arch": "temporal",
-                "conv_module": SpectralConv
+                "global_token": "off",
+                "autoregressive_mode": True,
+                "arch": "fno",
+                "conv_module": SpectralConv,
+                "residual_u0": False
             }, 
             {
                 "hidden_channels": 80,

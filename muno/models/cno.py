@@ -37,6 +37,7 @@ class CausalTemporalConv(nn.Module):
     def forward(self, tok):
         x = tok.transpose(1, 2)                              # [B, C, L]
         y = torch.tanh(self.dw(F.pad(x, (self.k - 1, 0))))   # pad слева => каузально
+        # print(f'In CausalTemporalConv.forward: {x.shape}, {y.shape}')
         g = torch.sigmoid(self.gate(x))
         y = self.out((1 - g) * x + g * y)
         return y.transpose(1, 2)
@@ -171,10 +172,10 @@ DIFF_MODES: Final         = ('off', 'parallel')
 
 class CFNO(FNO):
     def __init__(self, in_channels, out_channels, n_modes=(12, 32, 32), width=64,
-                 n_layers=4, rank=0.10, domain_padding=0.15, temporal='auto',
+                 n_layers=4, rank=1.00, domain_padding=0.15, autoregressive_mode: bool = False, temporal='auto',
                  d_state=16, d_conv=4, dropout=0.1, residual_u0=True, disable_lifting_and_projection: bool = False,
                  arch: Literal[ARCHS] = 'temporal', global_token: Literal[GLOBAL_TOKEN_MODES]='off',
-                 local_branch: Literal[LOCAL_MODES] ='off', # Errors here are ghost, Final saves!
+                 local_branch: Literal[LOCAL_MODES] ='off', # PyLance errors here are ghost, Final saves!
                  cno_levels=2, cno_blocks=2, cno_act_up=1,
                  diff_kernels: Literal[DIFF_MODES] = 'off', diff_kernel_size=3,
                  diff_padding='replicate', aux_out=0, *args, **kwargs):
@@ -186,14 +187,15 @@ class CFNO(FNO):
         for arg_to_pop in to_pop:
             if arg_to_pop in kwargs.keys():
                 kwargs.pop(arg_to_pop)
-
+        self._autoregressive_mode = autoregressive_mode
 
         super().__init__(
             n_modes=n_modes,
             hidden_channels=width,
             in_channels=in_channels,
             out_channels=out_channels,
-            factorization='tucker',
+            # disable_lifting_and_projection=disable_lifting_and_projection,
+            factorization=None, # 'tucker'
             rank=rank,
             implementation='factorized',
             n_layers=n_layers,
@@ -201,8 +203,12 @@ class CFNO(FNO):
             channel_mlp_dropout=dropout,
             positional_embedding=None,
             domain_padding=domain_padding,
+            disable_lifting_and_projection=disable_lifting_and_projection,
             *args, **kwargs
         )
+        print(self.n_modes)
+
+        # print(self.domain_padding)
         if len(args) != 0 or len(kwargs) != 0:
             print('Extra arguments of CFNO: ', end = '')
             for key in kwargs.keys():
@@ -216,9 +222,11 @@ class CFNO(FNO):
         self.spatial = SpatialProcessor(width, kind=temporal, d_state=d_state,
                                         d_conv=d_conv) \
             if arch in ('spatial', 'spatial-temporal') else None
+        
         self.temporal = TemporalProcessor(width, kind=temporal,
                                           d_state=d_state, d_conv=d_conv) \
-            if arch in ('temporal', 'spatial-temporal') else None
+            if arch in ('temporal', 'spatial-temporal') and not self._autoregressive_mode else None
+        
         if arch == 'fno':
             print("Arch: чистый FNO3D (без SSM-блоков)")
         # --- CNO-ветка: локальное восприятие, которого нет у спектральных
@@ -233,7 +241,7 @@ class CFNO(FNO):
         self.local_branch = local_branch
         if local_branch != 'off':
             self.cno = CNOBranch(width, levels=cno_levels, blocks=cno_blocks,
-                                 act_up=cno_act_up)
+                                 act_up=cno_act_up, autoregressive_mode=autoregressive_mode)
             self.cno_alpha = (torch.nn.Parameter(torch.zeros(1))
                               if local_branch == 'parallel' else None)
             n = sum(p.numel() for p in self.cno.parameters())
@@ -310,9 +318,10 @@ class CFNO(FNO):
         # x: [B, IN_CH, T, H, W]; каналы 0:n_out — u0 (нормализованные)
         u0 = x[:, :self.n_out]
         # канал 2 входа — активная маска пласта (0/1), постоянна во времени
-        gmask = x[:, 2, 0] if x.shape[1] > 2 else None
+        # gmask = x[:, 2, 0] if x.shape[1] > 2 else None
         if self._disable_lifting_and_projection:
             h = x
+
             if self.spatial is not None:
                 h = self.spatial(h)
             if self.temporal is not None:
@@ -320,23 +329,22 @@ class CFNO(FNO):
         else:
             h = self.lifting(x)
 
-        print('1')
+            if self.spatial is not None:
+                h = self.spatial(h)
+            if self.temporal is not None:
+                h = self.temporal(h)
 
         if self.gt_pre is not None:
-            h = self.gt_pre(h, gmask)         
-
-        print('2')
+            h = self.gt_pre(h, ) # gmask          
 
         h_local = self.cno(h) if self.cno is not None else None
-
-        print('3')
 
         if self.local_branch == 'only':
             h = h_local
         else:
             h_in = h
-            if self.domain_padding is not None:
-                h = self.domain_padding.pad(h)
+            # if self.domain_padding is not None:
+            #     h = self.domain_padding.pad(h)
             # grid_width: шаг сетки в нормированных координатах [0,1].
             # Спектральная часть его не видит, а дифференциальному ядру он
             # нужен для корректной нормировки (сходимость при h->0).
@@ -346,15 +354,13 @@ class CFNO(FNO):
                 h, _ = self.fno_blocks(h, i)
                 if self.diff is not None:
                     h = h + self.diff_alpha[i] * self.diff[i](h_in, gw)
-            if self.domain_padding is not None:
-                h = self.domain_padding.unpad(h)
+            # if self.domain_padding is not None:
+            #     h = self.domain_padding.unpad(h)
             if h_local is not None:
                 h = h + self.cno_alpha * h_local
 
-        print('4')
-
         if self.gt_post is not None:
-            h = self.gt_post(h, gmask)
+            h = self.gt_post(h, ) # gmask
 
         if self._disable_lifting_and_projection:
             out = h
