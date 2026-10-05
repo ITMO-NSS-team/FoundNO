@@ -100,6 +100,9 @@ from check_split import _resolve_key_owner
 DTYPE = torch.float32
 CDTYPE = torch.complex64
 
+# Percentile levels for the per-sample sqrt(chi2) metric (percent over samples).
+SQRT_CHI2_PERCENTILES = (5, 25, 50, 75, 95)
+
 
 # ----------------------------------------------------------------------------
 # Аргументы
@@ -512,10 +515,18 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
                   data_processor, out_normalizer, task_name, max_samples,
                   affine, metrics_config=None, output_dir=None,
                   mode="forward", fwd_batch=4):
+    """Метрики на eval-сэмплах.
+
+    ``luno_chi2`` -- глобальное среднее chi2 по элементам всех сэмплов.
+    ``luno_sqrt_chi2_*`` -- статистики приведённого sqrt(chi2) = sqrt(chi2 /
+    n_elements) (RMS стандартизованного остатка, ~1 при идеальной калибровке),
+    посчитанные по каждому сэмплу: перцентили p5/p25/p50/p75/p95 и среднее.
+    """
     cov = create_luno_cov(low_rank, prior_args)
     nll_sum = torch.tensor(0.0, dtype=DTYPE)
     rmse_sum = torch.tensor(0.0, dtype=DTYPE)
     chi2_sum = torch.tensor(0.0, dtype=DTYPE)
+    sqrt_chi2_samples = []
     cfg_sums = {}
     n_elements = 0
     n_samples = 0
@@ -537,8 +548,15 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
         )
         nll_sum = nll_sum + nll_gaussian(mean_raw, std_raw, target, scaled=False)
         rmse_sum = rmse_sum + torch.sqrt(torch.mean((mean_raw - target) ** 2))
-        chi2_sum = chi2_sum + chi_squared(mean_raw, std_raw, target, averaged=False)
-        n_elements += target.numel()
+        chi2_sample = chi_squared(mean_raw, std_raw, target, averaged=False)
+        chi2_sum = chi2_sum + chi2_sample
+        # Приведённый sqrt(chi2) одного сэмпла: sqrt(chi2 / n_elements).
+        n_elem_sample = target.numel()
+        if n_elem_sample:
+            sqrt_chi2_samples.append(
+                float(torch.sqrt(chi2_sample.double() / n_elem_sample))
+            )
+        n_elements += n_elem_sample
         n_samples += 1
 
         out_shape = target_raw.shape
@@ -564,17 +582,30 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
     rmse = (rmse_sum / n_samples).item() if n_samples else float("nan")
     chi2 = (chi2_sum / n_elements).item() if n_elements else float("nan")
 
+    # Перцентили приведённого sqrt(chi2) по сэмплам.
+    sqrt_chi2_pct = {}
+    if sqrt_chi2_samples:
+        vals = torch.tensor(sqrt_chi2_samples, dtype=torch.float64)
+        levels = torch.tensor(
+            [q / 100.0 for q in SQRT_CHI2_PERCENTILES], dtype=torch.float64
+        )
+        for q, v in zip(SQRT_CHI2_PERCENTILES, torch.quantile(vals, levels).tolist()):
+            sqrt_chi2_pct[f"luno_sqrt_chi2_p{q}"] = v
+        sqrt_chi2_pct["luno_sqrt_chi2_mean"] = vals.mean().item()
+
     cfg_metrics = {name: value / n_samples for name, value in cfg_sums.items()}
     metrics = {
         **cfg_metrics,
+        **sqrt_chi2_pct,
         "luno_nll": nll,
         "luno_rmse": rmse,
         "luno_chi2": chi2,
         "samples": n_samples,
     }
     cfg_str = " ".join(f"{k}={v:.6e}" for k, v in cfg_metrics.items())
+    pct_str = " ".join(f"{k}={v:.6e}" for k, v in sqrt_chi2_pct.items())
     print(f"[eval:{task_name}] luno_nll={nll:.6e} luno_rmse={rmse:.6e} "
-          f"luno_chi2={chi2:.6e} {cfg_str} "
+          f"luno_chi2={chi2:.6e} {pct_str} {cfg_str} "
           f"(samples={n_samples}, elements={n_elements})")
     return metrics
 
