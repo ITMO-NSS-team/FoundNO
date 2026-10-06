@@ -537,46 +537,52 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
         output_prefix.mkdir(parents=True, exist_ok=True)
         output_prefix = Path.joinpath(output_prefix, "luno_")
 
-    for sample in iter_samples(loader, max_samples):
-        sample = preprocess_sample(data_processor, sample)
-        x = sample[0]["x"]
-        target_raw = sample[0]["y"]
-        target = target_raw.reshape(-1)
-        mean_raw, std_raw = _batch_predictive_stats(
-            model_fn, w0, cov, x, out_normalizer, wrapper.num_output_channels,
-            affine=affine, mode=mode, fwd_batch=fwd_batch, vjp_chunk=args.vjp_chunk,
-        )
-        nll_sum = nll_sum + nll_gaussian(mean_raw, std_raw, target, scaled=False)
-        rmse_sum = rmse_sum + torch.sqrt(torch.mean((mean_raw - target) ** 2))
-        chi2_sample = chi_squared(mean_raw, std_raw, target, averaged=False)
-        chi2_sum = chi2_sum + chi2_sample
-        # Приведённый sqrt(chi2) одного сэмпла: sqrt(chi2 / n_elements).
-        n_elem_sample = target.numel()
-        if n_elem_sample:
-            sqrt_chi2_samples.append(
-                float(torch.sqrt(chi2_sample.double() / n_elem_sample))
+    # Без no_grad аккумуляторы nll_sum/rmse_sum/chi2_sum -- не-leaf тензоры,
+    # и каждый следующий плюс цепляется к предыдущему через grad_fn. Граф каждого
+    # eval-сэмпла тогда живёт до конца цикла (до .item() ниже), и память растёт
+    # линейно по числу сэмплов: на rank=20 это ~12 ГиБ при одном лишь --vjp-chunk,
+    # от которого эффект нулевой. Графы здесь не нужны вообще.
+    with torch.no_grad():
+        for sample in iter_samples(loader, max_samples):
+            sample = preprocess_sample(data_processor, sample)
+            x = sample[0]["x"]
+            target_raw = sample[0]["y"]
+            target = target_raw.reshape(-1)
+            mean_raw, std_raw = _batch_predictive_stats(
+                model_fn, w0, cov, x, out_normalizer, wrapper.num_output_channels,
+                affine=affine, mode=mode, fwd_batch=fwd_batch, vjp_chunk=args.vjp_chunk,
             )
-        n_elements += n_elem_sample
-        n_samples += 1
+            nll_sum = nll_sum + nll_gaussian(mean_raw, std_raw, target, scaled=False)
+            rmse_sum = rmse_sum + torch.sqrt(torch.mean((mean_raw - target) ** 2))
+            chi2_sample = chi_squared(mean_raw, std_raw, target, averaged=False)
+            chi2_sum = chi2_sum + chi2_sample
+            # Приведённый sqrt(chi2) одного сэмпла: sqrt(chi2 / n_elements).
+            n_elem_sample = target.numel()
+            if n_elem_sample:
+                sqrt_chi2_samples.append(
+                    float(torch.sqrt(chi2_sample.double() / n_elem_sample))
+                )
+            n_elements += n_elem_sample
+            n_samples += 1
 
-        out_shape = target_raw.shape
-        pred = {0: mean_raw.reshape(out_shape)}
-        band = {0: std_raw.reshape(out_shape)}
-        target_dict = {0: target_raw}
+            out_shape = target_raw.shape
+            pred = {0: mean_raw.reshape(out_shape)}
+            band = {0: std_raw.reshape(out_shape)}
+            target_dict = {0: target_raw}
 
-        if output_prefix is not None:
-            save_luno_images(pred, band, target_dict, output_prefix, n_samples - 1)
+            if output_prefix is not None:
+                save_luno_images(pred, band, target_dict, output_prefix, n_samples - 1)
 
-        if metrics_config:
-            batch_metrics = rmi.compute_batch_metrics(
-                pred,
-                band,
-                target_dict,
-                metrics_config=metrics_config,
-                task_name=task_name,
-            )
-            for name, value in batch_metrics[0].items():
-                cfg_sums[name] = cfg_sums.get(name, 0.0) + float(value)
+            if metrics_config:
+                batch_metrics = rmi.compute_batch_metrics(
+                    pred,
+                    band,
+                    target_dict,
+                    metrics_config=metrics_config,
+                    task_name=task_name,
+                )
+                for name, value in batch_metrics[0].items():
+                    cfg_sums[name] = cfg_sums.get(name, 0.0) + float(value)
 
     nll = (nll_sum / n_elements).item() if n_elements else float("nan")
     rmse = (rmse_sum / n_samples).item() if n_samples else float("nan")
