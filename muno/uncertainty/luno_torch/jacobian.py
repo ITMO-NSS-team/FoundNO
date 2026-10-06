@@ -65,6 +65,7 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         output_grid_shape: tuple[int, ...] | None = None,
         vjp_chunk: int = 64,
         vjp_refresh_every: int = 50,
+        diag_probes: int = 0,
     ):
         if mode not in ("forward", "affine"):
             raise ValueError(
@@ -80,6 +81,9 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         self._output_grid_shape = output_grid_shape
         self._vjp_chunk = vjp_chunk
         self._vjp_refresh_every = vjp_refresh_every
+        # 0 -- точный diag(J J^T) обратным режимом (m строк по vjp_chunk за чанк);
+        # >0 -- оценка Хатчинсона на diag_probes проб, forward-режимом.
+        self._diag_probes = int(diag_probes)
         self._diag_JJT_cache = None
 
         # Ленивая сборка: forward/VJP строятся только при первом использовании,
@@ -241,9 +245,22 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         return LastFNOBlockTransposeWeightJacobian(self)
 
     def diag_JJT(self) -> torch.Tensor:
-        """Row-wise squared norms of J, i.e. diag(J J^T)."""
+        """Row-wise squared norms of J, i.e. diag(J J^T).
+
+        При ``diag_probes > 0`` возвращается безсмещённая оценка Хатчинсона
+        forward-режимом, иначе -- точное значение обратным режимом (по строкам).
+        """
         if self._diag_JJT_cache is not None:
             return self._diag_JJT_cache
+        if self._diag_probes > 0:
+            result = self._diag_JJT_hutchinson(self._diag_probes)
+        else:
+            result = self._diag_JJT_exact()
+        self._diag_JJT_cache = result
+        return result
+
+    def _diag_JJT_exact(self) -> torch.Tensor:
+        """diag(J J^T) построчно: одна обратная прохода на каждую строку J."""
         norms = []
         try:
             for sl, rows in self._chunked_rows():
@@ -251,13 +268,50 @@ class LastFNOBlockWeightJacobian(LinearOperator):
                 del rows
             result = torch.cat(norms)
         finally:
-            # Граф последнего чанка не переживает выход из diag_JJT: иначе он
+            # Граф последнего чанка не переживает выход из диагонали: иначе он
             # удерживается до следующего вызова и живёт вместе со всеми
             # оставшимися сэмплами eval-цикла.
             norms.clear()
             self._release_vjp()
-        self._diag_JJT_cache = result
         return result
+
+    def _diag_JJT_hutchinson(self, n_probe: int) -> torch.Tensor:
+        """Оценка Хатчинсона для diag(J J^T), полностью в прямом режиме.
+
+        Для ``Z ∈ {±1}^{d×c}`` по элементам с независимыми `E[Z_ik²] = 1`:
+
+            E[(J Z)_ik²] = Σ_j J_ij² · E[Z_jk²] = Σ_j J_ij² = (J J^T)_ii
+
+        то есть усреднение ``(J Z)²`` по пробам даёт безсмещённую оценку искомой
+        диагонали. Стоимость -- ``n_probe`` прямых проходов вместо
+        ``ceil(m / vjp_chunk)`` обратных (при m = 65536 и vjp_chunk = 16 это 16
+        против 4096, т.е. ~256x), память на пробу ограничена чанком
+        ``fwd_batch``: ``fwd_batch * d * 4`` байт.
+
+        Оценка относится к самой диагонали ``(J J^T)_ii``. Если дальше эта
+        диагональ вычитается из сопоставимого слагаемого, шум окажется
+        усиленным -- в этом случае оценивать надо всю величину, см.
+        :func:`_var_of_congruence_hutchinson`.
+
+        Ошибка на один элемент ~ ``sqrt(2/n_probe)`` (на пробе chi2_1), то есть
+        n_probe = 16 даёт ~20%, n_probe = 64 -- ~6%. ``n_probe`` -- это обмен
+        скорости на точность; валидация идёт с точным диагоном, чтобы картинки и
+        эталонные метрики не зависели от числа проб.
+
+        Обратный граф не строится, поэтому ``_release_vjp`` не требуется.
+        """
+        m = self._fx_numel()
+        w0 = self._w0
+        acc = torch.zeros(m, dtype=w0.dtype, device=w0.device)
+        step = max(1, self._fwd_batch)
+        for c0 in range(0, n_probe, step):
+            c = min(step, n_probe - c0)
+            # Bernoulli in-place -> {-1, +1} без второго буфера под Z.
+            Z = torch.empty(w0.numel(), c, dtype=w0.dtype, device=w0.device)
+            Z.bernoulli_(0.5).mul_(2).sub_(1)
+            acc.add_((self._matmul(Z) ** 2).sum(dim=1))
+            del Z
+        return acc / n_probe
 
     def diag_JJT_times(self, diag: torch.Tensor) -> torch.Tensor:
         """Row-wise ``diag(J D J^T)`` for a weight-space diagonal D."""
@@ -297,14 +351,87 @@ class LastFNOBlockTransposeWeightJacobian(LinearOperator):
         return self._jacobian
 
 
+def _cov_sqrt_isotropic_lowrank(
+    Sigma: IsotropicScalingPlusSymmetricLowRank,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Факторизация ``Sigma^{1/2}`` для ``IsotropicScalingPlusSymmetricLowRank``.
+
+    Та же формула, что ``linox.lsqrt``:
+
+        ``Sigma = s I + U diag(S) U^T``
+        ``Sigma^{1/2} = sqrt(s) I + U diag( sqrt(s)(sqrt(S/s + 1) - 1) ) U^T``
+
+    Возвращает ``(scale, U, coeff)`` с ``Sigma^{1/2} = scale*(I + U diag(coeff) U^T)``.
+    ``S`` может быть отрицательным (после ``linverse``), но ``S/s + 1 = 1 - r > 0``,
+    поэтому корень определён.
+    """
+    U = Sigma.U
+    scalar = Sigma.scalar
+    if not isinstance(scalar, torch.Tensor):
+        scalar = torch.tensor(scalar, dtype=U.dtype, device=U.device)
+    coeff = torch.sqrt(Sigma.S / scalar + 1.0) - 1.0
+    return torch.sqrt(scalar), U, coeff
+
+
+def _var_of_congruence_hutchinson(
+    J: LastFNOBlockWeightJacobian,
+    Sigma: IsotropicScalingPlusSymmetricLowRank,
+    n_probe: int,
+) -> torch.Tensor:
+    """Оценка Хатчинсона для ``diag(J Sigma J^T)`` целиком, прямым режимом.
+
+    Для ``Z ∈ {±1}^{d×c}`` с независимыми ``E[Z z^T] = I``:
+
+        ``E[(J Sigma^{1/2} Z)_ik^2] = (J Sigma J^T)_ii``
+
+    Оценивается **вся** диагональ конгруэнции одним семейством проб, а не два
+    слагаемых ``scalar*diag(JJ^T)`` и ``sum((JU)^2 * S)`` по отдельности.
+
+    Разделение неприемлемо, потому что после ``linverse`` ``S < 0``: оба слагаемых
+    одного порядка и почти вычитают друг друга (``var = scalar*(|g|^2 - sum r_k (g.u_k)^2)``,
+    ``r_max ≈ 0.59``). Шум Хатчинсона на первом слагаемом приводит к тому, что у
+    доли строк оценка уходит в минус, ``torch.sqrt`` даёт NaN, и один NaN
+    отравляет ``nll.mean()``/``chi2.sum()`` целиком. При построении через
+    ``Sigma^{1/2}`` результат -- сумма квадратов, поэтому он неотрицателен по
+    построению, а относительная ошибка ``~sqrt(2/n_probe)`` относится к самому
+    ``var_i``, а не к большому ``scalar*diag_i``.
+
+    Стоимость прежняя: один ``J @ U`` (нужен и точному пути) плюс ``n_probe``
+    прямых проходов на ``J @ Z``; ``U^T Z`` и ``(k, c)``-умножения пренебрежимо дёшевы.
+    """
+    scale, U, coeff = _cov_sqrt_isotropic_lowrank(Sigma)
+    m = J._fx_numel()
+    w0 = J._w0
+    acc = torch.zeros(m, dtype=w0.dtype, device=w0.device)
+    JU = J._matmul(U) * coeff
+    step = max(1, J._fwd_batch)
+    for c0 in range(0, n_probe, step):
+        c = min(step, n_probe - c0)
+        Z = torch.empty(w0.numel(), c, dtype=w0.dtype, device=w0.device)
+        Z.bernoulli_(0.5).mul_(2).sub_(1)
+        T = scale * (J._matmul(Z) + JU @ (U.transpose(0, 1) @ Z))
+        acc.add_((T ** 2).sum(dim=1))
+        del Z, T
+    return acc / n_probe
+
+
 def var_of_congruence(
-    J: LastFNOBlockWeightJacobian, Sigma: LinearOperator
+    J: LastFNOBlockWeightJacobian, Sigma: LinearOperator, *, diag_probes: int = 0
 ) -> torch.Tensor:
     """diag(J Sigma J^T) as in luno._linox, split over Sigma's operator_list.
 
     Uses ``diag(J J^T)`` (reverse-mode over output basis) for the diagonal part and
-    ``(J U)^2 S`` (forward-mode over the rank basis) for the low-rank part.
+    ``(J U)^2 S`` (forward-mode over rank basis) for the low-rank part.
+
+    ``diag_probes > 0`` включает оценку Хатчинсона прямым режимом вместо обратного.
+    Для ``IsotropicScalingPlusSymmetricLowRank`` оценивается вся конгруэнция через
+    ``Sigma^{1/2}`` (см. :func:`_var_of_congruence_hutchinson`): частичная оценка
+    недопустима из-за почти полного вычитания ``scalar*diag(JJ^T)`` и отрицательного
+    низкорангового слагаемого. Остальные типы не оцениваются шумно: их
+    низкоранговая часть точная, а ``Sigma.diag`` неотрицателен.
     """
+    if diag_probes > 0 and isinstance(Sigma, IsotropicScalingPlusSymmetricLowRank):
+        return _var_of_congruence_hutchinson(J, Sigma, diag_probes)
     if isinstance(Sigma, IsotropicScalingPlusSymmetricLowRank):
         scalar_part = Sigma.scalar * J.diag_JJT()
         JU = J._matmul(Sigma.U)

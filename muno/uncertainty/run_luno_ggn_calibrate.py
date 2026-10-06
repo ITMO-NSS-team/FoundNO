@@ -12,7 +12,7 @@
     2) сплит модели: last FNO block core -> w0 = [R.real, R.imag, W, b];
        печать слоёв, выбранных в качестве последних;
     3) low-rank GGN последнего фурье-слоя на train-лоадере;
-    4) калибровка scalar prior_prec на первом val-батче (log10 grid, patience);
+    4) калибровка scalar prior_prec на первом батче calib-части val (log10 grid, patience);
     5) финальные метрики NLL (+RMSE) на val/test (limited max-eval-batches);
     6) сохранение GGN (LowRankTerms) и метрик в pkl в output-папке эксперимента
        (структура папок как в run_multiphysics_inference.py).
@@ -64,7 +64,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from torch.func import functional_call
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from muno.data.benchmarks.datasets import MultiPhysicsDataset
 from muno.data.benchmarks.inspections import (
@@ -159,6 +159,20 @@ def parse_args():
                    help="Макс. число сэмплов для GGN (как max_num_of_samples в luno).")
     p.add_argument("--max-eval-samples", type=int, default=2,
                    help="Макс. число сэмплов для финальных val/test метрик.")
+    p.add_argument("--max-val-eval-samples", type=int, default=2,
+                   help="Макс. число сэмплов для метрик на валидационной части "
+                        "val (с картинками и точным diag JJ^T).")
+    p.add_argument("--val-calib-frac", type=float, default=0.8,
+                   help="Доля val, отдаваемая калибровке prior_prec. Остаток "
+                        "(1 - доля) идёт на валидацию с картинками и точным "
+                        "diag JJ^T. Требует >= 2 сэмплов в val, иначе ошибка.")
+    p.add_argument("--diag-hutchinson", type=int, default=0,
+                   help="Число проб Хатчинсона на ТЕСТОВОМ прогоне: вместо "
+                        "ceil(m/vjp_chunk) обратных проходов считается "
+                        "diag(J Sigma J^T) целиком прямым режимом (n_probe "
+                        "прямых проходов, при n_probe=16 это ~256x быстрее). "
+                        "0 -- выключено, точный обратный режим. На валидации "
+                        "точный путь всегда, независимо от флага.")
     p.add_argument("--calib-grid-min", type=float, default=-3.0)
     p.add_argument("--calib-grid-max", type=float, default=3.0)
     p.add_argument("--calib-grid-size", type=int, default=50)
@@ -263,6 +277,51 @@ def make_model_fn(wrapper: TorchFNOWrapper, lifting, projection):
 # Построение пайплайна (модель + данные + нормализаторы)
 # ----------------------------------------------------------------------------
 
+def split_val_loaders(args, val_set):
+    """Режет val на две непересекающиеся части: калибровку и валидацию.
+
+    Калибровочная часть (``--val-calib-frac``) идёт в ``calibrate_prior_prec``,
+    остаток -- на метрики и качественные картинки. Обе части нужны, чтобы
+    решение о prior_prec не принималось на тех же сэмплах, на которых потом
+    считаются отчётные метрики.
+
+    ВАЖНО: ``rmi.loadData`` возвращает СПИСОК датасетов по числу задач, а не сами
+    сэмплы, поэтому ``len(val_set) == числу задач``. Настоящая длина сэмплов --
+    это ``len(MultiPhysicsDataset(...))``; ровно его и режем.
+
+    Shuffle в лоадерах выключен, поэтому head/tail-разрез детерминирован и не
+    требует seed.
+    """
+    val_mp = MultiPhysicsDataset(list(val_set))
+    n_val = len(val_mp)
+    frac = args.val_calib_frac
+    if not 0.0 < frac < 1.0:
+        raise ValueError(f"--val-calib-frac должен быть в (0, 1), получено {frac}")
+    if n_val < 2:
+        raise ValueError(
+            f"val содержит {n_val} сэмпл(ов), поэтому поделить его на калибровку "
+            f"({frac}) и валидацию (1-{frac}) нельзя. Нужно >= 2 сэмплов в val: "
+            "поднимите split.val в конфиге или max_samples_per_split.val."
+        )
+    n_calib = int(frac * n_val)
+    if n_calib < 1 or (n_val - n_calib) < 1:
+        raise ValueError(
+            f"Сплит val={n_val} сэмплов на доли {frac}/1-{frac} дал "
+            f"калибровку={n_calib}, валидацию={n_val - n_calib}: обе части должны "
+            "быть непустыми."
+        )
+    print(f"[split] val={n_val} сэмплов -> калибровка={n_calib}, "
+          f"валидация={n_val - n_calib} (доля {frac})")
+
+    calib_loader = DataLoader(
+        dataset=Subset(val_mp, list(range(n_calib))), batch_size=1, shuffle=False
+    )
+    val_eval_loader = DataLoader(
+        dataset=Subset(val_mp, list(range(n_calib, n_val))), batch_size=1, shuffle=False
+    )
+    return calib_loader, val_eval_loader
+
+
 def build_pipeline(args):
     config_path = rmi.resolve_path(args.config)
     config = rmi.load_yaml_config(config_path)
@@ -298,7 +357,7 @@ def build_pipeline(args):
         batch_size=1,
         shuffle=False,
     )
-    val_loader = DataLoader(dataset=MultiPhysicsDataset(list(val_set)), batch_size=1, shuffle=False)
+    calib_loader, val_eval_loader = split_val_loaders(args, val_set)
     test_loader = DataLoader(dataset=MultiPhysicsDataset(list(test_set)), batch_size=1, shuffle=False)
 
     loader_channels = rmi.get_loaders_channels(train_loader)
@@ -321,7 +380,8 @@ def build_pipeline(args):
         "lifting": model_liftings[0],
         "projection": model_projections[0],
         "train_loader": train_loader,
-        "val_loader": val_loader,
+        "calib_loader": calib_loader,
+        "val_eval_loader": val_eval_loader,
         "test_loader": test_loader,
         "loader_channels": loader_channels,
     }
@@ -410,7 +470,7 @@ def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor, affin
 
 def _batch_predictive_stats(model_fn, w0, weight_cov, x, out_normalizer,
                             num_output_channels, affine, mode="forward",
-                            fwd_batch=4, vjp_chunk=64):
+                            fwd_batch=4, vjp_chunk=64, diag_probes=0):
     """(mean_raw, std_raw) для одного входного тензора x в raw-пространстве."""
     with torch.no_grad():
         out_shape = model_fn(x, w0).shape
@@ -423,13 +483,14 @@ def _batch_predictive_stats(model_fn, w0, weight_cov, x, out_normalizer,
         fwd_batch=fwd_batch,
         num_output_channels=num_output_channels,
         vjp_chunk=vjp_chunk,
+        diag_probes=diag_probes,
     )
     # Граф последнего чанка diag_JJT не должен пережить выход из функции: иначе
     # он удерживается до конца эпохи, и на eval-цикле из 500 сэмплов память
-    # накапливается до OOM.
+    # накапливается до OOM. При diag_probes > 0 обратный граф вообще не строится.
     try:
         mean_norm = jac.fx.reshape(-1)
-        var_norm = var_of_congruence(jac, weight_cov)
+        var_norm = var_of_congruence(jac, weight_cov, diag_probes=diag_probes)
     finally:
         jac._release_vjp()
     std_norm = torch.sqrt(var_norm)
@@ -439,7 +500,10 @@ def _batch_predictive_stats(model_fn, w0, weight_cov, x, out_normalizer,
 def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
                          out_normalizer, val_loader, affine, objective_name="chi2",
                          mode="forward", fwd_batch=4):
-    """Калибровка scalar prior_prec на первом val-батче (как luno_experiments).
+    """Калибровка scalar prior_prec на первом батче ``val_loader`` (как luno_experiments).
+
+    ``val_loader`` здесь -- это калибровочная часть val (см. ``--val-calib-frac``),
+    остальная часть идёт на валидацию с метриками и картинками.
 
     Jacobian на входе кэшируется один раз; по гриду меняется только cov.
     ``objective_name``: "chi2" -- |chi_squared - 1| (как дефолт в laplax),
@@ -514,13 +578,20 @@ def save_luno_images(pred, band, target, output_prefix, batch_idx):
 def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
                   data_processor, out_normalizer, task_name, max_samples,
                   affine, metrics_config=None, output_dir=None,
-                  mode="forward", fwd_batch=4):
+                  mode="forward", fwd_batch=4,
+                  save_images=True, diag_probes=0):
     """Метрики на eval-сэмплах.
 
     ``luno_chi2`` -- глобальное среднее chi2 по элементам всех сэмплов.
     ``luno_sqrt_chi2_*`` -- статистики приведённого sqrt(chi2) = sqrt(chi2 /
     n_elements) (RMS стандартизованного остатка, ~1 при идеальной калибровке),
     посчитанные по каждому сэмплу: перцентили p5/p25/p50/p75/p95 и среднее.
+
+    ``save_images=False`` -- не писать PNG (диагностику смотрим только на
+    валидации, на тесте это лишняя работа).
+    ``diag_probes`` -- число проб Хатчинсона для ``diag(J Sigma J^T)`` (вся
+    конгруэнция, не только ``diag(J J^T)``); 0 -- точный обратный режим.
+    Тестовый прогон гоним с ``>0`` ради скорости, валидационный всегда с 0.
     """
     cov = create_luno_cov(low_rank, prior_args)
     nll_sum = torch.tensor(0.0, dtype=DTYPE)
@@ -532,7 +603,7 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
     n_samples = 0
 
     output_prefix = None
-    if output_dir is not None:
+    if output_dir is not None and save_images:
         output_prefix = Path(output_dir) / f"inspections_luno_{task_name}"
         output_prefix.mkdir(parents=True, exist_ok=True)
         output_prefix = Path.joinpath(output_prefix, "luno_")
@@ -551,6 +622,7 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
             mean_raw, std_raw = _batch_predictive_stats(
                 model_fn, w0, cov, x, out_normalizer, wrapper.num_output_channels,
                 affine=affine, mode=mode, fwd_batch=fwd_batch, vjp_chunk=args.vjp_chunk,
+                diag_probes=diag_probes,
             )
             nll_sum = nll_sum + nll_gaussian(mean_raw, std_raw, target, scaled=False)
             rmse_sum = rmse_sum + torch.sqrt(torch.mean((mean_raw - target) ** 2))
@@ -762,23 +834,31 @@ def main():
     print(f"[save] low_rank_terms -> {terms_path} "
           f"({terms_path.stat().st_size / 1024 ** 3:.2f} GiB)")
 
-    # --- калибровка на первом val-батче ---
-    print("\n[calibrate] оптимизация prior_prec на первом val-батче (val 0.1):")
+    # --- калибровка на первом батче калибровочной части val (80%) ---
+    print(f"\n[calibrate] оптимизация prior_prec на первом батче calib_loader "
+          f"(доля {args.val_calib_frac} от val):")
     prior_args = calibrate_prior_prec(
         args, model_fn, w0, low_rank, wrapper, data_processor,
-        data_processor.out_normalizer, pipeline["val_loader"], affine,
-        objective_name=        args.calib_objective, mode=args.jv_mode, fwd_batch=args.fwd_batch,
+        data_processor.out_normalizer, pipeline["calib_loader"], affine,
+        objective_name=args.calib_objective, mode=args.jv_mode,
+        fwd_batch=args.fwd_batch,
     )
 
     out_normalizer = data_processor.out_normalizer
 
-    # --- финальные метрики после калибровки ---
+    # --- метрики после калибровки: валидация и тест считаются по-разному ---
+    # валидация (остаток val): точный diag JJ^T обратным режимом + картинки;
+    # тест: диагонь Хатчинсона ради скорости, без картинок.
     print("\n[metrics] финальные метрики после калибровки:")
-    # Оценка на val отключена: она удваивает время прогона (eval для каждого
-    # батча считает Jv по всем сэмплам), а решение о калибровке уже принято на
-    # val-батче выше. Ключ "val" в results остаётся None, чтобы потребители
-    # pkl-файла не ломались на отсутствующем ключе.
-    val_metrics = None
+    val_metrics = evaluate_luno(
+        args, pipeline["val_eval_loader"], model_fn, w0, low_rank, prior_args,
+        wrapper, data_processor, out_normalizer, "val", args.max_val_eval_samples,
+        affine=affine,
+        metrics_config=pipeline["config"].get("metrics", {}),
+        output_dir=output_dir,
+        mode=args.jv_mode, fwd_batch=args.fwd_batch,
+        save_images=True, diag_probes=0,
+    )
     test_metrics = evaluate_luno(
         args, pipeline["test_loader"], model_fn, w0, low_rank, prior_args, wrapper,
         data_processor, out_normalizer, "test", args.max_eval_samples,
@@ -786,6 +866,7 @@ def main():
         metrics_config=pipeline["config"].get("metrics", {}),
         output_dir=output_dir,
         mode=args.jv_mode, fwd_batch=args.fwd_batch,
+        save_images=False, diag_probes=args.diag_hutchinson,
     )
 
     results = {
@@ -797,6 +878,8 @@ def main():
         "ggn_method": args.ggn_method,
         "ggn_oversample": args.ggn_oversample,
         "max_num_samples_ggn": args.max_num_samples,
+        "diag_hutchinson": args.diag_hutchinson,
+        "val_calib_frac": args.val_calib_frac,
     }
     with open(output_dir / "metrics" / "val_metrics.pkl", "wb") as f:
         pickle.dump({"val": val_metrics}, f)
