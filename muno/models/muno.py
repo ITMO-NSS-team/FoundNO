@@ -394,6 +394,17 @@ class Muno(nn.Module):
                                **_SAVE_LOAD_PARAMS)
                     torch.save(obj=self._projections[idx], pickle_module=dill, f=model_path[2][idx],
                                **_SAVE_LOAD_PARAMS)
+                    if len(self._skip_handlers) > 0 and self._skip_handlers[idx] is not None:
+                        for skip_idx in range(len(self._skip_handlers[idx])):
+                            try:
+                                skip_path_init: str = model_path[4][idx]
+                                skip_path = skip_path_init.removesuffix(".pt", "")
+                                skip_path += f'_{skip_idx}.pt'
+                                torch.save(obj=self._skip_handlers[idx][skip_idx], pickle_module=dill, f=skip_path,
+                                           **_SAVE_LOAD_PARAMS)
+                            except BaseException as excptn:
+                                warnings.warn(f"Failed to save skip {idx}-{skip_idx} due to {excptn.__cause__}")
+
 
     def toDataParallel(self, devices: Union[List[int], int] = [], dim: int = 0) -> torch.nn.DataParallel:
         if isinstance(devices, int):
