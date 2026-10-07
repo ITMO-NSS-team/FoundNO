@@ -12,8 +12,10 @@
     2) сплит модели: last FNO block core -> w0 = [R.real, R.imag, W, b];
        печать слоёв, выбранных в качестве последних;
     3) low-rank GGN последнего фурье-слоя на train-лоадере;
-    4) калибровка scalar prior_prec на первом батче calib-части val (log10 grid, patience);
-    5) финальные метрики NLL (+RMSE) на val/test (limited max-eval-batches);
+    4) калибровка scalar prior_prec на всех сэмплах calib-части val
+       (полный log10-грид, пробы Хатчинсона переиспользуются по кандидатам);
+    5) финальные метрики NLL (+RMSE): val -- весь остаток val, test --
+       ограничен --max-eval-samples;
     6) сохранение GGN (LowRankTerms) и метрик в pkl в output-папке эксперимента
        (структура папок как в run_multiphysics_inference.py).
 
@@ -82,13 +84,15 @@ from luno_torch.adapter import (
     split_wrapper,
 )
 from luno_torch.affine import AffineLastBlock
-from luno_torch.calibrate import chi_squared, chi_squared_zero, grid_search, nll_gaussian
+from luno_torch.calibrate import chi_squared, nll_gaussian
 from luno_torch.factory import create_luno_cov
 from luno_torch.ggn import GGNMatvec, LowRankTerms, low_rank_ggn
 from luno_torch.jacobian import (
     LastFNOBlockWeightJacobian,
     check_jacobian,
     default_check_tol,
+    sample_congruence_probes,
+    var_from_congruence_probes,
     var_of_congruence,
 )
 from luno_torch.progress import set_enabled, tqdm
@@ -101,7 +105,7 @@ DTYPE = torch.float32
 CDTYPE = torch.complex64
 
 # Percentile levels for the per-sample sqrt(chi2) metric (percent over samples).
-SQRT_CHI2_PERCENTILES = (5, 25, 50, 75, 95, 99)
+SQRT_CHI2_PERCENTILES = (5, 25, 50, 75, 95)
 
 
 # ----------------------------------------------------------------------------
@@ -157,23 +161,26 @@ def parse_args():
                         "--sketch-blocksize у skerch на ro_sketch не влияет.")
     p.add_argument("--max-num-samples", type=int, default=25,
                    help="Макс. число сэмплов для GGN (как max_num_of_samples в luno).")
-    p.add_argument("--max-eval-samples", type=int, default=2,
-                   help="Макс. число сэмплов для финальных val/test метрик.")
     p.add_argument("--val-calib-frac", type=float, default=0.8,
                    help="Доля val, отдаваемая калибровке prior_prec. Остаток "
-                        "(1 - доля) идёт на валидацию с картинками и точным "
-                        "diag JJ^T. Требует >= 2 сэмплов в val, иначе ошибка.")
-    p.add_argument("--diag-hutchinson", type=int, default=0,
-                   help="Число проб Хатчинсона на ТЕСТОВОМ прогоне: вместо "
-                        "ceil(m/vjp_chunk) обратных проходов считается "
-                        "diag(J Sigma J^T) целиком прямым режимом (n_probe "
-                        "прямых проходов, при n_probe=16 это ~256x быстрее). "
-                        "0 -- выключено, точный обратный режим. На валидации "
-                        "точный путь всегда, независимо от флага.")
+                        "(1 - доля) идёт на валидацию с картинками и метриками "
+                        "(Хатчинсон, см. --diag-hutchinson). Требует >= 2 сэмплов "
+                        "в val, иначе ошибка.")
+    p.add_argument("--diag-hutchinson", type=int, default=200,
+                   help="Число проб Хатчинсона для diag(J Sigma J^T) НА ВСЕХ "
+                        "прогонах: калибровка prior_prec, val и test. Вместо "
+                        "ceil(m/vjp_chunk) обратных проходов считается вся "
+                        "конгруэнция прямым режимом (n_probe прямых проходов; при "
+                        "n_probe=16 это ~256x быстрее). 0 -- точный обратный путь, "
+                        "≈369 с/сэмпл (на калибровке или val это десятки часов, "
+                        "спросит подтверждение).")
+    p.add_argument("--calib-max-samples", type=int, default=0,
+                   help="Сколько сэмплов calib-loader реально уходит в калибровку "
+                        "prior_prec. 0 -- все (доля --val-calib-frac от val). "
+                        "Меньше всех -- только ради смоук-тестов.")
     p.add_argument("--calib-grid-min", type=float, default=-3.0)
     p.add_argument("--calib-grid-max", type=float, default=3.0)
     p.add_argument("--calib-grid-size", type=int, default=50)
-    p.add_argument("--calib-patience", type=int, default=5)
     p.add_argument("--calib-objective", choices=["chi2", "nll"], default="chi2",
                    help="Objective калибровки: 'chi2' -- |chi_squared - 1| "
                         "(дефолт, как в laplax), 'nll' -- NLL.")
@@ -497,53 +504,127 @@ def _batch_predictive_stats(model_fn, w0, weight_cov, x, out_normalizer,
 def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
                          out_normalizer, val_loader, affine, objective_name="chi2",
                          mode="forward", fwd_batch=4):
-    """Калибровка scalar prior_prec на первом батче ``val_loader`` (как luno_experiments).
+    """Калибровка scalar prior_prec на сэмплах калибровочной части val.
 
-    ``val_loader`` здесь -- это калибровочная часть val (см. ``--val-calib-frac``),
-    остальная часть идёт на валидацию с метриками и картинками.
+    ``val_loader`` здесь -- калибровочная часть val (см. ``--val-calib-frac``);
+    сколько из неё реально взять, решает ``--calib-max-samples`` (0 -- все).
+    Остаток val идёт на валидацию с метриками и картинками, поэтому решение о
+    ``prior_prec`` не принимается на тех же сэмплах, на которых считаются
+    отчётные метрики.
 
-    Jacobian на входе кэшируется один раз; по гриду меняется только cov.
+    Цикл инвертирован относительно ``grid_search``: сэмпл снаружи, грид внутри.
+    От ``prior_prec`` зависит только ``scalar``/``coeff`` (O(k)), а ``J@Z``,
+    ``J@U``, ``U^T Z`` и ``diag(JJ^T)`` -- нет, поэтому пробы считаются один раз
+    на сэмпл и переиспользуются для всех кандидатов; иначе каждый из
+    ``len(grid)`` кандидатов оплачивал бы свой прогон по сэмплам. Побочный
+    эффект -- никакого early-stop: цель считается по всему гриду целиком и
+    берётся точный ``argmin``.
+
     ``objective_name``: "chi2" -- |chi_squared - 1| (как дефолт в laplax),
-    "nll" -- negative log-likelihood.
+    "nll" -- negative log-likelihood. Обе складываются как суммы по элементам и
+    только потом делятся на общее число элементов, то есть усредняются по всем
+    элементам всех сэмплов, а не по сэмплам.
     """
-    calib_sample = next(iter(val_loader))
-    calib_sample = preprocess_sample(data_processor, calib_sample)
-    x = calib_sample[0]["x"]
-    target = calib_sample[0]["y"].reshape(-1)
-
-    with torch.no_grad():
-        out_shape = model_fn(x, w0).shape
-    num_output_channels = wrapper.num_output_channels
-    jac = LastFNOBlockWeightJacobian(
-        model_fn, x, w0, affine=affine, mode=mode, fwd_batch=fwd_batch,
-        num_output_channels=num_output_channels,
-        vjp_chunk=args.vjp_chunk,
+    n_total = len(val_loader.dataset)
+    n_calib = n_total if args.calib_max_samples <= 0 else min(
+        args.calib_max_samples, n_total
     )
-    mean_norm = jac.fx.reshape(-1)
+    n_probe = args.diag_hutchinson
 
     grid = torch.logspace(
         args.calib_grid_min, args.calib_grid_max, args.calib_grid_size, base=10.0
     )
+    # cov строится по кандидату, а не по сэмплу: linverse переиспользует тот же
+    # low_rank.U, поэтому все объекты держат один и тот же буфер (0.55 ГиБ при
+    # rank 5) и весят O(k) каждый.
+    covs = [create_luno_cov(low_rank, {"prior_prec": p}) for p in grid]
+    n_grid = len(covs)
+    _print_mem("calib_covs", w0.device)
+    chi2_acc = torch.zeros(n_grid, dtype=torch.float64, device=w0.device)
+    nll_acc = torch.zeros(n_grid, dtype=torch.float64, device=w0.device)
+    n_elements = 0
+    num_output_channels = wrapper.num_output_channels
+    how = f"Хатчинсон n_probe={n_probe}" if n_probe > 0 else "точный обратный путь"
+    print(f"\n[calibrate] prior_prec: {n_calib}/{n_total} сэмплов calib-loader, "
+          f"{n_grid} кандидатов грида, objective={objective_name}, {how}, "
+          f"fwd_batch={fwd_batch}")
 
-    def objective(prec):
-        cov = create_luno_cov(low_rank, {"prior_prec": prec})
-        var_norm = var_of_congruence(jac, cov)
-        std_norm = torch.sqrt(var_norm)
-        mean_raw, std_raw = raw_from_normalized(
-            mean_norm, std_norm, out_normalizer, out_shape
+    bar = tqdm(total=n_calib, desc="[calibrate] сэмплы", unit="smp", leave=False)
+    try:
+        for sample in iter_samples(val_loader, n_calib):
+            sample = preprocess_sample(data_processor, sample)
+            x = sample[0]["x"]
+            target_raw = sample[0]["y"]
+            target = target_raw.reshape(-1)
+            out_shape = None  # считается лениво, один forward на сэмпл
+            jac = LastFNOBlockWeightJacobian(
+                model_fn, x, w0, affine=affine, mode=mode, fwd_batch=fwd_batch,
+                num_output_channels=num_output_channels,
+                vjp_chunk=args.vjp_chunk,
+            )
+            A = B = W = None
+            try:
+                # fx == f(x, w0) уже ПЛОСКИЙ (см. _flat_fn), поэтому из него
+                # нельзя брать out_shape: нормализатору нужна форма
+                # (B, C_out, ...) для поканального broadcasting, иначе
+                # (65536,) * (4,1,1,1) раздувается до (4,1,1,65536) и chi2
+                # падает на несовпадении размеров с target. Форму берём отдельным
+                # forward'ом -- один раз на сэмпл, как в _batch_predictive_stats.
+                if out_shape is None:
+                    with torch.no_grad():
+                        out_shape = model_fn(x, w0).shape
+                mean_norm = jac.fx.reshape(-1)
+                if n_probe > 0:
+                    A, B, W = sample_congruence_probes(jac, covs[0].U, n_probe)
+                for i, cov in enumerate(covs):
+                    if n_probe > 0:
+                        var_norm = var_from_congruence_probes(A, B, W, cov)
+                    else:
+                        var_norm = var_of_congruence(jac, cov)
+                    std_norm = torch.sqrt(var_norm)
+                    mean_raw, std_raw = raw_from_normalized(
+                        mean_norm, std_norm, out_normalizer, out_shape
+                    )
+                    if objective_name == "chi2":
+                        chi2_acc[i] += chi_squared(
+                            mean_raw, std_raw, target, averaged=False
+                        )
+                    else:
+                        nll_acc[i] += nll_gaussian(
+                            mean_raw, std_raw, target, scaled=False
+                        )
+                n_elements += target.numel()
+            finally:
+                # Граф forward-замыкания (model_fn, x) держится за self, а в
+                # точном пути -- ещё и обратный граф. Освобождаем сразу: сам jac
+                # подавится привязкой в начале следующей итерации.
+                jac._release_vjp()
+            bar.update(1)
+    finally:
+        bar.close()
+
+    if not n_elements:
+        raise SystemExit(
+            f"Калибровка не увидела ни одного сэмпла: len(calib_loader.dataset)="
+            f"{n_total}, --calib-max-samples={args.calib_max_samples}."
         )
-        if objective_name == "chi2":
-            return chi_squared_zero(mean_raw, std_raw, target)
-        return nll_gaussian(mean_raw, std_raw, target, scaled=True)
-
-    best_value, best_idx = grid_search(
-        grid, objective, patience=args.calib_patience,
-        progress=True, desc="calibrate: prior_prec",
-    )
+    if objective_name == "chi2":
+        objective = (chi2_acc / n_elements - 1.0).abs()
+    else:
+        objective = nll_acc / n_elements
+    if not bool(torch.isfinite(objective).all()):
+        raise RuntimeError(
+            f"Objective калибровки не конечен ({objective.tolist()}, "
+            f"n_calib={n_calib}, n_probe={n_probe}): var неотрицателен по "
+            f"построению при n_probe>0, поэтому дело в target или в std."
+        )
+    best_idx = int(objective.argmin())
     best_prec = grid[best_idx]
     print(f"[calibrate] best prior_prec={best_prec.item():.6e}, "
-          f"{objective_name}={best_value:.6e}")
-    return {"prior_prec": best_prec, "objective": objective_name}
+          f"{objective_name}={float(objective[best_idx]):.6e} "
+          f"(на {n_calib} сэмплах, {n_grid} кандидатов)")
+    return {"prior_prec": best_prec, "objective": objective_name,
+            "samples": n_calib, "diag_probes": n_probe}
 
 
 def save_luno_images(pred, band, target, output_prefix, batch_idx):
@@ -588,7 +669,9 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
     валидации, на тесте это лишняя работа).
     ``diag_probes`` -- число проб Хатчинсона для ``diag(J Sigma J^T)`` (вся
     конгруэнция, не только ``diag(J J^T)``); 0 -- точный обратный режим.
-    Тестовый прогон гоним с ``>0`` ради скорости, валидационный всегда с 0.
+    Калибровка, val и test берут одно значение ``--diag-hutchinson``: смещение
+    оценщика зависит только от числа проб (``~2/n_probe`` на chi2), поэтому
+    держать его разным ради "эталонности" не нужно.
     """
     cov = create_luno_cov(low_rank, prior_args)
     nll_sum = torch.tensor(0.0, dtype=DTYPE)
@@ -685,6 +768,48 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
     return metrics
 
 
+# Измерено на r5_hutch_fix: 4096 чанков @ 11.23 chunk/s (m=65536, vjp_chunk=16)
+# -- то есть один сэмпл точного diag(J Sigma J^T) стоит ~369 с.
+EXACT_SEC_PER_SAMPLE = 369.0
+
+
+def confirm_exact_diag(args, pipeline):
+    """Просит подтверждение при --diag-hutchinson 0 (точный обратный путь).
+
+    Точный путь одинаково дорог на всех трёх стадиях -- калибровке, val и test,
+    -- поэтому оцениваем их разом и останавливаемся до GGN и до записи
+    low_rank_terms.pkl. Неинтерактивный запуск (setsid/nohup, как у нас
+    фоновые GPU-задачи) вопрос задать не может, поэтому там отказ сразу:
+    молча прогнать 83-часовой прогон нельзя.
+    """
+    if args.diag_hutchinson > 0:
+        return
+    n_calib = len(pipeline["calib_loader"].dataset)
+    n_val = len(pipeline["val_eval_loader"].dataset)
+    n_test = len(pipeline["test_loader"].dataset)
+    n_all = n_calib + n_val + n_test
+    total_h = EXACT_SEC_PER_SAMPLE * n_all / 3600.0
+    msg = (
+        f"--diag-hutchinson 0: точный обратный путь на {n_all} сэмплах "
+        f"≈ {total_h:.1f} ч (калибровка {n_calib} + val {n_val} + test {n_test}, "
+        f"~{EXACT_SEC_PER_SAMPLE:.0f} с/сэмпл)."
+    )
+    print(f"[!] {msg}")
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            f"{msg} Неинтерактивный запуск -- отказ. Перезапустите с "
+            f"--diag-hutchinson N (рекомендуется 200)."
+        )
+    try:
+        answer = input(" Продолжить? [y/N]: ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer not in ("y", "yes", "д", "да"):
+        raise SystemExit(
+            "Отменено. Перезапустите с --diag-hutchinson N (рекомендуется 200)."
+        )
+
+
 # ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
@@ -703,6 +828,7 @@ def main():
         raise SystemExit("--core-checkpoint обязателен.")
 
     pipeline = build_pipeline(args)
+    confirm_exact_diag(args, pipeline)
     core = pipeline["core"]
     lifting = pipeline["lifting"]
     projection = pipeline["projection"]
@@ -831,9 +957,11 @@ def main():
     print(f"[save] low_rank_terms -> {terms_path} "
           f"({terms_path.stat().st_size / 1024 ** 3:.2f} GiB)")
 
-    # --- калибровка на первом батче калибровочной части val (80%) ---
-    print(f"\n[calibrate] оптимизация prior_prec на первом батче calib_loader "
-          f"(доля {args.val_calib_frac} от val):")
+    # --- калибровка на сэмплах калибровочной части val (доля --val-calib-frac) ---
+    # Память здесь -- единственное, что отличает дешёвую калибровку от OOM: один
+    # прогон прямого режима стоит ~fwd_batch * активации сети, и если GGN оставил
+    # после себя буферы, места на него может не хватить.
+    _print_mem("before_calibrate", device)
     prior_args = calibrate_prior_prec(
         args, model_fn, w0, low_rank, wrapper, data_processor,
         data_processor.out_normalizer, pipeline["calib_loader"], affine,
@@ -843,9 +971,8 @@ def main():
 
     out_normalizer = data_processor.out_normalizer
 
-    # --- метрики после калибровки: валидация и тест считаются по-разному ---
-    # валидация (остаток val): точный diag JJ^T обратным режимом + картинки;
-    # тест: диагонь Хатчинсона ради скорости, без картинок.
+    # --- метрики после калибровки: val и test делят одно значение --diag-hutchinson ---
+    # val (остаток val): Хатчинсон + PNG; test: тот же Хатчинсон, без PNG.
     print("\n[metrics] финальные метрики после калибровки:")
     val_metrics = evaluate_luno(
         args, pipeline["val_eval_loader"], model_fn, w0, low_rank, prior_args,
@@ -858,7 +985,7 @@ def main():
     )
     test_metrics = evaluate_luno(
         args, pipeline["test_loader"], model_fn, w0, low_rank, prior_args, wrapper,
-        data_processor, out_normalizer, "test", args.max_eval_samples,
+        data_processor, out_normalizer, "test", len(pipeline["test_loader"].dataset),
         affine=affine,
         metrics_config=pipeline["config"].get("metrics", {}),
         output_dir=output_dir,
@@ -869,6 +996,9 @@ def main():
     results = {
         "prior_prec": prior_args["prior_prec"].item(),
         "calib_objective": prior_args.get("objective", args.calib_objective),
+        "calib_samples": prior_args["samples"],
+        "calib_diag_probes": prior_args["diag_probes"],
+        "calib_max_samples": args.calib_max_samples,
         "val": val_metrics,
         "test": test_metrics,
         "max_rank": args.max_rank,
@@ -876,6 +1006,8 @@ def main():
         "ggn_oversample": args.ggn_oversample,
         "max_num_samples_ggn": args.max_num_samples,
         "diag_hutchinson": args.diag_hutchinson,
+        "max_eval_samples": len(pipeline["val_eval_loader"].dataset),
+        "max_test_samples": len(pipeline["test_loader"].dataset),
         "val_calib_frac": args.val_calib_frac,
     }
     with open(output_dir / "metrics" / "val_metrics.pkl", "wb") as f:

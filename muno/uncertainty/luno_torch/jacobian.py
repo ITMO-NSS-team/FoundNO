@@ -210,11 +210,20 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         держит ОДНОВРЕМЕННО и список чанков (m, k), и результат (m, k), то есть
         удваивает пик. При d = 27.6M и k = rank это лишние ~5 ГиБ на rank = 50,
         которых не хватает вместе со скетчем.
+
+        Возвращаемое значение всегда ``requires_grad=False``. При включённом grad
+        mode тангенс ``torch.func.jvp`` наследует град от параметров сети, а
+        присваивание его в ``out`` делает ``out`` grad-трекаемым с ``grad_fn =
+        CopySlices``. Такой тензор удерживает ПОЛНЫЙ прямой граф сети (~0.41 ГиБ
+        при d = 27.6M), и каждый ``J @ W`` привязывает к результату свой граф:
+        запись в накопитель проб (см. ``sample_congruence_probes``) копила их по
+        0.41 ГиБ на чанк и уходила в OOM уже на 35-м из 50. ``.detach()``
+        отбрасывает граф без копирования -- значения побитово те же.
         """
         flat_fn = self._flat_fn
         w0 = self._w0
         if weights.dim() == 1:
-            return torch.func.jvp(flat_fn, (w0,), (weights,))[1]
+            return torch.func.jvp(flat_fn, (w0,), (weights,))[1].detach()
         k = weights.shape[-1]
         m = self.fx.numel()
         if k == 0:
@@ -229,7 +238,7 @@ class LastFNOBlockWeightJacobian(LinearOperator):
                 lambda t: torch.func.jvp(flat_fn, (w0,), (t,))[1],
                 in_dims=0, out_dims=0,
             )(tangents)  # (b, m)
-            out[:, c0:c1] = outs.transpose(0, 1)
+            out[:, c0:c1] = outs.transpose(0, 1).detach()
             del tangents, outs
         return out
 
@@ -295,8 +304,9 @@ class LastFNOBlockWeightJacobian(LinearOperator):
 
         Ошибка на один элемент ~ ``sqrt(2/n_probe)`` (на пробе chi2_1), то есть
         n_probe = 16 даёт ~20%, n_probe = 64 -- ~6%. ``n_probe`` -- это обмен
-        скорости на точность; валидация идёт с точным диагоном, чтобы картинки и
-        эталонные метрики не зависели от числа проб.
+        скорости на точность; калибровка, val и test делят одно значение флага
+        ``--diag-hutchinson``, а число проб не влияет на смещение оценщика var
+        (оно ``~2/p``), только на его разброс.
 
         Обратный граф не строится, поэтому ``_release_vjp`` не требуется.
         """
@@ -373,6 +383,67 @@ def _cov_sqrt_isotropic_lowrank(
     return torch.sqrt(scalar), U, coeff
 
 
+def sample_congruence_probes(
+    J: LastFNOBlockWeightJacobian,
+    U: torch.Tensor,
+    n_probe: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Пробы Хатчинсона, не зависящие от ``Sigma``: ``(A, B, W) = (J@Z, J@U, U^T Z)``.
+
+    ``A`` формы ``(m, n_probe)``, ``B`` -- ``(m, k)``, ``W`` -- ``(k, n_probe)``,
+    где ``Z ∈ {±1}^{d×n_probe}`` выбирается один раз на весь прогон и чанкуется
+    по ``fwd_batch``: полный ``Z`` весил бы ``d * n_probe * 4`` байт, то есть
+    22 ГиБ при ``d = 27.6M`` и ``n_probe = 200``.
+
+    Кроме ``U`` здесь ничего не зависит от ``Sigma``, поэтому однажды посчитанные
+    величины переиспользуются для всего грида ``prior_prec``: на каждом кандидате
+    меняются только ``scalar``/``coeff`` (``O(k)``), а ``n_probe`` прямых проходов
+    не повторяются. Одинаковый ``Z`` на всех кандидатах даёт common random numbers
+    -- цель по ``prior_prec`` получается гладкой, а не зашумлённой независимым
+    шумом на каждой итерации.
+
+    Память -- ``(m, n_probe) + (m, k)`` байт (~52 МБ при ``m = 65536`` и
+    ``n_probe = 200``, против ``U`` на 553 МБ при rank 5) плюс обычный рабочий
+    буфер прямого режима ``fwd_batch * d * 4`` байт.
+    """
+    if n_probe < 1:
+        raise ValueError(f"n_probe должен быть >= 1, получено {n_probe}")
+    w0 = J._w0
+    m = J._fx_numel()
+    k = U.shape[1]
+    dtype, device = w0.dtype, w0.device
+    A = torch.empty(m, n_probe, dtype=dtype, device=device)
+    B = J._matmul(U)
+    W = torch.empty(k, n_probe, dtype=dtype, device=device)
+    step = max(1, J._fwd_batch)
+    for c0 in range(0, n_probe, step):
+        c1 = min(c0 + step, n_probe)
+        # Bernoulli in-place -> {-1, +1} без второго буфера под Z.
+        Z = torch.empty(w0.numel(), c1 - c0, dtype=dtype, device=device)
+        Z.bernoulli_(0.5).mul_(2).sub_(1)
+        A[:, c0:c1] = J._matmul(Z)
+        W[:, c0:c1] = U.transpose(0, 1) @ Z
+        del Z
+    return A, B, W
+
+
+def var_from_congruence_probes(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    W: torch.Tensor,
+    Sigma: IsotropicScalingPlusSymmetricLowRank,
+) -> torch.Tensor:
+    """``diag(J Sigma J^T)`` из проб, взятых в :func:`sample_congruence_probes`.
+
+    ``T = scale * (A + (B*coeff) @ W)`` -- это ровно ``J Sigma^{1/2} Z``, поэтому
+    ``mean_p T_ip^2`` -- безсмещённая оценка искомой диагонали и сумма квадратов,
+    то есть неотрицательна по построению (см. :func:`_var_of_congruence_hutchinson`).
+    """
+    scale, _, coeff = _cov_sqrt_isotropic_lowrank(Sigma)
+    T = scale * (A + (B * coeff) @ W)
+    return (T ** 2).sum(dim=1) / A.shape[1]
+
+
 def _var_of_congruence_hutchinson(
     J: LastFNOBlockWeightJacobian,
     Sigma: IsotropicScalingPlusSymmetricLowRank,
@@ -398,21 +469,13 @@ def _var_of_congruence_hutchinson(
 
     Стоимость прежняя: один ``J @ U`` (нужен и точному пути) плюс ``n_probe``
     прямых проходов на ``J @ Z``; ``U^T Z`` и ``(k, c)``-умножения пренебрежимо дёшевы.
+
+    Обёртка над :func:`sample_congruence_probes` + :func:`var_from_congruence_probes`:
+    ради переиспользования проб на гриде ``prior_prec`` они вынесены наружу, а сами
+    оценки для одного и того же ``Z`` совпадают байт-в-байт.
     """
-    scale, U, coeff = _cov_sqrt_isotropic_lowrank(Sigma)
-    m = J._fx_numel()
-    w0 = J._w0
-    acc = torch.zeros(m, dtype=w0.dtype, device=w0.device)
-    JU = J._matmul(U) * coeff
-    step = max(1, J._fwd_batch)
-    for c0 in range(0, n_probe, step):
-        c = min(step, n_probe - c0)
-        Z = torch.empty(w0.numel(), c, dtype=w0.dtype, device=w0.device)
-        Z.bernoulli_(0.5).mul_(2).sub_(1)
-        T = scale * (J._matmul(Z) + JU @ (U.transpose(0, 1) @ Z))
-        acc.add_((T ** 2).sum(dim=1))
-        del Z, T
-    return acc / n_probe
+    A, B, W = sample_congruence_probes(J, Sigma.U, n_probe)
+    return var_from_congruence_probes(A, B, W, Sigma)
 
 
 def var_of_congruence(
