@@ -11,13 +11,16 @@
        (rmi.loadData; val-сплит 0.1 -> данные для калибровки);
     2) сплит модели: last FNO block core -> w0 = [R.real, R.imag, W, b];
        печать слоёв, выбранных в качестве последних;
-    3) low-rank GGN последнего фурье-слоя на train-лоадере;
+    3) low-rank GGN последнего фурье-слоя на train-лоадере; при заданном
+       --ggn-checkpoint шаг пропускается и LowRankTerms читается из pickle
+       (файла нет -- предупреждение и расчёт как обычно);
     4) калибровка scalar prior_prec на всех сэмплах calib-части val
        (полный log10-грид, пробы Хатчинсона переиспользуются по кандидатам);
     5) финальные метрики NLL (+RMSE): val -- весь остаток val, test --
        ограничен --max-eval-samples;
-    6) сохранение GGN (LowRankTerms) и метрик в pkl в output-папке эксперимента
-       (структура папок как в run_multiphysics_inference.py).
+    6) сохранение GGN (LowRankTerms, если он считался, а не загружен) и метрик
+       в pkl в output-папке эксперимента (структура папок как в
+       run_multiphysics_inference.py).
 
 Запуск (флаги -- как в run_multiphysics_inference.py):
     python muno/uncertainty/run_luno_ggn_calibrate.py \
@@ -146,6 +149,15 @@ def parse_args():
                         "пути (diag JJ^T, transpose). На Jv/J@W не влияет: они "
                         "считаются прямым режимом (--jv-mode), без строк J.")
     p.add_argument("--max-rank", type=int, default=10, help="Low-rank rank для GGN.")
+    p.add_argument("--ggn-checkpoint", type=str, default=None,
+                   help="Путь к pickle с LowRankTerms (артефакт *_low_rank_terms.pkl "
+                        "из прошлого прогона). Если файл найден и валиден -- расчёт "
+                        "GGN пропускается целиком (сбор сэмплов, GGNMatvec, скетч), "
+                        "артефакт в новый ранг не пишется, а --max-rank/--ggn-method/"
+                        "--ggn-oversample/--max-num-samples игнорируются: авторитетен "
+                        "ранг из чекпойнта. Если файла нет -- предупреждение и GGN "
+                        "считается как обычно (сохранение артефакта тоже). Битый или "
+                        "несовместимый (другая d) файл -- ошибка.")
     p.add_argument("--ggn-method", type=str, default="randomized",
                    choices=["randomized", "skerch"],
                    help="Метод низкоранговой аппроксимации GGN. "
@@ -470,6 +482,49 @@ def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor, affin
     )
     print(f"[GGN] low-rank terms: U={tuple(low_rank.U.shape)} S={tuple(low_rank.S.shape)}")
     return low_rank
+
+
+def load_low_rank_ggn(path, w0):
+    """Читает LowRankTerms из pickle (артефакт *_low_rank_terms.pkl).
+
+    Возвращает ``None``, если файла нет -- тогда вызывающий код считает GGN
+    как обычно (предупреждение печатается здесь). Файл с другими проблемами
+    (битый pickle, не LowRankTerms, несовместимая d) даёт исключение: путь
+    указан явно, молчаливый пересчёт спрячет опечатку.
+
+    U/S лежат на CPU (это CPU-копия для pickle), переносятся на устройство и
+    точность ``w0``.
+    """
+    p = rmi.resolve_path(path)
+    if not p.is_file():
+        print(f"[GGN] --ggn-checkpoint: файла нет ({p}); считаю GGN как обычно.")
+        return None
+    with open(p, "rb") as f:
+        terms = pickle.load(f)
+    if not isinstance(terms, LowRankTerms):
+        raise TypeError(
+            f"--ggn-checkpoint: ожидался LowRankTerms, получен "
+            f"{type(terms).__name__} ({p})."
+        )
+    U, S = terms.U, terms.S
+    if U.ndim != 2:
+        raise ValueError(f"--ggn-checkpoint: U.ndim={U.ndim}, ожидалось 2 ({p}).")
+    if S.ndim != 1 or S.numel() != U.shape[1]:
+        raise ValueError(
+            f"--ggn-checkpoint: S {tuple(S.shape)} не согласуется с U "
+            f"{tuple(U.shape)} (нужен S длины U.shape[1]) ({p})."
+        )
+    if U.shape[0] != w0.numel():
+        raise ValueError(
+            f"--ggn-checkpoint: U.shape[0]={U.shape[0]} != w0.numel()="
+            f"{w0.numel()} -- GGN от другой модели или другого сплита ({p})."
+        )
+    U = U.to(device=w0.device, dtype=w0.dtype)
+    S = S.to(device=w0.device, dtype=w0.dtype)
+    scalar = terms.scalar.to(device=w0.device) if isinstance(terms.scalar, torch.Tensor) else terms.scalar
+    print(f"[GGN] загружен из {p}: U={tuple(U.shape)} S={tuple(S.shape)} "
+          f"scalar={scalar}, dtype={U.dtype}, device={U.device}")
+    return LowRankTerms(U=U, S=S, scalar=scalar)
 
 
 def _batch_predictive_stats(model_fn, w0, weight_cov, x, out_normalizer,
@@ -937,25 +992,31 @@ def main():
         )
     _print_mem("after_jv_check", device)
 
-    # --- low-rank GGN на train ---
-    print("\n[GGN] low-rank аппроксимация GGN последнего фурье-слоя (train loader):")
-    low_rank = compute_low_rank_ggn(
-        args, model_fn, w0, pipeline["train_loader"], data_processor, affine,
-        mode=args.jv_mode, fwd_batch=args.fwd_batch,
+    # --- low-rank GGN на train (или загрузка готового из --ggn-checkpoint) ---
+    print("\n[GGN] low-rank аппроксимация GGN последнего фурье-слоя:")
+    low_rank = (
+        load_low_rank_ggn(args.ggn_checkpoint, w0) if args.ggn_checkpoint else None
     )
+    ggn_loaded = low_rank is not None
+    if not ggn_loaded:
+        low_rank = compute_low_rank_ggn(
+            args, model_fn, w0, pipeline["train_loader"], data_processor, affine,
+            mode=args.jv_mode, fwd_batch=args.fwd_batch,
+        )
 
-    # U имеет форму (d, rank) -- при d = 27.6M и rank = 50 это 5.15 ГиБ. Пишем
-    # артефакт с CPU-копией: сам pickle всё равно такой размер, но GPU-копия
-    # продолжает жить в low_rank для калибровки и метрик.
-    low_rank_cpu = LowRankTerms(
-        U=low_rank.U.detach().to("cpu"), S=low_rank.S.detach().to("cpu"),
-        scalar=low_rank.scalar,
-    )
-    terms_path = output_dir / f"{run_prefix}_low_rank_terms.pkl"
-    with open(terms_path, "wb") as f:
-        pickle.dump(low_rank_cpu, f)
-    print(f"[save] low_rank_terms -> {terms_path} "
-          f"({terms_path.stat().st_size / 1024 ** 3:.2f} GiB)")
+        # U имеет форму (d, rank) -- при d = 27.6M и rank = 50 это 5.15 ГиБ. Пишем
+        # артефакт с CPU-копией: сам pickle всё равно такой размер, но GPU-копия
+        # продолжает жить в low_rank для калибровки и метрик. При загрузке из
+        # --ggn-checkpoint шаг пропускается: артефакт уже есть в чекпойнте.
+        low_rank_cpu = LowRankTerms(
+            U=low_rank.U.detach().to("cpu"), S=low_rank.S.detach().to("cpu"),
+            scalar=low_rank.scalar,
+        )
+        terms_path = output_dir / f"{run_prefix}_low_rank_terms.pkl"
+        with open(terms_path, "wb") as f:
+            pickle.dump(low_rank_cpu, f)
+        print(f"[save] low_rank_terms -> {terms_path} "
+              f"({terms_path.stat().st_size / 1024 ** 3:.2f} GiB)")
 
     # --- калибровка на сэмплах калибровочной части val (доля --val-calib-frac) ---
     # Память здесь -- единственное, что отличает дешёвую калибровку от OOM: один
@@ -1005,6 +1066,15 @@ def main():
         "ggn_method": args.ggn_method,
         "ggn_oversample": args.ggn_oversample,
         "max_num_samples_ggn": args.max_num_samples,
+        # Откуда взят low-rank: "checkpoint" -- загружен из --ggn-checkpoint
+        # (артефакт не переписывался), "computed" -- посчитан на train loader.
+        # ggn_rank -- фактический ранг (из чекпойнта, если он авторитетен),
+        # max_rank остаётся значением CLI, чтобы не ломать сравнение с ранами.
+        "ggn_source": "checkpoint" if ggn_loaded else "computed",
+        "ggn_checkpoint": (
+            str(rmi.resolve_path(args.ggn_checkpoint)) if ggn_loaded else None
+        ),
+        "ggn_rank": int(low_rank.U.shape[1]),
         "diag_hutchinson": args.diag_hutchinson,
         "max_eval_samples": len(pipeline["val_eval_loader"].dataset),
         "max_test_samples": len(pipeline["test_loader"].dataset),
