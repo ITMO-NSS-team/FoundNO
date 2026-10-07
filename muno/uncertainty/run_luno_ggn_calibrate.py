@@ -101,7 +101,7 @@ DTYPE = torch.float32
 CDTYPE = torch.complex64
 
 # Percentile levels for the per-sample sqrt(chi2) metric (percent over samples).
-SQRT_CHI2_PERCENTILES = (5, 25, 50, 75, 95)
+SQRT_CHI2_PERCENTILES = (5, 25, 50, 75, 95, 99)
 
 
 # ----------------------------------------------------------------------------
@@ -159,9 +159,6 @@ def parse_args():
                    help="Макс. число сэмплов для GGN (как max_num_of_samples в luno).")
     p.add_argument("--max-eval-samples", type=int, default=2,
                    help="Макс. число сэмплов для финальных val/test метрик.")
-    p.add_argument("--max-val-eval-samples", type=int, default=2,
-                   help="Макс. число сэмплов для метрик на валидационной части "
-                        "val (с картинками и точным diag JJ^T).")
     p.add_argument("--val-calib-frac", type=float, default=0.8,
                    help="Доля val, отдаваемая калибровке prior_prec. Остаток "
                         "(1 - доля) идёт на валидацию с картинками и точным "
@@ -852,12 +849,12 @@ def main():
     print("\n[metrics] финальные метрики после калибровки:")
     val_metrics = evaluate_luno(
         args, pipeline["val_eval_loader"], model_fn, w0, low_rank, prior_args,
-        wrapper, data_processor, out_normalizer, "val", args.max_val_eval_samples,
+        wrapper, data_processor, out_normalizer, "val", len(pipeline["val_eval_loader"].dataset),
         affine=affine,
         metrics_config=pipeline["config"].get("metrics", {}),
         output_dir=output_dir,
         mode=args.jv_mode, fwd_batch=args.fwd_batch,
-        save_images=True, diag_probes=0,
+        save_images=True, diag_probes=args.diag_hutchinson,
     )
     test_metrics = evaluate_luno(
         args, pipeline["test_loader"], model_fn, w0, low_rank, prior_args, wrapper,
