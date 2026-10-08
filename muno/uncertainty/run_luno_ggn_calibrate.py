@@ -47,6 +47,7 @@ conv + skip (касательные веса, обычный forward без AD) 
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import pickle
 import sys
@@ -70,6 +71,8 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 from torch.func import functional_call
 from torch.utils.data import DataLoader, Subset
+
+from scipy.stats import spearmanr
 
 from muno.data.benchmarks.datasets import MultiPhysicsDataset
 from muno.data.benchmarks.inspections import (
@@ -193,7 +196,7 @@ def parse_args():
     p.add_argument("--calib-grid-min", type=float, default=-3.0)
     p.add_argument("--calib-grid-max", type=float, default=3.0)
     p.add_argument("--calib-grid-size", type=int, default=50)
-    p.add_argument("--calib-objective", choices=["chi2", "nll"], default="chi2",
+    p.add_argument("--calib-objective", choices=["chi2", "nll"], default="nll",
                    help="Objective калибровки: 'chi2' -- |chi_squared - 1| "
                         "(дефолт, как в laplax), 'nll' -- NLL.")
     p.add_argument("--no-progress", action="store_true",
@@ -708,6 +711,34 @@ def save_luno_images(pred, band, target, output_prefix, batch_idx):
                    "luno sqrt(chi2)")
 
 
+def spearman_corr(a, b) -> float:
+    """Коэффициент корреляции Спирмена по двум плоским векторам одного сэмпла.
+
+    Оба тензора неподвижно переводятся в numpy (rank-корреляция считается по
+    рангам, точность float32 достаточно). Если кто-то из векторов вырожден
+    (min == max), rho не определён: возвращаем nan БЕЗ вызова scipy, иначе
+    scipy выпустит ConstantInputWarning на каждом сэмпле -- то есть на сотни
+    строк в логе. Вырожденные сэмплы выбрасываются из среднего (см.
+    mean_finite), о чём evaluate_luno печатает spearman_valid=k/n.
+    """
+    a = a.detach().reshape(-1).float().cpu().numpy()
+    b = b.detach().reshape(-1).float().cpu().numpy()
+    if a.size < 2 or a.min() == a.max() or b.min() == b.max():
+        return float("nan")
+    return float(spearmanr(a, b).statistic)
+
+
+def mean_finite(values) -> float:
+    """Среднее по конечным значениям; nan, если конечных нет вообще.
+
+    Нужно для метрик, которые считаются на сэмпл и могут дать nan на
+    вырожденном сэмпле (luno_spearman_std_resid): один плохой сэмпл не должен
+    обнулять всю метрику.
+    """
+    finite = [v for v in values if math.isfinite(v)]
+    return sum(finite) / len(finite) if finite else float("nan")
+
+
 def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
                   data_processor, out_normalizer, task_name, max_samples,
                   affine, metrics_config=None, output_dir=None,
@@ -719,6 +750,14 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
     ``luno_sqrt_chi2_*`` -- статистики приведённого sqrt(chi2) = sqrt(chi2 /
     n_elements) (RMS стандартизованного остатка, ~1 при идеальной калибровке),
     посчитанные по каждому сэмплу: перцентили p5/p25/p50/p75/p95 и среднее.
+
+    ``luno_spearman_std_resid`` -- коэффициент корреляции Спирмена между
+    ``std_raw`` и остатком ``|mean_raw - target|`` ПО ВСЕМ элементам одного
+    сэмпла (все каналы склеены), усреднённый по сэмплам. Показывает, растёт ли
+    неопределённость там, где ошибка большая: 1 -- идеальный монотонный рост,
+    0 -- связи нет, < 0 -- неопределённость антагонична ошибке. Сэмпл с
+    вырожденным (константным) std или остатком даёт nan и в среднее не входит
+    (в логе это видно как ``spearman_valid=k/n``).
 
     ``save_images=False`` -- не писать PNG (диагностику смотрим только на
     валидации, на тесте это лишняя работа).
@@ -733,6 +772,7 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
     rmse_sum = torch.tensor(0.0, dtype=DTYPE)
     chi2_sum = torch.tensor(0.0, dtype=DTYPE)
     sqrt_chi2_samples = []
+    spearman_samples = []  # по одному rho на сэмпл; nan на вырожденных
     cfg_sums = {}
     n_elements = 0
     n_samples = 0
@@ -763,6 +803,11 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
             rmse_sum = rmse_sum + torch.sqrt(torch.mean((mean_raw - target) ** 2))
             chi2_sample = chi_squared(mean_raw, std_raw, target, averaged=False)
             chi2_sum = chi2_sum + chi2_sample
+            # Корреляция Спирмена std_raw <-> |остаток| по всем элементам сэмпла
+            # (все каналы склеены): один rho на сэмпл, среднее -- в конце.
+            spearman_samples.append(
+                spearman_corr(std_raw, (mean_raw - target).abs())
+            )
             # Приведённый sqrt(chi2) одного сэмпла: sqrt(chi2 / n_elements).
             n_elem_sample = target.numel()
             if n_elem_sample:
@@ -806,6 +851,11 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
             sqrt_chi2_pct[f"luno_sqrt_chi2_p{q}"] = v
         sqrt_chi2_pct["luno_sqrt_chi2_mean"] = vals.mean().item()
 
+    # Спирмен std_raw <-> |остаток|: одно среднее по сэмплам, невырожденные
+    # (конечные) rho. Если выпавших сэмплов нет -- без суффикса в логе.
+    spearman = mean_finite(spearman_samples)
+    n_spearman_valid = sum(1 for v in spearman_samples if math.isfinite(v))
+
     cfg_metrics = {name: value / n_samples for name, value in cfg_sums.items()}
     metrics = {
         **cfg_metrics,
@@ -813,13 +863,19 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
         "luno_nll": nll,
         "luno_rmse": rmse,
         "luno_chi2": chi2,
+        "luno_spearman_std_resid": spearman,
         "samples": n_samples,
     }
     cfg_str = " ".join(f"{k}={v:.6e}" for k, v in cfg_metrics.items())
     pct_str = " ".join(f"{k}={v:.6e}" for k, v in sqrt_chi2_pct.items())
+    valid_str = (
+        f" spearman_valid={n_spearman_valid}/{n_samples}"
+        if n_spearman_valid != n_samples else ""
+    )
     print(f"[eval:{task_name}] luno_nll={nll:.6e} luno_rmse={rmse:.6e} "
-          f"luno_chi2={chi2:.6e} {pct_str} {cfg_str} "
-          f"(samples={n_samples}, elements={n_elements})")
+          f"luno_chi2={chi2:.6e} luno_spearman_std_resid={spearman:.6e} "
+          f"{pct_str} {cfg_str} "
+          f"(samples={n_samples}, elements={n_elements}{valid_str})")
     return metrics
 
 
