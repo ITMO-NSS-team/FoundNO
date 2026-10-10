@@ -113,6 +113,11 @@ CDTYPE = torch.complex64
 # Percentile levels for the per-sample sqrt(chi2) metric (percent over samples).
 SQRT_CHI2_PERCENTILES = (5, 25, 50, 75, 95)
 
+# Перцентиль элементного sqrt(chi2) внутри одного канала (percent по элементам
+# канала, затем среднее по сэмплам). Отдельная константа, не из
+# SQRT_CHI2_PERCENTILES: там перцентили берутся МЕЖДУ сэмплами.
+PER_CHANNEL_PCT = 99
+
 
 # ----------------------------------------------------------------------------
 # Аргументы
@@ -739,11 +744,52 @@ def mean_finite(values) -> float:
     return sum(finite) / len(finite) if finite else float("nan")
 
 
+def channel_key_names(channel_names, n_ch) -> list:
+    """Имена каналов для ключей метрик: из конфига или ch0..ch{C-1}.
+
+    ``channel_names`` -- adapter.variable_names (порядок = ось канала).
+    Конфиг не обязан совпадать с моделью (другой бенчмарк, переименование),
+    поэтому при расхождении длины молча уходим на индексы: лучше потерять
+    подписи, чем подписать канал чужим именем.
+    """
+    if channel_names and len(channel_names) == n_ch:
+        return [str(name) for name in channel_names]
+    return [f"ch{i}" for i in range(n_ch)]
+
+
+def per_channel_p99(pred, std, target, pct=PER_CHANNEL_PCT) -> list:
+    """Перцентиль ``pct`` элементного sqrt(chi2) = |pred - target| / std ПО КАЖДОМУ КАНАЛУ.
+
+    Формы ``(B=1, C, ...)``: ось канала = 1 (см.
+    ``_get_channelwise_reduce_dims`` и ``canonical_image``), режем как
+    ``t[0, c]``. В отличие от ``luno_sqrt_chi2_p*`` (RMS приведённого
+    sqrt(chi2) на сэмпл, перцентили МЕЖДУ сэмплами) здесь перцентиль берётся
+    ПО ЭЛЕМЕНТАМ внутри одного канала -- это хвосты распределения
+    стандартизованного остатка, посмотренные отдельно на каждом поле.
+
+    ``std == 0`` даёт inf, а один inf отравил бы весь перцентиль (``quantile``
+    возвращает nan), поэтому не-конечные значения переводятся в nan и
+    отбрасываются ``nanquantile``'ом. Пустой канал (нет конечных значений)
+    даёт nan.
+    """
+    if pred.shape[0] != 1:
+        raise ValueError(
+            f"per_channel_p99: ожидался батч из одного сэмпла (B=1), "
+            f"получено {pred.shape[0]}"
+        )
+    sq = ((pred - target).abs() / std).reshape(pred.shape[1], -1)
+    if sq.numel() == 0:
+        return [float("nan") for _ in range(pred.shape[1])]
+    sq = torch.nan_to_num(sq, nan=float("nan"),
+                          posinf=float("nan"), neginf=float("nan"))
+    return [float(v) for v in torch.nanquantile(sq, pct / 100.0, dim=1)]
+
+
 def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
                   data_processor, out_normalizer, task_name, max_samples,
                   affine, metrics_config=None, output_dir=None,
                   mode="forward", fwd_batch=4,
-                  save_images=True, diag_probes=0):
+                  save_images=True, diag_probes=0, channel_names=None):
     """Метрики на eval-сэмплах.
 
     ``luno_chi2`` -- глобальное среднее chi2 по элементам всех сэмплов.
@@ -759,6 +805,18 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
     вырожденным (константным) std или остатком даёт nan и в среднее не входит
     (в логе это видно как ``spearman_valid=k/n``).
 
+    ``luno_sqrt_chi2_{канал}_p99`` и ``luno_sqrt_chi2_chmean_p99`` -- 99-й
+    перцентиль ЭЛЕМЕНТНОГО sqrt(chi2) = |mean - target| / std, взятый внутри
+    одного канала (16384 элементов при 128x128), затем усреднённый по сэмплам.
+    По одному ключу на канал (имена из ``adapter.variable_names``, при
+    расхождении с числом выходов -- ``ch0..``) плюс сводный: среднее по
+    каналам внутри сэмпла, потом по сэмплам. Это НЕ то же самое, что
+    ``luno_sqrt_chi2_p*`` выше: там -- RMS приведённого sqrt(chi2) на сэмпл и
+    перцентили между сэмплами, здесь -- хвосты распределения остатка по
+    элементам каждого поля. При хорошо откалиброванном гауссе ориентир
+    p99(|N(0,1)|) ~ 2.58. Сэмпл, где в канале нет конечных значений, даёт nan
+    и в среднее по этому каналу не входит (``p99_valid=k/n`` в логе).
+
     ``save_images=False`` -- не писать PNG (диагностику смотрим только на
     валидации, на тесте это лишняя работа).
     ``diag_probes`` -- число проб Хатчинсона для ``diag(J Sigma J^T)`` (вся
@@ -773,6 +831,7 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
     chi2_sum = torch.tensor(0.0, dtype=DTYPE)
     sqrt_chi2_samples = []
     spearman_samples = []  # по одному rho на сэмпл; nan на вырожденных
+    ch_p99_samples = []  # по одному списку длины C на сэмпл; nan на пустых каналах
     cfg_sums = {}
     n_elements = 0
     n_samples = 0
@@ -822,6 +881,12 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
             band = {0: std_raw.reshape(out_shape)}
             target_dict = {0: target_raw}
 
+            # 99-й перцентиль элементного sqrt(chi2) по каждому каналу отдельно
+            # (хвосты остатка по полям); усреднение -- после цикла.
+            ch_p99_samples.append(
+                per_channel_p99(pred[0], band[0], target_dict[0])
+            )
+
             if output_prefix is not None:
                 save_luno_images(pred, band, target_dict, output_prefix, n_samples - 1)
 
@@ -856,10 +921,29 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
     spearman = mean_finite(spearman_samples)
     n_spearman_valid = sum(1 for v in spearman_samples if math.isfinite(v))
 
+    # Перцентиль элементного sqrt(chi2) по каналам: одно среднее по сэмплам на
+    # канал плюс сводное (внутри сэмпла среднее по каналам, потом по сэмплам).
+    # Сэмпл считается валидным, если конечны p99 всех каналов сразу.
+    ch_pct = {}
+    n_chp99_valid = 0
+    if ch_p99_samples:
+        keys = channel_key_names(channel_names, len(ch_p99_samples[0]))
+        for c, key in enumerate(keys):
+            ch_pct[f"luno_sqrt_chi2_{key}_p99"] = mean_finite(
+                row[c] for row in ch_p99_samples
+            )
+        ch_pct["luno_sqrt_chi2_chmean_p99"] = mean_finite(
+            mean_finite(row) for row in ch_p99_samples
+        )
+        n_chp99_valid = sum(
+            1 for row in ch_p99_samples if all(math.isfinite(v) for v in row)
+        )
+
     cfg_metrics = {name: value / n_samples for name, value in cfg_sums.items()}
     metrics = {
         **cfg_metrics,
         **sqrt_chi2_pct,
+        **ch_pct,
         "luno_nll": nll,
         "luno_rmse": rmse,
         "luno_chi2": chi2,
@@ -876,6 +960,14 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
           f"luno_chi2={chi2:.6e} luno_spearman_std_resid={spearman:.6e} "
           f"{pct_str} {cfg_str} "
           f"(samples={n_samples}, elements={n_elements}{valid_str})")
+    if ch_pct:
+        ch_pct_str = " ".join(f"{k}={v:.6e}" for k, v in ch_pct.items())
+        ch_valid_str = (
+            f" p99_valid={n_chp99_valid}/{n_samples}"
+            if n_chp99_valid != n_samples else ""
+        )
+        print(f"[eval:{task_name}] sqrt_chi2_p{PER_CHANNEL_PCT} по каналам "
+              f"(среднее по {n_samples} сэмплам): {ch_pct_str}{ch_valid_str}")
     return metrics
 
 
@@ -1090,6 +1182,13 @@ def main():
 
     # --- метрики после калибровки: val и test делят одно значение --diag-hutchinson ---
     # val (остаток val): Хатчинсон + PNG; test: тот же Хатчинсон, без PNG.
+    # Имена каналов для per-channel метрик: adapter.variable_names первого
+    # таска (порядок совпадает с осью канала). Конфиг может разойтись с
+    # моделью -- внутри evaluate_luno это проверяется по длине и уходит на ch0..
+    _tasks = ((pipeline["config"] or {}).get("tasks") or [])
+    _first_task = _tasks[0] if isinstance(_tasks, list) and _tasks else _tasks
+    channel_names = ((_first_task or {}).get("adapter") or {}).get("variable_names")
+
     print("\n[metrics] финальные метрики после калибровки:")
     val_metrics = evaluate_luno(
         args, pipeline["val_eval_loader"], model_fn, w0, low_rank, prior_args,
@@ -1099,6 +1198,7 @@ def main():
         output_dir=output_dir,
         mode=args.jv_mode, fwd_batch=args.fwd_batch,
         save_images=True, diag_probes=args.diag_hutchinson,
+        channel_names=channel_names,
     )
     test_metrics = evaluate_luno(
         args, pipeline["test_loader"], model_fn, w0, low_rank, prior_args, wrapper,
@@ -1108,6 +1208,7 @@ def main():
         output_dir=output_dir,
         mode=args.jv_mode, fwd_batch=args.fwd_batch,
         save_images=False, diag_probes=args.diag_hutchinson,
+        channel_names=channel_names,
     )
 
     results = {
