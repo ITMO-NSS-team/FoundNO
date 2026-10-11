@@ -245,7 +245,7 @@ class Trainer(object):
             model = self.model
 
         if self._muno_model:
-            assert isinstance(model_path, tuple) and len(model_path) == 3, \
+            assert isinstance(model_path, tuple) and (len(model_path) == 3 or len(model_path) == 3), \
                 'Saving lifting-main part-projection model requires tuple of str arg with len 3'
             assert isinstance(model, Muno), \
                 f'Somehow, using non-Muno model in the Muno case, instead got {type(model)}.'

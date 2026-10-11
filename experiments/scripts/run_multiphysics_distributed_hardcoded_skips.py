@@ -249,7 +249,7 @@ def main():
     liftings = load_from_dir(args.lift_checkpoint_dir) if args.lift_checkpoint_dir is not None else None
     projections = load_from_dir(args.lift_checkpoint_dir) if args.proj_checkpoint_dir is not None else None
 
-    model_blocks = build_model(loader_channels, model_config, 
+    model_blocks = build_model([(5, 5)], model_config, 
                                core_checkpoint, liftings, projections)
 
     print(f'local_rank: {local_rank}, lengths: {train_set._data_lens}, \

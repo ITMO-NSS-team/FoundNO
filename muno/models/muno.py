@@ -136,7 +136,7 @@ class Muno(nn.Module):
             yield from proj.parameters(recurse=recurse)
 
         for adapter_skips in self._skip_handlers:
-            for skip in adapter_skips:
+            for skip in adapter_skips.values():
                 yield from skip.parameters(recurse=recurse)
 
         yield from ()
@@ -151,7 +151,7 @@ class Muno(nn.Module):
             yield from proj.named_parameters(prefix = prefix, recurse = recurse, remove_duplicate = remove_duplicate)
 
         for adapter_skips in self._skip_handlers:
-            for skip in adapter_skips:
+            for skip in adapter_skips.values():
                 yield from skip.named_parameters(prefix = prefix, recurse = recurse, remove_duplicate = remove_duplicate)
 
         yield from ()
@@ -395,10 +395,10 @@ class Muno(nn.Module):
                     torch.save(obj=self._projections[idx], pickle_module=dill, f=model_path[2][idx],
                                **_SAVE_LOAD_PARAMS)
                     if len(self._skip_handlers) > 0 and self._skip_handlers[idx] is not None:
-                        for skip_idx in range(len(self._skip_handlers[idx])):
+                        for skip_idx, skip_key in enumerate(self._skip_handlers[idx].values()):
                             try:
-                                skip_path_init: str = model_path[4][idx]
-                                skip_path = skip_path_init.removesuffix(".pt", "")
+                                skip_path_init: str = model_path[3][idx]
+                                skip_path = skip_path_init.removesuffix(".pt")
                                 skip_path += f'_{skip_idx}.pt'
                                 torch.save(obj=self._skip_handlers[idx][skip_idx], pickle_module=dill, f=skip_path,
                                            **_SAVE_LOAD_PARAMS)

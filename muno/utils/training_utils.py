@@ -86,6 +86,17 @@ class ParameterLoading(metaclass=ParamContainerMeta):
             warnings.warn(f'Possibly incorrect parameter change: from {old_type} to {new_type}.')
         self._repo[parameter_name] = new_value
 
+class GenericLoss(object):
+    def __init__(self, loss = torch.nn.MSELoss):
+        self._eval = loss()
+
+    def __call__(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None, *args, **kwargs):
+        try:
+            return self._eval(pred, target, mask, *args, **kwargs)
+        except TypeError:
+            return self._eval(pred, target)
+
+
 
 class LpLoss(object):
     """
@@ -248,7 +259,6 @@ class LpLoss(object):
     def __call__(self, y_pred, y, **kwargs):
         return self.rel(y_pred, y)
 
-
 class BalancedRelL2Loss(object):  # теперь последний вопрос по метрикам
     def __init__(self, eps: float = 1e-6, weights: np.ndarray = None):
         self._eps = eps
@@ -274,7 +284,6 @@ class BalancedRelL2Loss(object):  # теперь последний вопрос
         if torch.isinf(total_loss).any().item():
             print('NAN in BalancedRelL2Loss!')
         return total_loss
-
 
 class FourierHFLoss(object):
     def __init__(self, dims: List[int] = [3, 4]):
