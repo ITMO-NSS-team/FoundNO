@@ -1,30 +1,42 @@
 """
-Полный LUNO-пайплайн для модели Muno (однозадачная упрощённая версия).
+Полный LUNO-пайплайн для модели Muno (мультизадачная версия).
 
-Одна задача, один лифтинг и одна проекция (берутся из переданных файлов),
-внутренние мультизадачные адаптеры в вычислениях НЕ участвуют. Тюнимые
-параметры -- веса последнего FNO-блока общего core (R, W, b); лифтинг и
-проекция фиксированы.
+Скрипт запускает по очереди задачи из ``config.tasks`` (флаг ``--tasks``:
+``all`` или имена через запятую). Для каждой задачи берётся свой адаптер
+(лифтинг+проекция), нормализаторы и GGN -- по полю ``task_idx`` задачи
+("тип физики"), а не по позиции в списке: файлы ``lift_{task_idx}.pt``,
+``proj_{task_idx}.pt``, ``input_normalizer_{task_idx}.pkl``,
+``output_normalizer_{task_idx}.pkl``. Ядро (core) и сплит его последнего
+FNO-блока общие для всех задач. Тюнимые параметры -- веса последнего
+FNO-блока общего core (R, W, b); лифтинг и проекция фиксированы.
 
-Пайплайн:
+Переопределить не-общие и не-весовые аргументы для конкретной задачи можно
+блоком ``luno:`` внутри описания задачи в yaml (например ``max_rank``,
+``diag_hutchinson``). Значения по умолчанию -- из CLI.
+
+Каждая задача пишет результаты в СВОЮ подпапку внутри папки прогона
+(``<output_root>/<prefix>_<timestamp>/<task_name>/``). Ошибка в одной задаче
+не прерывает прогон: задача пропускается, остальные продолжают выполняться.
+
+Пайплайн (на каждую задачу):
     1) загрузка модели (torch.load + dill через rmi.load_from_dir) и данных
        (rmi.loadData; val-сплит 0.1 -> данные для калибровки);
     2) сплит модели: last FNO block core -> w0 = [R.real, R.imag, W, b];
        печать слоёв, выбранных в качестве последних;
     3) low-rank GGN последнего фурье-слоя на train-лоадере; при заданном
-       --ggn-checkpoint шаг пропускается и LowRankTerms читается из pickle
-       (файла нет -- предупреждение и расчёт как обычно);
+       --ggn-checkpoint (файл или папка с low_rank_terms_{task_idx}.pkl) шаг
+       пропускается и LowRankTerms читается из pickle (файла нет --
+       предупреждение и расчёт как обычно);
     4) калибровка scalar prior_prec на всех сэмплах calib-части val
        (полный log10-грид, пробы Хатчинсона переиспользуются по кандидатам);
-    5) финальные метрики NLL (+RMSE): val -- весь остаток val, test --
-       ограничен --max-eval-samples;
+    5) финальные метрики NLL (+RMSE): val -- весь остаток val, test -- весь сплит;
     6) сохранение GGN (LowRankTerms, если он считался, а не загружен) и метрик
-       в pkl в output-папке эксперимента (структура папок как в
-       run_multiphysics_inference.py).
+       в pkl в подпапке задачи (структура папок как в run_multiphysics_inference.py).
 
 Запуск (флаги -- как в run_multiphysics_inference.py):
     python muno/uncertainty/run_luno_ggn_calibrate.py \
         --config experiments/scripts/configs/pdebench_multiphysics.yaml \
+        --tasks all \
         --core-checkpoint <path>/core.pt \
         --lift-checkpoint-dir <dir> \
         --proj-checkpoint-dir <dir> \
@@ -47,10 +59,12 @@ conv + skip (касательные веса, обычный forward без AD) 
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import os
 import pickle
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -73,6 +87,7 @@ from torch.func import functional_call
 from torch.utils.data import DataLoader, Subset
 
 from scipy.stats import spearmanr
+import dill
 
 from muno.data.benchmarks.datasets import MultiPhysicsDataset
 from muno.data.benchmarks.inspections import (
@@ -124,8 +139,12 @@ PER_CHANNEL_PCT = 99
 # ----------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="LUNO pipeline for a single-adapter Muno.")
+    p = argparse.ArgumentParser(description="LUNO pipeline for a multi-adapter Muno.")
     p.add_argument("--config", default="experiments/configs/pdebench_multiphysics_pretrain.yaml")
+    p.add_argument("--tasks", default="all",
+                   help="Какие задачи из config.tasks запускать: 'all' (по "
+                        "умолчанию) или имена через запятую (поле name задачи). "
+                        "Порядок и task_idx берутся из описания задачи.")
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--core-checkpoint", default=None)
     p.add_argument("--lift-checkpoint-dir", default=None)
@@ -207,6 +226,141 @@ def parse_args():
     p.add_argument("--no-progress", action="store_true",
                    help="Отключить прогресс-бары (tqdm).")
     return p.parse_args()
+
+
+# ----------------------------------------------------------------------------
+# Мультизадачный запуск: выбор задач и пер-таск overrides
+# ----------------------------------------------------------------------------
+
+# Ключи, которые можно переопределять для отдельной задачи блоком ``luno:``
+# в yaml. Сюда НЕ входят: общие флаги (config/device/dtype/...), пути-веса
+# (core/lift/proj/normalizers/ggn -- они берутся по task_idx) и аргументы
+# стартового self-check (--check-probes/--check-tol), которые остаются общими.
+PER_TASK_LUNO_KEYS = {
+    "jv_mode": str,
+    "fwd_batch": int,
+    "vjp_chunk": int,
+    "max_rank": int,
+    "ggn_method": str,
+    "ggn_oversample": int,
+    "max_num_samples": int,
+    "val_calib_frac": float,
+    "diag_hutchinson": int,
+    "calib_max_samples": int,
+    "calib_grid_min": float,
+    "calib_grid_max": float,
+    "calib_grid_size": int,
+    "calib_objective": str,
+}
+
+_LUNO_KEY_CHOICES = {
+    "jv_mode": ("forward", "affine"),
+    "ggn_method": ("randomized", "skerch"),
+    "calib_objective": ("chi2", "nll"),
+}
+
+
+def task_name(cfg, position):
+    return cfg.get("name", f"task_{position}")
+
+
+def select_tasks(task_configs, spec):
+    """Выбирает задачи из ``task_configs`` по spec (``all`` или имена).
+
+    Возвращает список ``(позиция_в_конфиге, cfg)`` в порядке конфига.
+    Неизвестное имя -- ошибка со списком доступных.
+    """
+    if not task_configs:
+        raise SystemExit("В конфиге нет задач (config.tasks пуст).")
+    names = [task_name(cfg, i) for i, cfg in enumerate(task_configs)]
+    spec = (spec or "all").strip()
+    if spec == "all":
+        return list(enumerate(task_configs))
+    wanted = [s.strip() for s in spec.split(",") if s.strip()]
+    if not wanted:
+        raise SystemExit("--tasks пуст. Укажите 'all' или имена задач через запятую.")
+    index = {n: i for i, n in enumerate(names)}
+    missing = [w for w in wanted if w not in index]
+    if missing:
+        raise SystemExit(
+            f"--tasks: неизвестные задачи {missing}. Доступные: {names}"
+        )
+    chosen = {index[w] for w in wanted}
+    return [(i, cfg) for i, cfg in enumerate(task_configs) if i in chosen]
+
+
+def apply_task_overrides(args, cfg):
+    """Копия ``args`` c применённым блоком ``luno:`` задачи (валидация ключей)."""
+    overrides = cfg.get("luno") or {}
+    if not isinstance(overrides, dict):
+        raise ValueError(
+            f"задача '{task_name(cfg, '?')}': блок luno должен быть словарём, "
+            f"получено {type(overrides).__name__}."
+        )
+    task_args = argparse.Namespace(**vars(args))
+    for key, value in overrides.items():
+        if key not in PER_TASK_LUNO_KEYS:
+            raise ValueError(
+                f"задача '{task_name(cfg, '?')}': неизвестный ключ luno.{key}; "
+                f"допустимые: {sorted(PER_TASK_LUNO_KEYS)}"
+            )
+        caster = PER_TASK_LUNO_KEYS[key]
+        try:
+            value = caster(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"задача '{task_name(cfg, '?')}': luno.{key}={value!r} не "
+                f"приводится к {caster.__name__}: {exc}"
+            )
+        choices = _LUNO_KEY_CHOICES.get(key)
+        if choices is not None and value not in choices:
+            raise ValueError(
+                f"задача '{task_name(cfg, '?')}': luno.{key}={value!r} вне "
+                f"допустимых {choices}"
+            )
+        setattr(task_args, key, value)
+    return task_args
+
+
+def resolve_task_idx(cfg, position):
+    """``task_idx`` задачи -- номер файла весов (тип физики).
+
+    Если поле не задано, используется позиция задачи в конфиге (обратная
+    совместимость с однозадачными конфигами вроде inference_local.yaml).
+    """
+    if cfg.get("task_idx") is not None:
+        return int(cfg["task_idx"])
+    print(
+        f"[task:{task_name(cfg, position)}] task_idx не задан -> использую "
+        f"позицию в конфиге ({position}); веса берутся по этому номеру."
+    )
+    return position
+
+
+def find_indexed_file(directory, prefix, suffix, task_idx):
+    """Файл ``{prefix}_{task_idx}{suffix}`` внутри directory (или None).
+
+    Сначала точное имя, затем любой файл с суффиксом ``_{task_idx}``, затем
+    (с предупреждением) позиция в отсортированном списке -- чтобы не падать
+    на нестандартных именах вроде ``{run_prefix}_low_rank_terms.pkl``.
+    """
+    if directory is None:
+        return None
+    directory = rmi.resolve_path(directory)
+    exact = directory / f"{prefix}_{task_idx}{suffix}"
+    if exact.is_file():
+        return exact
+    files = sorted(Path(f) for f in rmi.get_all_files(str(directory), suffix))
+    by_suffix = [f for f in files if f.stem.endswith(f"_{task_idx}")]
+    if by_suffix:
+        return by_suffix[0]
+    if task_idx < len(files):
+        print(
+            f"[assets] точного файла {exact.name} нет; беру {files[task_idx].name} "
+            f"(позиция {task_idx} в {directory})."
+        )
+        return files[task_idx]
+    return None
 
 
 # ----------------------------------------------------------------------------
@@ -346,35 +500,44 @@ def split_val_loaders(args, val_set):
     return calib_loader, val_eval_loader
 
 
-def build_pipeline(args):
-    config_path = rmi.resolve_path(args.config)
-    config = rmi.load_yaml_config(config_path)
-    model_config = config.get("model", {})
-    task_configs = config.get("tasks", [])
-    assert task_configs, "No tasks in the config."
+def load_task_adapters(args, task_idx, asset_cache):
+    """Загружает лифтинг и проекцию для типа задачи ``task_idx`` (с кэшем).
 
-    print("Загрузка чекпойнтов (torch.load + dill):")
-    core = rmi.load_from_dir(args.core_checkpoint)[0]
-    liftings = (
-        rmi.load_from_dir(args.lift_checkpoint_dir)
-        if args.lift_checkpoint_dir is not None
-        else None
-    )
-    projections = (
-        rmi.load_from_dir(args.proj_checkpoint_dir)
-        if args.proj_checkpoint_dir is not None
-        else None
-    )
+    Файлы ищутся в переданных --lift/--proj-checkpoint-dir по имени
+    ``lift_{task_idx}.pt`` / ``proj_{task_idx}.pt`` (см. find_indexed_file).
+    """
+    key = ("adapters", task_idx)
+    if key in asset_cache:
+        return asset_cache[key]
+    lift_path = find_indexed_file(args.lift_checkpoint_dir, "lift", ".pt", task_idx)
+    proj_path = find_indexed_file(args.proj_checkpoint_dir, "proj", ".pt", task_idx)
+    if lift_path is None:
+        raise FileNotFoundError(
+            f"task_idx={task_idx}: не найден lifting в {args.lift_checkpoint_dir} "
+            f"(ожидался lift_{task_idx}.pt)."
+        )
+    if proj_path is None:
+        raise FileNotFoundError(
+            f"task_idx={task_idx}: не найдена проекция в {args.proj_checkpoint_dir} "
+            f"(ожидался proj_{task_idx}.pt)."
+        )
+    print(f"[assets] task_idx={task_idx}: lifting={lift_path.name}, "
+          f"projection={proj_path.name}")
+    lifting = torch.load(lift_path, pickle_module=dill)
+    projection = torch.load(proj_path, pickle_module=dill)
+    asset_cache[key] = (lifting, projection)
+    return lifting, projection
 
-    # Однозадачная версия: один лифтинг и одна проекция.
-    assert liftings is not None and projections is not None, \
-        "For the single-task LUNO pipeline both --lift/--proj checkpoint dirs are required."
-    lifting, projection = liftings[0], projections[0]
-    print("Используем lifting[0] и projection[0] (одна задача).")
 
-    # Данные: для одного адаптера используем только первую задачу из конфига.
-    single_task_configs = task_configs[:1]
-    train_set, val_set, test_set, _ = rmi.loadData(single_task_configs)
+def build_task_pipeline(args, cfg, task_idx, model_config, core, asset_cache):
+    """Данные + лоадеры + модель для ОДНОЙ задачи (адаптер по task_idx).
+
+    ``rmi.loadData([cfg])`` возвращает датасеты одной задачи, поэтому ключ
+    в батчах снова ``0`` и весь per-task код продолжает работать с ``sample[0]``.
+    """
+    lifting, projection = load_task_adapters(args, task_idx, asset_cache)
+
+    train_set, val_set, test_set, _ = rmi.loadData([cfg])
 
     train_loader = DataLoader(
         dataset=MultiPhysicsDataset(list(train_set)),
@@ -382,7 +545,9 @@ def build_pipeline(args):
         shuffle=False,
     )
     calib_loader, val_eval_loader = split_val_loaders(args, val_set)
-    test_loader = DataLoader(dataset=MultiPhysicsDataset(list(test_set)), batch_size=1, shuffle=False)
+    test_loader = DataLoader(
+        dataset=MultiPhysicsDataset(list(test_set)), batch_size=1, shuffle=False
+    )
 
     loader_channels = rmi.get_loaders_channels(train_loader)
     print("loader_channels:", loader_channels)
@@ -398,8 +563,6 @@ def build_pipeline(args):
     model_liftings, model_core, model_projections = model_blocks
 
     return {
-        "config": config,
-        "model_config": model_config,
         "core": model_core,
         "lifting": model_liftings[0],
         "projection": model_projections[0],
@@ -411,21 +574,31 @@ def build_pipeline(args):
     }
 
 
-def build_data_processor(args, pipeline):
+def build_data_processor(args, pipeline, task_idx):
     first_batch = next(iter(pipeline["train_loader"]))
 
     dims_x = {i: _get_channelwise_reduce_dims(sub["x"]) for i, sub in first_batch.items()}
     dims_y = {i: _get_channelwise_reduce_dims(sub["y"]) for i, sub in first_batch.items()}
 
     in_normalizer = MultiphysicsUnitGaussianNormalizer(num=1, dim=dims_x, key="x")
-    inp_norm_files = sorted(rmi.get_all_files(args.in_normalizers, ".pkl"))
-    print("[norm] in-normalizer files (task-0 берёт первый):", inp_norm_files[:1])
-    in_normalizer.from_file(inp_norm_files)
+    in_path = find_indexed_file(args.in_normalizers, "input_normalizer", ".pkl", task_idx)
+    if in_path is None:
+        raise FileNotFoundError(
+            f"task_idx={task_idx}: не найден input_normalizer_{task_idx}.pkl "
+            f"в {args.in_normalizers}."
+        )
+    print(f"[norm] in-normalizer (task_idx={task_idx}): {in_path.name}")
+    in_normalizer.from_file([str(in_path)])
 
     out_normalizer = MultiphysicsUnitGaussianNormalizer(num=1, dim=dims_y, key="y")
-    out_norm_files = sorted(rmi.get_all_files(args.out_normalizers, ".pkl"))
-    print("[norm] out-normalizer files (task-0 берёт первый):", out_norm_files[:1])
-    out_normalizer.from_file(out_norm_files)
+    out_path = find_indexed_file(args.out_normalizers, "output_normalizer", ".pkl", task_idx)
+    if out_path is None:
+        raise FileNotFoundError(
+            f"task_idx={task_idx}: не найден output_normalizer_{task_idx}.pkl "
+            f"в {args.out_normalizers}."
+        )
+    print(f"[norm] out-normalizer (task_idx={task_idx}): {out_path.name}")
+    out_normalizer.from_file([str(out_path)])
 
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
     in_normalizer.to(device)
@@ -1017,134 +1190,39 @@ def confirm_exact_diag(args, pipeline):
 # main
 # ----------------------------------------------------------------------------
 
-def main():
-    args = parse_args()
+def resolve_low_rank(args, w0, model_fn, pipeline, data_processor, affine, task_idx,
+                     output_dir, run_prefix, asset_cache):
+    """Возвращает (low_rank, ggn_source, ggn_checkpoint) для одной задачи.
 
-    set_enabled(not args.no_progress)
+    ``--ggn-checkpoint`` файл -- используется всеми задачами; папка -- берётся
+    файл этой задачи ``low_rank_terms_{task_idx}.pkl`` (с кэшем на task_idx).
+    Если файла нет -- GGN считается на train-лоадере и сохраняется в подпапке
+    задачи как ``{run_prefix}_low_rank_terms.pkl``.
+    """
+    ggn_path = None
+    if args.ggn_checkpoint:
+        raw = rmi.resolve_path(args.ggn_checkpoint)
+        if raw.is_dir():
+            ggn_path = find_indexed_file(
+                args.ggn_checkpoint, "low_rank_terms", ".pkl", task_idx
+            )
+            if ggn_path is None:
+                print(f"[GGN] в {raw} нет low_rank_terms_{task_idx}.pkl; "
+                      f"считаю GGN как обычно.")
+        else:
+            ggn_path = raw
 
-    if args.dtype == "float64":
-        global DTYPE, CDTYPE
-        DTYPE = torch.float64
-        CDTYPE = torch.complex128
+    low_rank = None
+    if ggn_path is not None:
+        cache_key = ("ggn", task_idx, str(ggn_path))
+        if cache_key in asset_cache:
+            low_rank = asset_cache[cache_key]
+            print(f"[GGN] из кэша (task_idx={task_idx}): {ggn_path}")
+        else:
+            low_rank = load_low_rank_ggn(ggn_path, w0)
+            if low_rank is not None:
+                asset_cache[cache_key] = low_rank
 
-    if args.core_checkpoint is None:
-        raise SystemExit("--core-checkpoint обязателен.")
-
-    pipeline = build_pipeline(args)
-    confirm_exact_diag(args, pipeline)
-    core = pipeline["core"]
-    lifting = pipeline["lifting"]
-    projection = pipeline["projection"]
-
-    device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
-    core = core.to(device=device)
-    lifting = lifting.to(device=device).to(dtype=DTYPE)
-    projection = projection.to(device=device).to(dtype=DTYPE)
-
-    # ВАЖНО: core НЕ кастатится `to(dtype=DTYPE)` целиком — `Tensor.to(torch.float64)`
-    # отбрасывает мнимую часть комплексных спектральных весов SpectralConv
-    # (warning: "Casting complex values to real discards the imaginary part"),
-    # после чего forward падает в einsum ("expected ComplexDouble but found Double"),
-    # а GGN строится по неправильным весам. Вместо этого переносим core на device
-    # и выставляем точность поканально, сохраняя комплексность.
-    # Сам `functional_call(core, sd, ...)` и так работает в нужной точности:
-    # она приходит из reconstruct(w) / _base_state_dict().
-    for p in core.parameters():
-        p.data = p.data.to(
-            dtype=CDTYPE if p.is_complex() else DTYPE, device=device
-        )
-    for b in core.buffers():
-        b.data = b.data.to(
-            dtype=CDTYPE if b.is_complex() else DTYPE, device=device
-        )
-
-    # --- output-папка эксперимента (как в run_multiphysics_inference.py) ---
-    output_config = pipeline["config"].get("output", {})
-    output_root = (
-        args.output_root
-        if args.output_root is not None
-        else output_config.get("root", "runs")
-    )
-    config_path = rmi.resolve_path(args.config)
-    run_prefix = args.run_name if args.run_name is not None else config_path.stem
-    run_name = f"{run_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    output_dir = rmi.resolve_path(output_root) / run_name
-    for d in (output_dir / "checkpoints", output_dir / "logs", output_dir / "metrics"):
-        d.mkdir(parents=True, exist_ok=True)
-    print(f"output_dir: {output_dir}")
-
-    # --- нормализаторы и data_processor ---
-    data_processor, device = build_data_processor(args, pipeline)
-
-    # --- сплит: last FNO block core -> w0 ---
-    wrapper = TorchFNOWrapper(core, dtype=DTYPE)
-    model_fn_wrap, w0 = split_wrapper(wrapper)
-    print(f"[split] w0: d={w0.numel()}, dtype={w0.dtype}, device={w0.device}")
-
-    # keys = discover_last_block_keys(core)
-    # print("\n[последний фурье-слой core]:")
-    # for label in ("R", "W", "b"):
-    #     path, cls, attr = _resolve_key_owner(core, keys[label])
-    #     print(f"    {label}: layer='{path}' ({cls}, attr='{attr}')")
-    # R, W, b = ref_state_dict(core, keys)
-    # print(f"    R: {tuple(R.shape)} (complex -> R.real | R.imag)")
-    # print(f"    W: {tuple(W.shape)}")
-    # print(f"    b: {tuple(b.shape) if b is not None else None}")
-    # assert torch.is_complex(R), (
-    #     "Спектральный вес R стал некомплексным (мнимая часть потеряна из-за "
-    #     "core.to(dtype=...)). Не кастать core целиком в float64; см. комментарий"
-    #     " к переносу core на device в main."
-    # )
-
-    # Верификация сплита (реконструкция весов core из w0).
-    base = wrapper._base_state_dict()
-    recon = wrapper.reconstruct(w0)
-    max_diff = max(
-        (recon[k] - base[k]).abs().max().item()
-        for k in base
-    )
-    status = "SPLIT OK" if max_diff == 0 else f"SPLIT NOT OK (max diff={max_diff:.3e})"
-    print(f"    [проверка] max |reconstruct(w0) - base| = {max_diff:.3e} -> {status}")
-    _print_mem("after_split_w0", device)
-
-    # model_fn: лифтинг -> core(с w) -> проекция (фиксированы лифтинг и проекция).
-    model_fn = make_model_fn(wrapper, lifting, projection)
-
-    # Стартовый гейт: Jv выбранного режима против reverse-строк на ОДНОМ батче.
-    # Эталон -- обратный режим (AD не трогает спектральный conv "изнутри"); при
-    # расхождении падаем явно, а не молча считаем кривую кривизну. Допуск зависит
-    # от точности: float32 набирает ошибку суммирования по 28M элементам, float64 --
-    # на три порядка точнее (см. default_check_tol).
-    probe = preprocess_sample(
-        data_processor, next(iter_samples(pipeline["train_loader"], 1))
-    )
-    affine = (
-        AffineLastBlock(wrapper.model, projection, wrapper.keys, dtype=DTYPE)
-        if args.jv_mode == "affine" else None
-    )
-    ok, rel = check_jacobian(
-        model_fn, probe[0]["x"], w0,
-        affine=affine, mode=args.jv_mode, fwd_batch=args.fwd_batch,
-        num_probes=args.check_probes, tol=args.check_tol,
-    )
-    tol_used = args.check_tol if args.check_tol is not None else default_check_tol(w0.dtype)
-    print(f"[{args.jv_mode}-JV] self-check vs reverse rows на 1 батче: "
-          f"{'OK' if ok else 'FAILED'} (max rel err={rel:.3e}, tol={tol_used:.1e}, "
-          f"dtype={w0.dtype}, torch={torch.__version__})")
-    if not ok:
-        raise RuntimeError(
-            f"Jv в режиме '{args.jv_mode}' не совпал с reverse-строками "
-            f"(max rel err={rel:.3e} > tol={tol_used:.1e}). Проверьте структуру "
-            "последнего FNO-блока (conv/skip/norm/transform), точность весов и "
-            "то, что complex-веса не потеряли мнимую часть при кастинге."
-        )
-    _print_mem("after_jv_check", device)
-
-    # --- low-rank GGN на train (или загрузка готового из --ggn-checkpoint) ---
-    print("\n[GGN] low-rank аппроксимация GGN последнего фурье-слоя:")
-    low_rank = (
-        load_low_rank_ggn(args.ggn_checkpoint, w0) if args.ggn_checkpoint else None
-    )
     ggn_loaded = low_rank is not None
     if not ggn_loaded:
         low_rank = compute_low_rank_ggn(
@@ -1166,6 +1244,66 @@ def main():
         print(f"[save] low_rank_terms -> {terms_path} "
               f"({terms_path.stat().st_size / 1024 ** 3:.2f} GiB)")
 
+    ggn_source = "checkpoint" if ggn_loaded else "computed"
+    ggn_checkpoint = str(ggn_path) if ggn_loaded else None
+    return low_rank, ggn_source, ggn_checkpoint
+
+
+def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
+                 output_dir, run_prefix, config_name, metrics_config, asset_cache):
+    """Полный LUNO-пайплайн одной задачи; результаты пишутся в output_dir."""
+    name = cfg.get("name", f"task_idx{task_idx}")
+
+    pipeline = build_task_pipeline(args, cfg, task_idx, model_config, core, asset_cache)
+    confirm_exact_diag(args, pipeline)
+
+    device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
+    lifting = pipeline["lifting"].to(device=device).to(dtype=DTYPE)
+    projection = pipeline["projection"].to(device=device).to(dtype=DTYPE)
+
+    # --- нормализаторы и data_processor ---
+    data_processor, device = build_data_processor(args, pipeline, task_idx)
+
+    # model_fn: лифтинг -> core(с w) -> проекция (фиксированы лифтинг и проекция).
+    model_fn = make_model_fn(wrapper, lifting, projection)
+
+    # Стартовый гейт: Jv выбранного режима против reverse-строк на ОДНОМ батче.
+    # Эталон -- обратный режим (AD не трогает спектральный conv "изнутри"); при
+    # расхождении падаем явно, а не молча считаем кривую кривизну. Допуск зависит
+    # от точности: float32 набирает ошибку суммирования по 28M элементам, float64 --
+    # на три порядка точнее (см. default_check_tol).
+    # probe = preprocess_sample(
+    #     data_processor, next(iter_samples(pipeline["train_loader"], 1))
+    # )
+    affine = (
+        AffineLastBlock(wrapper.model, projection, wrapper.keys, dtype=DTYPE)
+        if args.jv_mode == "affine" else None
+    )
+    # ok, rel = check_jacobian(
+    #     model_fn, probe[0]["x"], w0,
+    #     affine=affine, mode=args.jv_mode, fwd_batch=args.fwd_batch,
+    #     num_probes=args.check_probes, tol=args.check_tol,
+    # )
+    # tol_used = args.check_tol if args.check_tol is not None else default_check_tol(w0.dtype)
+    # print(f"[{args.jv_mode}-JV] self-check vs reverse rows на 1 батче: "
+    #       f"{'OK' if ok else 'FAILED'} (max rel err={rel:.3e}, tol={tol_used:.1e}, "
+    #       f"dtype={w0.dtype}, torch={torch.__version__})")
+    # if not ok:
+    #     raise RuntimeError(
+    #         f"Jv в режиме '{args.jv_mode}' не совпал с reverse-строками "
+    #         f"(max rel err={rel:.3e} > tol={tol_used:.1e}). Проверьте структуру "
+    #         "последнего FNO-блока (conv/skip/norm/transform), точность весов и "
+    #         "то, что complex-веса не потеряли мнимую часть при кастинге."
+    #     )
+    # _print_mem("after_jv_check", device)
+
+    # --- low-rank GGN на train (или загрузка готового из --ggn-checkpoint) ---
+    print("\n[GGN] low-rank аппроксимация GGN последнего фурье-слоя:")
+    low_rank, ggn_source, ggn_checkpoint = resolve_low_rank(
+        args, w0, model_fn, pipeline, data_processor, affine, task_idx,
+        output_dir, run_prefix, asset_cache,
+    )
+
     # --- калибровка на сэмплах калибровочной части val (доля --val-calib-frac) ---
     # Память здесь -- единственное, что отличает дешёвую калибровку от OOM: один
     # прогон прямого режима стоит ~fwd_batch * активации сети, и если GGN оставил
@@ -1182,19 +1320,17 @@ def main():
 
     # --- метрики после калибровки: val и test делят одно значение --diag-hutchinson ---
     # val (остаток val): Хатчинсон + PNG; test: тот же Хатчинсон, без PNG.
-    # Имена каналов для per-channel метрик: adapter.variable_names первого
-    # таска (порядок совпадает с осью канала). Конфиг может разойтись с
-    # моделью -- внутри evaluate_luno это проверяется по длине и уходит на ch0..
-    _tasks = ((pipeline["config"] or {}).get("tasks") or [])
-    _first_task = _tasks[0] if isinstance(_tasks, list) and _tasks else _tasks
-    channel_names = ((_first_task or {}).get("adapter") or {}).get("variable_names")
+    # Имена каналов для per-channel метрик: adapter.variable_names этой задачи
+    # (порядок совпадает с осью канала). Конфиг может разойтись с моделью --
+    # внутри evaluate_luno это проверяется по длине и уходит на ch0..
+    channel_names = (cfg.get("adapter") or {}).get("variable_names")
 
     print("\n[metrics] финальные метрики после калибровки:")
     val_metrics = evaluate_luno(
         args, pipeline["val_eval_loader"], model_fn, w0, low_rank, prior_args,
         wrapper, data_processor, out_normalizer, "val", len(pipeline["val_eval_loader"].dataset),
         affine=affine,
-        metrics_config=pipeline["config"].get("metrics", {}),
+        metrics_config=metrics_config,
         output_dir=output_dir,
         mode=args.jv_mode, fwd_batch=args.fwd_batch,
         save_images=True, diag_probes=args.diag_hutchinson,
@@ -1204,7 +1340,7 @@ def main():
         args, pipeline["test_loader"], model_fn, w0, low_rank, prior_args, wrapper,
         data_processor, out_normalizer, "test", len(pipeline["test_loader"].dataset),
         affine=affine,
-        metrics_config=pipeline["config"].get("metrics", {}),
+        metrics_config=metrics_config,
         output_dir=output_dir,
         mode=args.jv_mode, fwd_batch=args.fwd_batch,
         save_images=False, diag_probes=args.diag_hutchinson,
@@ -1212,6 +1348,9 @@ def main():
     )
 
     results = {
+        "config": config_name,
+        "task_name": cfg.get("name"),
+        "task_idx": task_idx,
         "prior_prec": prior_args["prior_prec"].item(),
         "calib_objective": prior_args.get("objective", args.calib_objective),
         "calib_samples": prior_args["samples"],
@@ -1227,10 +1366,8 @@ def main():
         # (артефакт не переписывался), "computed" -- посчитан на train loader.
         # ggn_rank -- фактический ранг (из чекпойнта, если он авторитетен),
         # max_rank остаётся значением CLI, чтобы не ломать сравнение с ранами.
-        "ggn_source": "checkpoint" if ggn_loaded else "computed",
-        "ggn_checkpoint": (
-            str(rmi.resolve_path(args.ggn_checkpoint)) if ggn_loaded else None
-        ),
+        "ggn_source": ggn_source,
+        "ggn_checkpoint": ggn_checkpoint,
         "ggn_rank": int(low_rank.U.shape[1]),
         "diag_hutchinson": args.diag_hutchinson,
         "max_eval_samples": len(pipeline["val_eval_loader"].dataset),
@@ -1243,8 +1380,143 @@ def main():
         pickle.dump({"test": test_metrics}, f)
     with open(output_dir / "luno_results.pkl", "wb") as f:
         pickle.dump(results, f)
+    return results
 
-    print(f"\nГотово. Результаты: {output_dir}")
+
+def main():
+    args = parse_args()
+
+    set_enabled(not args.no_progress)
+
+    if args.dtype == "float64":
+        global DTYPE, CDTYPE
+        DTYPE = torch.float64
+        CDTYPE = torch.complex128
+
+    if args.core_checkpoint is None:
+        raise SystemExit("--core-checkpoint обязателен.")
+
+    config_path = rmi.resolve_path(args.config)
+    config = rmi.load_yaml_config(config_path)
+    model_config = config.get("model", {})
+    task_configs = config.get("tasks", [])
+    selected = select_tasks(task_configs, args.tasks)
+    print(f"[config] {config_path}")
+    print(f"[tasks] выбрано {len(selected)} из {len(task_configs)}: "
+          f"{[task_name(cfg, i) for i, cfg in selected]}")
+
+    # --- core общий для всех задач: загрузка и перенос на device ОДИН раз ---
+    print("Загрузка core (torch.load + dill):")
+    core = rmi.load_from_dir(args.core_checkpoint)[0]
+
+    device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
+    core = core.to(device=device)
+
+    # ВАЖНО: core НЕ кастатится `to(dtype=DTYPE)` целиком — `Tensor.to(torch.float64)`
+    # отбрасывает мнимую часть комплексных спектральных весов SpectralConv
+    # (warning: "Casting complex values to real discards the imaginary part"),
+    # после чего forward падает в einsum ("expected ComplexDouble but found Double"),
+    # а GGN строится по неправильным весам. Вместо этого переносим core на device
+    # и выставляем точность поканально, сохраняя комплексность.
+    # Сам `functional_call(core, sd, ...)` и так работает в нужной точности:
+    # она приходит из reconstruct(w) / _base_state_dict().
+    for p in core.parameters():
+        p.data = p.data.to(
+            dtype=CDTYPE if p.is_complex() else DTYPE, device=device
+        )
+    for b in core.buffers():
+        b.data = b.data.to(
+            dtype=CDTYPE if b.is_complex() else DTYPE, device=device
+        )
+
+    # --- корневая output-папка прогона (подпапки -- на каждую задачу) ---
+    output_config = config.get("output", {})
+    output_root = (
+        args.output_root
+        if args.output_root is not None
+        else output_config.get("root", "runs")
+    )
+    run_prefix = args.run_name if args.run_name is not None else config_path.stem
+    run_name = f"{run_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    output_dir = rmi.resolve_path(output_root) / run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"output_dir: {output_dir}")
+
+    # --- сплит: last FNO block core -> w0 (один раз, core общий) ---
+    wrapper = TorchFNOWrapper(core, dtype=DTYPE)
+    _, w0 = split_wrapper(wrapper)
+    print(f"[split] w0: d={w0.numel()}, dtype={w0.dtype}, device={w0.device}")
+
+    keys = discover_last_block_keys(core)
+    print("\n[последний фурье-слой core]:")
+    for label in ("R", "W", "b"):
+        path, cls, attr = _resolve_key_owner(core, keys[label])
+        print(f"    {label}: layer='{path}' ({cls}, attr='{attr}')")
+    R, W, b = ref_state_dict(core, keys)
+    print(f"    R: {tuple(R.shape)} (complex -> R.real | R.imag)")
+    print(f"    W: {tuple(W.shape)}")
+    print(f"    b: {tuple(b.shape) if b is not None else None}")
+    assert torch.is_complex(R), (
+        "Спектральный вес R стал некомплексным (мнимая часть потеряна из-за "
+        "core.to(dtype=...)). Не кастать core целиком в float64; см. комментарий"
+        " к переносу core на device в main."
+    )
+
+    # Верификация сплита (реконструкция весов core из w0).
+    base = wrapper._base_state_dict()
+    recon = wrapper.reconstruct(w0)
+    max_diff = max(
+        (recon[k] - base[k]).abs().max().item()
+        for k in base
+    )
+    status = "SPLIT OK" if max_diff == 0 else f"SPLIT NOT OK (max diff={max_diff:.3e})"
+    print(f"    [проверка] max |reconstruct(w0) - base| = {max_diff:.3e} -> {status}")
+    _print_mem("after_split_w0", device)
+
+    asset_cache = {}
+    computed = []
+    for position, cfg in selected:
+        name = task_name(cfg, position)
+        task_args = apply_task_overrides(args, cfg)
+        task_idx = resolve_task_idx(cfg, position)
+
+        task_dir = output_dir / name
+        for d in (task_dir / "checkpoints", task_dir / "logs", task_dir / "metrics"):
+            d.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n{'=' * 70}\n[task:{name}] старт (position={position}, "
+              f"task_idx={task_idx})\n{'=' * 70}")
+        try:
+            run_one_task(
+                task_args, cfg, task_idx, model_config, core, wrapper, w0,
+                task_dir, run_prefix, config_path.stem,
+                config.get("metrics", {}), asset_cache,
+            )
+            computed.append(name)
+            print(f"[task:{name}] ГОТОВО -> {task_dir}")
+        except Exception as exc:
+            print(f"[task:{name}] ОШИБКА, задача пропущена: "
+                  f"{type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            with open(task_dir / "luno_results.pkl", "wb") as f:
+                pickle.dump(
+                    {
+                        "config": config_path.stem,
+                        "task_name": cfg.get("name"),
+                        "task_idx": task_idx,
+                        "status": "failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "traceback": traceback.format_exc(),
+                    },
+                    f,
+                )
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    print(f"\nГотово. Посчитаны задачи ({len(computed)}): {computed}. "
+          f"Результаты: {output_dir}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1010 @@
+output:
+  root: /workspace/fno_uq_runs
+
+seed:
+  value: 42
+  deterministic: false
+
+inspections:
+  enabled: true
+
+tasks:
+### CFD ###
+  - name: pdebench_2d_cfd
+    task_idx: 0
+    luno:
+      jv_mode: affine
+      fwd_batch: 4
+      vjp_chunk: 16
+      max_rank: 0
+      ggn_method: randomized
+      ggn_oversample: 0
+      max_num_samples: 2
+      val_calib_frac: 0.8
+      diag_hutchinson: 50
+      calib_max_samples: 0
+      calib_grid_min: -3.0
+      calib_grid_max: 3.0
+      calib_grid_size: 50
+      calib_objective: nll
+    source:
+      location: url
+      format: hdf5
+      sample_dim: 0
+      variables:
+        density: density
+        pressure: pressure
+        Vx: Vx
+        Vy: Vy
+      url: https://darus.uni-stuttgart.de/api/access/datafile/164687
+      path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
+      axis_selection:
+        0:
+          linspace: [0, 20, 16]
+
+    adapter:
+      type: temporal
+      variable_names: [density, pressure, Vx, Vy]
+      data_order: TXY
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: 2d_cfd
+
+    split:
+      type: ratios
+      train: 0.8
+      val: 0.1
+      test: 0.1
+
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: false
+        drop_last: false
+
+  - name: pdebench_2d_cfd_M1.0
+    task_idx: 0
+    luno:
+      jv_mode: affine
+      fwd_batch: 4
+      vjp_chunk: 16
+      max_rank: 0
+      ggn_method: randomized
+      ggn_oversample: 0
+      max_num_samples: 2
+      val_calib_frac: 0.8
+      diag_hutchinson: 50
+      calib_max_samples: 0
+      calib_grid_min: -3.0
+      calib_grid_max: 3.0
+      calib_grid_size: 50
+      calib_objective: nll
+    source:
+      location: url
+      format: hdf5
+      sample_dim: 0
+      variables:
+        density: density
+        pressure: pressure
+        Vx: Vx
+        Vy: Vy
+      url: https://darus.uni-stuttgart.de/api/access/datafile/164690
+      path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M1.0_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
+      axis_selection:
+        0:
+          linspace: [0, 20, 16]
+
+    adapter:
+      type: temporal
+      variable_names: [density, pressure, Vx, Vy]
+      data_order: TXY
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: 2d_cfd
+
+    split:
+      type: ratios
+      train: 0.8
+      val: 0.1
+      test: 0.1
+
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: false
+        drop_last: false
+
+  - name: pdebench_2d_cfd_Eta1e-08
+    task_idx: 0
+    luno:
+      jv_mode: affine
+      fwd_batch: 4
+      vjp_chunk: 16
+      max_rank: 0
+      ggn_method: randomized
+      ggn_oversample: 0
+      max_num_samples: 2
+      val_calib_frac: 0.8
+      diag_hutchinson: 50
+      calib_max_samples: 0
+      calib_grid_min: -3.0
+      calib_grid_max: 3.0
+      calib_grid_size: 50
+      calib_objective: nll
+    source:
+      location: url
+      format: hdf5
+      sample_dim: 0
+      variables:
+        density: density
+        pressure: pressure
+        Vx: Vx
+        Vy: Vy
+      url: https://darus.uni-stuttgart.de/api/access/datafile/164689
+      path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta1e-08_Zeta1e-08_periodic_512_Train.hdf5
+      axis_selection:
+        0:
+          linspace: [0, 20, 16]
+        1:
+          slice: [0, 512, 4]
+        2:
+          slice: [0, 512, 4]
+
+    adapter:
+      type: temporal
+      variable_names: [density, pressure, Vx, Vy]
+      data_order: TXY
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: 2d_cfd
+
+    split:
+      type: ratios
+      train: 0.8
+      val: 0.1
+      test: 0.1
+
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: false
+        drop_last: false
+
+  - name: pdebench_2d_cfd_time
+    task_idx: 0
+    luno:
+      jv_mode: affine
+      fwd_batch: 4
+      vjp_chunk: 16
+      max_rank: 0
+      ggn_method: randomized
+      ggn_oversample: 0
+      max_num_samples: 2
+      val_calib_frac: 0.8
+      diag_hutchinson: 50
+      calib_max_samples: 0
+      calib_grid_min: -3.0
+      calib_grid_max: 3.0
+      calib_grid_size: 50
+      calib_objective: nll
+    source:
+      location: url
+      format: hdf5
+      sample_dim: 0
+      variables:
+        density: density
+        pressure: pressure
+        Vx: Vx
+        Vy: Vy
+      url: https://darus.uni-stuttgart.de/api/access/datafile/164687
+      path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
+      axis_selection:
+        0:
+          linspace: [0, 20, 20]
+
+    adapter:
+      type: temporal
+      variable_names: [density, pressure, Vx, Vy]
+      data_order: TXY
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: 2d_cfd
+
+    split:
+      type: ratios
+      train: 0.8
+      val: 0.1
+      test: 0.1
+
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: false
+        drop_last: false
+      
+  - name: pdebench_2d_cfd_scarce
+    task_idx: 0
+    luno:
+      jv_mode: affine
+      fwd_batch: 4
+      vjp_chunk: 16
+      max_rank: 0
+      ggn_method: randomized
+      ggn_oversample: 0
+      max_num_samples: 2
+      val_calib_frac: 0.8
+      diag_hutchinson: 50
+      calib_max_samples: 0
+      calib_grid_min: -3.0
+      calib_grid_max: 3.0
+      calib_grid_size: 50
+      calib_objective: nll
+    source:
+      location: url
+      format: hdf5
+      sample_dim: 0
+      variables:
+        density: density
+        pressure: pressure
+        Vx: Vx
+        Vy: Vy
+      url: https://darus.uni-stuttgart.de/api/access/datafile/164687
+      path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
+      axis_selection:
+        0:
+          linspace: [0, 20, 16]
+
+    adapter:
+      type: temporal
+      variable_names: [density, pressure, Vx, Vy]
+      data_order: TXY
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: PDEBench
+      physics_name: 2d_cfd
+
+    split:
+      type: ratios
+      train: 0.998
+      val: 0.001
+      test: 0.001
+
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: true
+        shuffle: false
+        drop_last: false
+### shear flow ###
+
+  - name: thewell_shear_flow
+    task_idx: 4
+    luno:
+      jv_mode: affine
+      fwd_batch: 4
+      vjp_chunk: 16
+      max_rank: 0
+      ggn_method: randomized
+      ggn_oversample: 0
+      max_num_samples: 2
+      val_calib_frac: 0.8
+      diag_hutchinson: 50
+      calib_max_samples: 0
+      calib_grid_min: -3.0
+      calib_grid_max: 3.0
+      calib_grid_size: 50
+      calib_objective: nll
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/TheWell/shear_flow/thewell_shear_flow
+      field_groups:
+        t0_fields:
+          - tracer
+          - pressure
+        t1_fields: []
+        t2_fields: []
+      axis_selection:
+        0:
+          linspace: [0, 199, 16]
+        1:
+          slice: [0, 256, 4]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: window
+      #window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
+      input_time_indices: [0, 1, 2, 3]
+      output_time_indices: [1, 2, 3, 4]
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_shear_flow_1e4_Schmidt_1e1
+    task_idx: 4
+    luno:
+      jv_mode: affine
+      fwd_batch: 4
+      vjp_chunk: 16
+      max_rank: 0
+      ggn_method: randomized
+      ggn_oversample: 0
+      max_num_samples: 2
+      val_calib_frac: 0.8
+      diag_hutchinson: 50
+      calib_max_samples: 0
+      calib_grid_min: -3.0
+      calib_grid_max: 3.0
+      calib_grid_size: 50
+      calib_objective: nll
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/shear_flow/thewell_shear_flow_1e4_Schmidt_1e1
+      field_groups:
+        t0_fields:
+          - tracer
+          - pressure
+        t1_fields: []
+        t2_fields: []
+      axis_selection:
+        0:
+          linspace: [0, 199, 16]
+        1:
+          slice: [0, 256, 4]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e1.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e1.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e1.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3]
+      output_time_indices: [1, 2, 3, 4]
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_shear_flow_1e5_Schmidt_1e0
+    task_idx: 4
+    luno:
+      jv_mode: affine
+      fwd_batch: 4
+      vjp_chunk: 16
+      max_rank: 0
+      ggn_method: randomized
+      ggn_oversample: 0
+      max_num_samples: 2
+      val_calib_frac: 0.8
+      diag_hutchinson: 50
+      calib_max_samples: 0
+      calib_grid_min: -3.0
+      calib_grid_max: 3.0
+      calib_grid_size: 50
+      calib_objective: nll
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/shear_flow/thewell_shear_flow_1e5_Schmidt_1e0
+      field_groups:
+        t0_fields:
+          - tracer
+          - pressure
+        t1_fields: []
+        t2_fields: []
+      axis_selection:
+        0:
+          linspace: [0, 199, 16]
+        1:
+          slice: [0, 256, 4]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: data/train/shear_flow_Reynolds_1e5_Schmidt_1e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e5_Schmidt_1e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e5_Schmidt_1e0.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3]
+      output_time_indices: [1, 2, 3, 4]
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_shear_flow_1e5_Schmidt_1e1
+    task_idx: 4
+    luno:
+      jv_mode: affine
+      fwd_batch: 4
+      vjp_chunk: 16
+      max_rank: 0
+      ggn_method: randomized
+      ggn_oversample: 0
+      max_num_samples: 2
+      val_calib_frac: 0.8
+      diag_hutchinson: 50
+      calib_max_samples: 0
+      calib_grid_min: -3.0
+      calib_grid_max: 3.0
+      calib_grid_size: 50
+      calib_objective: nll
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/shear_flow/thewell_shear_flow_1e5_Schmidt_1e1
+      field_groups:
+        t0_fields:
+          - tracer
+          - pressure
+        t1_fields: []
+        t2_fields: []
+      axis_selection:
+        0:
+          linspace: [0, 199, 16]
+        1:
+          slice: [0, 256, 4]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: data/train/shear_flow_Reynolds_1e5_Schmidt_1e1.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e5_Schmidt_1e1.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e5_Schmidt_1e1.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3]
+      output_time_indices: [1, 2, 3, 4]
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_shear_flow_1e4_Schmidt_1e-1
+    task_idx: 4
+    luno:
+      jv_mode: affine
+      fwd_batch: 4
+      vjp_chunk: 16
+      max_rank: 0
+      ggn_method: randomized
+      ggn_oversample: 0
+      max_num_samples: 2
+      val_calib_frac: 0.8
+      diag_hutchinson: 50
+      calib_max_samples: 0
+      calib_grid_min: -3.0
+      calib_grid_max: 3.0
+      calib_grid_size: 50
+      calib_objective: nll
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/shear_flow/thewell_shear_flow_1e4_Schmidt_1e-1
+      field_groups:
+        t0_fields:
+          - tracer
+          - pressure
+        t1_fields: []
+        t2_fields: []
+      axis_selection:
+        0:
+          linspace: [0, 199, 16]
+        1:
+          slice: [0, 256, 4]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e-1.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e-1.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e-1.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3]
+      output_time_indices: [1, 2, 3, 4]
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_shear_flow_time
+    task_idx: 4
+    luno:
+      jv_mode: affine
+      fwd_batch: 4
+      vjp_chunk: 16
+      max_rank: 0
+      ggn_method: randomized
+      ggn_oversample: 0
+      max_num_samples: 2
+      val_calib_frac: 0.8
+      diag_hutchinson: 50
+      calib_max_samples: 0
+      calib_grid_min: -3.0
+      calib_grid_max: 3.0
+      calib_grid_size: 50
+      calib_objective: nll
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/TheWell/shear_flow/thewell_shear_flow
+      field_groups:
+        t0_fields:
+          - tracer
+          - pressure
+        t1_fields: []
+        t2_fields: []
+      axis_selection:
+        0:
+          linspace: [0, 199, 32]
+        1:
+          slice: [0, 256, 4]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3]
+      output_time_indices: [1, 2, 3, 4]
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_shear_flow_space
+    task_idx: 4
+    luno:
+      jv_mode: affine
+      fwd_batch: 4
+      vjp_chunk: 16
+      max_rank: 0
+      ggn_method: randomized
+      ggn_oversample: 0
+      max_num_samples: 2
+      val_calib_frac: 0.8
+      diag_hutchinson: 50
+      calib_max_samples: 0
+      calib_grid_min: -3.0
+      calib_grid_max: 3.0
+      calib_grid_size: 50
+      calib_objective: nll
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/TheWell/shear_flow/thewell_shear_flow
+      field_groups:
+        t0_fields:
+          - tracer
+          - pressure
+        t1_fields: []
+        t2_fields: []
+      axis_selection:
+        0:
+          linspace: [0, 199, 32]
+        1:
+          slice: [0, 256, 2]
+        2:
+          slice: [0, 512, 2]
+      files:
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3]
+      output_time_indices: [1, 2, 3, 4]
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_shear_flow_scarce
+    task_idx: 4
+    luno:
+      jv_mode: affine
+      fwd_batch: 4
+      vjp_chunk: 16
+      max_rank: 0
+      ggn_method: randomized
+      ggn_oversample: 0
+      max_num_samples: 2
+      val_calib_frac: 0.8
+      diag_hutchinson: 50
+      calib_max_samples: 0
+      calib_grid_min: -3.0
+      calib_grid_max: 3.0
+      calib_grid_size: 50
+      calib_objective: nll
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/TheWell/shear_flow/thewell_shear_flow
+      field_groups:
+        t0_fields:
+          - tracer
+          - pressure
+        t1_fields: []
+        t2_fields: []
+      axis_selection:
+        0:
+          linspace: [0, 199, 16]
+        1:
+          slice: [0, 256, 4]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: window
+      input_time_indices: [0, 1, 2, 3]
+      output_time_indices: [1, 2, 3, 4]
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+    split:
+      type: ratios
+      train: 0.997
+      val: 0.001
+      test: 0.002
+    loaders:
+      train:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: true
+      val:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 8
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+
+
+normalization:
+  enabled: true
+  normalize_x: true
+  normalize_y: true
+  device: cuda
+  max_fit_batches: 16
+
+model:
+  type: adapted_fno_no_mamba
+  n_dim: 3
+  hidden_channels: 120
+  lifting_layers: 3
+  projection_layers: 2
+  core_layers: 4
+  n_modes: [16, 32, 32]
+
+training:
+  epochs: 10
+  device: cuda
+  train_main_fno: true
+  gradient_accumulation_steps: 4
+  optimizer:
+    optimizer: adamw
+    lr: 0.001
+    weight_decay: 1.0e-05
+  scheduler:
+    scheduler: reducelr
+    patience: 2
+    factor: 0.5
+    min_lr: 1.0e-06
+
+metrics:
+  names:
+    - mse
+    - mae
+    - rmse
+    - nrmse
+    - vrmse
+    - relative_l2
+    - balanced_relative_l2
+    - nmae_range
+    - r2_score
+    - mean_linf_error
+    - max_linf_error
+  physical:
+    - name: spectral_mse
+      tasks: all
+    - name: spectral_nrmse
+      tasks: all
+    - name: band_spectral_mse_2d
+      tasks: all
+    - name: band_spectral_nrmse_2d
+      tasks: all
