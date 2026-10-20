@@ -105,7 +105,13 @@ from luno_torch.adapter import (
     split_wrapper,
 )
 from luno_torch.affine import AffineLastBlock
-from luno_torch.calibrate import chi_squared, nll_gaussian
+from luno_torch.calibrate import (
+    STD_REL_FLOOR,
+    chi_squared,
+    nll_gaussian,
+    standardized_residual,
+    std_valid_mask,
+)
 from luno_torch.factory import create_luno_cov
 from luno_torch.ggn import GGNMatvec, LowRankTerms, low_rank_ggn
 from luno_torch.jacobian import (
@@ -757,9 +763,12 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
     берётся точный ``argmin``.
 
     ``objective_name``: "chi2" -- |chi_squared - 1| (как дефолт в laplax),
-    "nll" -- negative log-likelihood. Обе складываются как суммы по элементам и
-    только потом делятся на общее число элементов, то есть усредняются по всем
-    элементам всех сэмплов, а не по сэмплам.
+    "nll" -- negative log-likelihood. Обе складываются как суммы по ВАЛИДНЫМ
+    элементам и делятся на их число (пер-кандидат: маска зависит от std, а std
+    масштабируется sqrt(prior_prec)). Невалидные элементы (std==0/nan и
+    near-zero, см. ``std_valid_mask``) отбрасываются, иначе objective определялся
+    бы десятком дегенеративных пикселей. Итог усредняется по элементам всех
+    сэмплов, а не по сэмплам.
     """
     n_total = len(val_loader.dataset)
     n_calib = n_total if args.calib_max_samples <= 0 else min(
@@ -778,7 +787,12 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
     _print_mem("calib_covs", w0.device)
     chi2_acc = torch.zeros(n_grid, dtype=torch.float64, device=w0.device)
     nll_acc = torch.zeros(n_grid, dtype=torch.float64, device=w0.device)
-    n_elements = 0
+    # Число ВАЛИДНЫХ по std элементов на кандидата грида: std масштабируется
+    # sqrt(prior_prec), поэтому маска (и знаменатель objective) у кандидатов
+    # разные. Элементы с std==0/nan и near-zero std отбрасываются -- иначе
+    # objective определяется десятком дегенеративных пикселей.
+    n_valid_acc = torch.zeros(n_grid, dtype=torch.float64, device=w0.device)
+    n_elem_total = 0
     num_output_channels = wrapper.num_output_channels
     how = f"Хатчинсон n_probe={n_probe}" if n_probe > 0 else "точный обратный путь"
     print(f"\n[calibrate] prior_prec: {n_calib}/{n_total} сэмплов calib-loader, "
@@ -810,6 +824,7 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
                     with torch.no_grad():
                         out_shape = model_fn(x, w0).shape
                 mean_norm = jac.fx.reshape(-1)
+                scale = torch.sqrt(torch.mean(target.double() ** 2))
                 if n_probe > 0:
                     A, B, W = sample_congruence_probes(jac, covs[0].U, n_probe)
                 for i, cov in enumerate(covs):
@@ -821,15 +836,24 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
                     mean_raw, std_raw = raw_from_normalized(
                         mean_norm, std_norm, out_normalizer, out_shape
                     )
+                    valid = std_valid_mask(std_raw, scale)
+                    sr = standardized_residual(mean_raw, std_raw, target)
+                    valid = valid & torch.isfinite(sr)
+                    n_valid = int(valid.sum())
+                    if n_valid == 0:
+                        continue
+                    sr_v = sr[valid].double()
+                    std_v = std_raw[valid].double()
                     if objective_name == "chi2":
-                        chi2_acc[i] += chi_squared(
-                            mean_raw, std_raw, target, averaged=False
-                        )
+                        chi2_acc[i] += (sr_v ** 2).sum()
                     else:
-                        nll_acc[i] += nll_gaussian(
-                            mean_raw, std_raw, target, scaled=False
-                        )
-                n_elements += target.numel()
+                        nll_acc[i] += (
+                            0.5 * sr_v ** 2
+                            + std_v.log()
+                            + 0.5 * math.log(2.0 * math.pi)
+                        ).sum()
+                    n_valid_acc[i] += n_valid
+                n_elem_total += target.numel()
             finally:
                 # Граф forward-замыкания (model_fn, x) держится за self, а в
                 # точном пути -- ещё и обратный граф. Освобождаем сразу: сам jac
@@ -839,15 +863,16 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
     finally:
         bar.close()
 
-    if not n_elements:
+    if not n_elem_total:
         raise SystemExit(
             f"Калибровка не увидела ни одного сэмпла: len(calib_loader.dataset)="
             f"{n_total}, --calib-max-samples={args.calib_max_samples}."
         )
+    n_valid_safe = n_valid_acc.clamp_min(1.0)
     if objective_name == "chi2":
-        objective = (chi2_acc / n_elements - 1.0).abs()
+        objective = (chi2_acc / n_valid_safe - 1.0).abs()
     else:
-        objective = nll_acc / n_elements
+        objective = nll_acc / n_valid_safe
     if not bool(torch.isfinite(objective).all()):
         raise RuntimeError(
             f"Objective калибровки не конечен ({objective.tolist()}, "
@@ -863,17 +888,34 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
             "samples": n_calib, "diag_probes": n_probe}
 
 
+def mask_image_outliers(x, vmax=10.0):
+    """Копия ``x``, где non-finite и значения > ``vmax`` заменены на nan.
+
+    Только для визуализации sqrt(chi2): один inf/огромное значение растягивает
+    автомасштаб ``imshow`` и делает остальную картинку нечитаемой. nan
+    matplotlib рисует как пустой пиксель и не учитывает в vmin/vmax, поэтому
+    шкала строится по валидным значениям.
+    """
+    x = x.clone()
+    x[~torch.isfinite(x) | (x > vmax)] = float("nan")
+    return x
+
+
 def save_luno_images(pred, band, target, output_prefix, batch_idx):
     """Картинки LUNO: target / predict (mean_raw) / std_raw / sqrt(chi2).
 
     sqrt(chi2) = |target - mean_raw| / std_raw -- калиброванная стандартизованная
-    ошибка по элементам. Имена файлов: <prefix>_<key>_<idx>_<suffix>_.png.
+    ошибка по элементам. На этой панели значения >10 и non-finite заменяются на
+    nan (``mask_image_outliers``), чтобы выбросы не растягивали цветовую шкалу;
+    остальные панели пишутся как есть.
+    Имена файлов: <prefix>_<key>_<idx>_<suffix>_.png.
     """
     for key in pred.keys():
         time_index = _inference_time_index(pred[key])
         p, b, t = pred[key], band[key], target[key]
         eps = torch.finfo(p.dtype).eps
         sqrt_chi2 = (t - p).abs() / b.clamp_min(eps)
+        sqrt_chi2 = mask_image_outliers(sqrt_chi2)
 
         save_image(canonical_image(t, channel_index=0, time_index=time_index),
                    output_prefix.with_name(output_prefix.name + f"{key}_{batch_idx}_target_.png"),
@@ -942,15 +984,25 @@ def per_channel_p99(pred, std, target, pct=PER_CHANNEL_PCT) -> list:
 
     ``std == 0`` даёт inf, а один inf отравил бы весь перцентиль (``quantile``
     возвращает nan), поэтому не-конечные значения переводятся в nan и
-    отбрасываются ``nanquantile``'ом. Пустой канал (нет конечных значений)
-    даёт nan.
+    отбрасываются ``nanquantile``'ом. Дополнительно элементы с невалидным std
+    (nan или ``std < STD_REL_FLOOR * RMS(|target|)`` этого поля) тоже
+    отбрасываются -- near-zero std портит хвост. Пустой канал (нет конечных
+    значений) даёт nan.
     """
     if pred.shape[0] != 1:
         raise ValueError(
             f"per_channel_p99: ожидался батч из одного сэмпла (B=1), "
             f"получено {pred.shape[0]}"
         )
-    sq = ((pred - target).abs() / std).reshape(pred.shape[1], -1)
+    if pred.numel() == 0:
+        return [float("nan") for _ in range(pred.shape[1])]
+    scale = torch.sqrt(torch.mean(target.double() ** 2))
+    valid = std_valid_mask(std, scale)
+    sq = torch.where(
+        valid,
+        (pred - target).abs() / std,
+        torch.full_like(std, float("nan")),
+    ).reshape(pred.shape[1], -1)
     if sq.numel() == 0:
         return [float("nan") for _ in range(pred.shape[1])]
     sq = torch.nan_to_num(sq, nan=float("nan"),
@@ -965,13 +1017,22 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
                   save_images=True, diag_probes=0, channel_names=None):
     """Метрики на eval-сэмплах.
 
-    ``luno_chi2`` -- глобальное среднее chi2 по элементам всех сэмплов.
+    Везде, где участвует ``std``, элементы фильтруются по нему: пиксель
+    валиден, если ``std`` конечен и ``std >= STD_REL_FLOOR * RMS(|target|)``
+    этого поля (STD_REL_FLOOR = 1e-6). std==0/nan и near-zero std дают
+    гигантские chi2/nll даже на считанных пикселях и топят средние. Отбрасываются
+    ЭЛЕМЕНТЫ, а не целые сэмплы. В ``metrics`` пишутся
+    ``luno_valid_percent`` (доля валидных элементов, %) и
+    ``luno_dropped_elements`` (число отброшенных). ``luno_rmse`` std не
+    использует -- считается по всем элементам.
+
+    ``luno_chi2`` -- глобальное среднее chi2 по валидным элементам всех сэмплов.
     ``luno_sqrt_chi2_*`` -- статистики приведённого sqrt(chi2) = sqrt(chi2 /
-    n_elements) (RMS стандартизованного остатка, ~1 при идеальной калибровке),
+    n_valid) (RMS стандартизованного остатка, ~1 при идеальной калибровке),
     посчитанные по каждому сэмплу: перцентили p5/p25/p50/p75/p95 и среднее.
 
     ``luno_spearman_std_resid`` -- коэффициент корреляции Спирмена между
-    ``std_raw`` и остатком ``|mean_raw - target|`` ПО ВСЕМ элементам одного
+    ``std_raw`` и остатком ``|mean_raw - target|`` ПО ВАЛИДНЫМ элементам одного
     сэмпла (все каналы склеены), усреднённый по сэмплам. Показывает, растёт ли
     неопределённость там, где ошибка большая: 1 -- идеальный монотонный рост,
     0 -- связи нет, < 0 -- неопределённость антагонична ошибке. Сэмпл с
@@ -999,14 +1060,16 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
     держать его разным ради "эталонности" не нужно.
     """
     cov = create_luno_cov(low_rank, prior_args)
-    nll_sum = torch.tensor(0.0, dtype=DTYPE)
+    nll_sum = torch.tensor(0.0, dtype=torch.float64)
     rmse_sum = torch.tensor(0.0, dtype=DTYPE)
-    chi2_sum = torch.tensor(0.0, dtype=DTYPE)
+    chi2_sum = torch.tensor(0.0, dtype=torch.float64)
     sqrt_chi2_samples = []
     spearman_samples = []  # по одному rho на сэмпл; nan на вырожденных
     ch_p99_samples = []  # по одному списку длины C на сэмпл; nan на пустых каналах
     cfg_sums = {}
     n_elements = 0
+    n_elements_valid = 0
+    n_dropped = 0
     n_samples = 0
 
     output_prefix = None
@@ -1031,21 +1094,38 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
                 affine=affine, mode=mode, fwd_batch=fwd_batch, vjp_chunk=args.vjp_chunk,
                 diag_probes=diag_probes,
             )
-            nll_sum = nll_sum + nll_gaussian(mean_raw, std_raw, target, scaled=False)
-            rmse_sum = rmse_sum + torch.sqrt(torch.mean((mean_raw - target) ** 2))
-            chi2_sample = chi_squared(mean_raw, std_raw, target, averaged=False)
-            chi2_sum = chi2_sum + chi2_sample
-            # Корреляция Спирмена std_raw <-> |остаток| по всем элементам сэмпла
-            # (все каналы склеены): один rho на сэмпл, среднее -- в конце.
-            spearman_samples.append(
-                spearman_corr(std_raw, (mean_raw - target).abs())
-            )
-            # Приведённый sqrt(chi2) одного сэмпла: sqrt(chi2 / n_elements).
+            # Фильтр по std: std==0/nan и near-zero std (std < STD_REL_FLOOR *
+            # RMS(|target|) этого поля) дают гигантские chi2/nll даже на
+            # считанных пикселях и топят средние. Отбрасываем ЭЛЕМЕНТЫ (пиксели),
+            # а не целые сэмплы, и считаем chi2/nll/spearman/sqrt_chi2 только по
+            # валидным. rmse std не использует -- остаётся по всем элементам.
+            scale = torch.sqrt(torch.mean(target.double() ** 2))
+            valid = std_valid_mask(std_raw, scale)
+            sr = standardized_residual(mean_raw, std_raw, target)
+            valid = valid & torch.isfinite(sr)
+            n_valid = int(valid.sum())
             n_elem_sample = target.numel()
-            if n_elem_sample:
+            n_dropped += n_elem_sample - n_valid
+
+            rmse_sum = rmse_sum + torch.sqrt(torch.mean((mean_raw - target) ** 2))
+            if n_valid:
+                sr_v = sr[valid].double()
+                std_v = std_raw[valid].double()
+                chi2_sum = chi2_sum + (sr_v ** 2).sum()
+                nll_sum = nll_sum + (
+                    0.5 * sr_v ** 2
+                    + std_v.log()
+                    + 0.5 * math.log(2.0 * math.pi)
+                ).sum()
+                n_elements_valid += n_valid
                 sqrt_chi2_samples.append(
-                    float(torch.sqrt(chi2_sample.double() / n_elem_sample))
+                    float(torch.sqrt((sr_v ** 2).sum() / n_valid))
                 )
+            # Корреляция Спирмена std_raw <-> |остаток| по валидным элементам
+            # сэмпла (все каналы склеены): один rho на сэмпл, среднее -- в конце.
+            spearman_samples.append(
+                spearman_corr(std_raw[valid], (mean_raw - target).abs()[valid])
+            )
             n_elements += n_elem_sample
             n_samples += 1
 
@@ -1074,9 +1154,10 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
                 for name, value in batch_metrics[0].items():
                     cfg_sums[name] = cfg_sums.get(name, 0.0) + float(value)
 
-    nll = (nll_sum / n_elements).item() if n_elements else float("nan")
+    nll = (nll_sum / n_elements_valid).item() if n_elements_valid else float("nan")
     rmse = (rmse_sum / n_samples).item() if n_samples else float("nan")
-    chi2 = (chi2_sum / n_elements).item() if n_elements else float("nan")
+    chi2 = (chi2_sum / n_elements_valid).item() if n_elements_valid else float("nan")
+    valid_percent = 100.0 * n_elements_valid / n_elements if n_elements else float("nan")
 
     # Перцентили приведённого sqrt(chi2) по сэмплам.
     sqrt_chi2_pct = {}
@@ -1121,6 +1202,8 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
         "luno_rmse": rmse,
         "luno_chi2": chi2,
         "luno_spearman_std_resid": spearman,
+        "luno_valid_percent": valid_percent,
+        "luno_dropped_elements": n_dropped,
         "samples": n_samples,
     }
     cfg_str = " ".join(f"{k}={v:.6e}" for k, v in cfg_metrics.items())
@@ -1131,6 +1214,8 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
     )
     print(f"[eval:{task_name}] luno_nll={nll:.6e} luno_rmse={rmse:.6e} "
           f"luno_chi2={chi2:.6e} luno_spearman_std_resid={spearman:.6e} "
+          f"luno_valid_percent={valid_percent:.6e} "
+          f"luno_dropped_elements={n_dropped} "
           f"{pct_str} {cfg_str} "
           f"(samples={n_samples}, elements={n_elements}{valid_str})")
     if ch_pct:

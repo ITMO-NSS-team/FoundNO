@@ -12,6 +12,7 @@ tasks:
 ### CFD ###
   - name: pdebench_2d_cfd
     task_idx: 0
+    task_type: in_distr
     luno:
       jv_mode: affine
       fwd_batch: 4
@@ -55,9 +56,9 @@ tasks:
 
     split:
       type: ratios
-      train: 0.8
-      val: 0.1
-      test: 0.1
+      train: 0.98
+      val: 0.01
+      test: 0.01
 
     loaders:
       train:
@@ -404,7 +405,7 @@ tasks:
       variable_name: data
       data_order: TCHW
       temporal_mode: window
-      #window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
+      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
       input_time_indices: [0, 1, 2, 3]
       output_time_indices: [1, 2, 3, 4]
       flatten_time_to_channels: false
@@ -479,6 +480,7 @@ tasks:
       variable_name: data
       data_order: TCHW
       temporal_mode: window
+      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
       input_time_indices: [0, 1, 2, 3]
       output_time_indices: [1, 2, 3, 4]
       flatten_time_to_channels: false
@@ -553,6 +555,7 @@ tasks:
       variable_name: data
       data_order: TCHW
       temporal_mode: window
+      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
       input_time_indices: [0, 1, 2, 3]
       output_time_indices: [1, 2, 3, 4]
       flatten_time_to_channels: false
@@ -627,6 +630,7 @@ tasks:
       variable_name: data
       data_order: TCHW
       temporal_mode: window
+      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
       input_time_indices: [0, 1, 2, 3]
       output_time_indices: [1, 2, 3, 4]
       flatten_time_to_channels: false
@@ -701,6 +705,7 @@ tasks:
       variable_name: data
       data_order: TCHW
       temporal_mode: window
+      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
       input_time_indices: [0, 1, 2, 3]
       output_time_indices: [1, 2, 3, 4]
       flatten_time_to_channels: false
@@ -775,6 +780,7 @@ tasks:
       variable_name: data
       data_order: TCHW
       temporal_mode: window
+      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
       input_time_indices: [0, 1, 2, 3]
       output_time_indices: [1, 2, 3, 4]
       flatten_time_to_channels: false
@@ -849,6 +855,7 @@ tasks:
       variable_name: data
       data_order: TCHW
       temporal_mode: window
+      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
       input_time_indices: [0, 1, 2, 3]
       output_time_indices: [1, 2, 3, 4]
       flatten_time_to_channels: false
@@ -923,6 +930,7 @@ tasks:
       variable_name: data
       data_order: TCHW
       temporal_mode: window
+      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
       input_time_indices: [0, 1, 2, 3]
       output_time_indices: [1, 2, 3, 4]
       flatten_time_to_channels: false

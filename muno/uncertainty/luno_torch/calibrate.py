@@ -4,6 +4,31 @@ import torch
 
 from .progress import tqdm
 
+# Порог "std близкий к нулю" ОТНОСИТЕЛЬНО масштаба сигнала: пиксель считается
+# валидным, если std >= STD_REL_FLOOR * scale (scale -- RMS сигнала этого поля).
+# std_raw = std_norm*(norm.std+eps), а std_norm ~ sqrt(prior_prec), поэтому
+# абсолютный порог "плыл" бы вместе с калибровкой; относительный -- нет.
+STD_REL_FLOOR = 1e-4
+
+
+def std_valid_mask(std, scale, rel=STD_REL_FLOOR):
+    """Маска валидных по std элементов: конечный std и std >= rel*scale.
+
+    ``scale`` -- характерный масштаб сигнала (обычно RMS(|target|)) того же
+    сэмпла. Отбрасывает std==0/nan и near-zero std, которые иначе дают
+    гигантские chi2/nll.
+    """
+    return torch.isfinite(std) & (std > 0) & (std >= rel * scale)
+
+
+def standardized_residual(pred_mean, pred_std, target):
+    """Поэлементный |mean - target| / std (для фильтрации и chi2/nll по элементам).
+
+    На нулевом std даёт inf/nan -- вызывающий обязан сначала применить
+    ``std_valid_mask``.
+    """
+    return (pred_mean.reshape(-1) - target.reshape(-1)).abs() / pred_std.reshape(-1)
+
 
 def nll_gaussian(mean: torch.Tensor, std: torch.Tensor, target: torch.Tensor, scaled: bool = True) -> torch.Tensor:
     """Negative log-likelihood under a diagonal Gaussian predictive.
