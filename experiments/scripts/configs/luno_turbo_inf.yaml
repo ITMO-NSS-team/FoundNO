@@ -56,9 +56,9 @@ tasks:
 
     split:
       type: ratios
-      train: 0.98
-      val: 0.01
-      test: 0.01
+      train: 0.8
+      val: 0.1
+      test: 0.1
 
     loaders:
       train:
@@ -359,10 +359,12 @@ tasks:
         pin_memory: true
         shuffle: false
         drop_last: false
-### shear flow ###
+
+###  polymathic-ai/turbulent_radiative_layer_2D ###
 
   - name: thewell_shear_flow
     task_idx: 4
+    task_type: in_distr
     luno:
       jv_mode: affine
       fwd_batch: 4
@@ -938,9 +940,9 @@ tasks:
       physics_name: shear_flow
     split:
       type: ratios
-      train: 0.997
-      val: 0.001
-      test: 0.002
+      train: 0.97
+      val: 0.01
+      test: 0.02
     loaders:
       train:
         batch_size: 8
