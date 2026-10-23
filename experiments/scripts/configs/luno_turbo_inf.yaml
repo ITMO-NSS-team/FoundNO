@@ -14,8 +14,8 @@ tasks:
     task_idx: 0
     task_type: in_distr
     luno:
-      jv_mode: affine
-      fwd_batch: 4
+      jv_mode: forward
+      fwd_batch: 1
       vjp_chunk: 16
       max_rank: 0
       ggn_method: randomized
@@ -252,7 +252,7 @@ tasks:
       path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
       axis_selection:
         0:
-          linspace: [0, 20, 20]
+          linspace: [0, 60, 16]
 
     adapter:
       type: temporal
@@ -270,75 +270,6 @@ tasks:
       train: 0.8
       val: 0.1
       test: 0.1
-
-    loaders:
-      train:
-        batch_size: 8
-        num_workers: 0
-        pin_memory: true
-        shuffle: true
-        drop_last: true
-      val:
-        batch_size: 8
-        num_workers: 0
-        pin_memory: true
-        shuffle: false
-        drop_last: false
-      test:
-        batch_size: 8
-        num_workers: 0
-        pin_memory: true
-        shuffle: false
-        drop_last: false
-      
-  - name: pdebench_2d_cfd_scarce
-    task_idx: 0
-    luno:
-      jv_mode: affine
-      fwd_batch: 4
-      vjp_chunk: 16
-      max_rank: 0
-      ggn_method: randomized
-      ggn_oversample: 0
-      max_num_samples: 2
-      val_calib_frac: 0.8
-      diag_hutchinson: 50
-      calib_max_samples: 0
-      calib_grid_min: -3.0
-      calib_grid_max: 3.0
-      calib_grid_size: 50
-      calib_objective: nll
-    source:
-      location: url
-      format: hdf5
-      sample_dim: 0
-      variables:
-        density: density
-        pressure: pressure
-        Vx: Vx
-        Vy: Vy
-      url: https://darus.uni-stuttgart.de/api/access/datafile/164687
-      path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
-      axis_selection:
-        0:
-          linspace: [0, 20, 16]
-
-    adapter:
-      type: temporal
-      variable_names: [density, pressure, Vx, Vy]
-      data_order: TXY
-      temporal_mode: initial_to_trajectory
-      input_time_index: 0
-      output_time_indices: all
-      flatten_time_to_channels: false
-      benchmark_name: PDEBench
-      physics_name: 2d_cfd
-
-    split:
-      type: ratios
-      train: 0.998
-      val: 0.001
-      test: 0.001
 
     loaders:
       train:
@@ -393,7 +324,7 @@ tasks:
         t2_fields: []
       axis_selection:
         0:
-          linspace: [0, 199, 16]
+          linspace: [0, 20, 16]
         1:
           slice: [0, 256, 4]
         2:
@@ -406,10 +337,9 @@ tasks:
       type: temporal
       variable_name: data
       data_order: TCHW
-      temporal_mode: window
-      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
-      input_time_indices: [0, 1, 2, 3]
-      output_time_indices: [1, 2, 3, 4]
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
       flatten_time_to_channels: false
       benchmark_name: TheWell
       physics_name: shear_flow
@@ -468,7 +398,7 @@ tasks:
         t2_fields: []
       axis_selection:
         0:
-          linspace: [0, 199, 16]
+          linspace: [0, 20, 16]
         1:
           slice: [0, 256, 4]
         2:
@@ -481,10 +411,9 @@ tasks:
       type: temporal
       variable_name: data
       data_order: TCHW
-      temporal_mode: window
-      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
-      input_time_indices: [0, 1, 2, 3]
-      output_time_indices: [1, 2, 3, 4]
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
       flatten_time_to_channels: false
       benchmark_name: TheWell
       physics_name: shear_flow
@@ -543,7 +472,7 @@ tasks:
         t2_fields: []
       axis_selection:
         0:
-          linspace: [0, 199, 16]
+          linspace: [0, 20, 16]
         1:
           slice: [0, 256, 4]
         2:
@@ -556,10 +485,9 @@ tasks:
       type: temporal
       variable_name: data
       data_order: TCHW
-      temporal_mode: window
-      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
-      input_time_indices: [0, 1, 2, 3]
-      output_time_indices: [1, 2, 3, 4]
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
       flatten_time_to_channels: false
       benchmark_name: TheWell
       physics_name: shear_flow
@@ -618,7 +546,7 @@ tasks:
         t2_fields: []
       axis_selection:
         0:
-          linspace: [0, 199, 16]
+          linspace: [0, 20, 16]
         1:
           slice: [0, 256, 4]
         2:
@@ -632,9 +560,9 @@ tasks:
       variable_name: data
       data_order: TCHW
       temporal_mode: window
-      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
-      input_time_indices: [0, 1, 2, 3]
-      output_time_indices: [1, 2, 3, 4]
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
       flatten_time_to_channels: false
       benchmark_name: TheWell
       physics_name: shear_flow
@@ -693,7 +621,7 @@ tasks:
         t2_fields: []
       axis_selection:
         0:
-          linspace: [0, 199, 16]
+          linspace: [0, 20, 16]
         1:
           slice: [0, 256, 4]
         2:
@@ -707,9 +635,9 @@ tasks:
       variable_name: data
       data_order: TCHW
       temporal_mode: window
-      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
-      input_time_indices: [0, 1, 2, 3]
-      output_time_indices: [1, 2, 3, 4]
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
       flatten_time_to_channels: false
       benchmark_name: TheWell
       physics_name: shear_flow
@@ -768,7 +696,7 @@ tasks:
         t2_fields: []
       axis_selection:
         0:
-          linspace: [0, 199, 32]
+          linspace: [0, 120, 16]
         1:
           slice: [0, 256, 4]
         2:
@@ -782,9 +710,9 @@ tasks:
       variable_name: data
       data_order: TCHW
       temporal_mode: window
-      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
-      input_time_indices: [0, 1, 2, 3]
-      output_time_indices: [1, 2, 3, 4]
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
       flatten_time_to_channels: false
       benchmark_name: TheWell
       physics_name: shear_flow
@@ -843,11 +771,11 @@ tasks:
         t2_fields: []
       axis_selection:
         0:
-          linspace: [0, 199, 32]
+          linspace: [0, 20, 16]
         1:
-          slice: [0, 256, 2]
+          slice: [0, 256, 1]
         2:
-          slice: [0, 512, 2]
+          slice: [0, 512, 1]
       files:
         - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
         - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
@@ -857,9 +785,9 @@ tasks:
       variable_name: data
       data_order: TCHW
       temporal_mode: window
-      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
-      input_time_indices: [0, 1, 2, 3]
-      output_time_indices: [1, 2, 3, 4]
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
       flatten_time_to_channels: false
       benchmark_name: TheWell
       physics_name: shear_flow
@@ -868,81 +796,6 @@ tasks:
       train: 0.7
       val: 0.1
       test: 0.2
-    loaders:
-      train:
-        batch_size: 8
-        num_workers: 0
-        pin_memory: false
-        shuffle: true
-        drop_last: true
-      val:
-        batch_size: 8
-        num_workers: 0
-        pin_memory: false
-        shuffle: false
-        drop_last: false
-      test:
-        batch_size: 8
-        num_workers: 0
-        pin_memory: false
-        shuffle: false
-        drop_last: false
-
-  - name: thewell_shear_flow_scarce
-    task_idx: 4
-    luno:
-      jv_mode: affine
-      fwd_batch: 4
-      vjp_chunk: 16
-      max_rank: 0
-      ggn_method: randomized
-      ggn_oversample: 0
-      max_num_samples: 2
-      val_calib_frac: 0.8
-      diag_hutchinson: 50
-      calib_max_samples: 0
-      calib_grid_min: -3.0
-      calib_grid_max: 3.0
-      calib_grid_size: 50
-      calib_objective: nll
-    source:
-      location: huggingface
-      format: concat_thewell_hdf5
-      repo_id: polymathic-ai/shear_flow
-      cache_dir: /workspace/data/TheWell/shear_flow/thewell_shear_flow
-      field_groups:
-        t0_fields:
-          - tracer
-          - pressure
-        t1_fields: []
-        t2_fields: []
-      axis_selection:
-        0:
-          linspace: [0, 199, 16]
-        1:
-          slice: [0, 256, 4]
-        2:
-          slice: [0, 512, 4]
-      files:
-        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
-        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
-        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
-    adapter:
-      type: temporal
-      variable_name: data
-      data_order: TCHW
-      temporal_mode: window
-      window_start_indices: [0,1,2, 3, 4, 5, 6, 7, 8, 9, 10,11]
-      input_time_indices: [0, 1, 2, 3]
-      output_time_indices: [1, 2, 3, 4]
-      flatten_time_to_channels: false
-      benchmark_name: TheWell
-      physics_name: shear_flow
-    split:
-      type: ratios
-      train: 0.97
-      val: 0.01
-      test: 0.02
     loaders:
       train:
         batch_size: 8
