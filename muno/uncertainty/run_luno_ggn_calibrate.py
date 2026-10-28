@@ -7,8 +7,11 @@
 ("тип физики"), а не по позиции в списке: файлы ``lift_{task_idx}.pt``,
 ``proj_{task_idx}.pt``, ``input_normalizer_{task_idx}.pkl``,
 ``output_normalizer_{task_idx}.pkl``. Ядро (core) и сплит его последнего
-FNO-блока общие для всех задач. Тюнимые параметры -- веса последнего
-FNO-блока общего core (R, W, b); лифтинг и проекция фиксированы.
+FNO-блока общие для всех задач. По умолчанию (``--ggn-target last-block``)
+тюнимые параметры -- веса последнего FNO-блока общего core (R, W, b), а
+лифтинг и проекция фиксированы. С ``--ggn-target lifting`` линейизуются все
+параметры лифтинга каждой задачи (``fcs.*.weight``/``fcs.*.bias``), а core и
+проекция фиксированы; для лифтинга доступен только ``--jv-mode forward``.
 
 Переопределить не-общие и не-весовые аргументы для конкретной задачи можно
 блоком ``luno:`` внутри описания задачи в yaml (например ``max_rank``,
@@ -34,11 +37,11 @@ in_distr-задачи, откуда читается ``prior_prec``). Если �
        (rmi.loadData; val-сплит 0.1 -> данные для калибровки);
     2) сплит модели: last FNO block core -> w0 = [R.real, R.imag, W, b];
        печать слоёв, выбранных в качестве последних;
-    3) low-rank GGN последнего фурье-слоя на train-лоадере; при заданном
-       --ggn-checkpoint (файл или папка с low_rank_terms_{task_idx}.pkl) шаг
-       пропускается и LowRankTerms читается из pickle (файла нет --
-       предупреждение и расчёт как обычно); для НЕ-in_distr задач берётся у
-       in_distr-соседа того же task_idx;
+    3) low-rank GGN выбранного target на train-лоадере (last-block:
+       low_rank_terms_{task_idx}.pkl, lifting: lifting_low_rank_terms_{task_idx}.pkl);
+       при заданном --ggn-checkpoint шаг пропускается и LowRankTerms читается
+       из pickle (файла нет -- предупреждение и расчёт как обычно); для
+       НЕ-in_distr задач берётся у in_distr-соседа того же task_idx;
     4) калибровка scalar prior_prec на всех сэмплах calib-части val
        (полный log10-грид, пробы Хатчинсона переиспользуются по кандидатам);
        только для in_distr задач, НЕ-in_distr берут результат соседа;
@@ -78,6 +81,7 @@ import os
 import pickle
 import sys
 import traceback
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -113,6 +117,7 @@ from muno.data.data.transforms.normalizers import MultiphysicsUnitGaussianNormal
 
 from luno_torch.adapter import (
     TorchFNOWrapper,
+    TorchLiftingWrapper,
     discover_last_block_keys,
     ref_state_dict,
     split_wrapper,
@@ -126,9 +131,10 @@ from luno_torch.calibrate import (
     std_valid_mask,
 )
 from luno_torch.factory import create_luno_cov
-from luno_torch.ggn import GGNMatvec, LowRankTerms, low_rank_ggn
+from luno_torch.ggn import GGNMatvec, LiftingGGNMatvec, LowRankTerms, low_rank_ggn
 from luno_torch.jacobian import (
     LastFNOBlockWeightJacobian,
+    LiftingWeightJacobian,
     check_jacobian,
     default_check_tol,
     sample_congruence_probes,
@@ -180,7 +186,14 @@ def parse_args():
                    help="Режим прямых произведений Jv/J@W: forward-mode AD "
                         "(torch.func.jvp, по умолчанию) или аффинная декомпозиция "
                         "последнего блока (conv/skip через прямой forward, хвост "
-                        "через jvp). Оба точны; выбирается по памяти/скорости.")
+                        "через jvp). Оба точны; выбирается по памяти/скорости. "
+                        "Для --ggn-target lifting доступен только forward.")
+    p.add_argument("--ggn-target", choices=["last-block", "lifting"],
+                   default="last-block",
+                   help="По каким параметрам считать GGN и калибровать prior_prec: "
+                        "'last-block' -- веса последнего FNO-блока core (как "
+                        "раньше), 'lifting' -- все веса и bias адаптера лифтинга "
+                        "для каждой задачи.")
     p.add_argument("--fwd-batch", type=int, default=4,
                    help="Сколько колонок J@W считать одним батчем через vmap "
                         "(только для --jv-mode forward). Больше -- быстрее, но "
@@ -383,7 +396,7 @@ class TaskSkipped(RuntimeError):
     """
 
 
-def load_prior_prec_from_results(directory, task_idx):
+def load_prior_prec_from_results(directory, task_idx, ggn_target="last-block"):
     """Читает ``prior_prec`` in_distr-задачи ``task_idx`` из папки прогона.
 
     ``directory`` -- папка прогона (``<output-root>/<prefix>_<timestamp>``)
@@ -391,6 +404,10 @@ def load_prior_prec_from_results(directory, task_idx):
     глубже одного уровня вложенности) ищется ``luno_results.pkl`` с
     ``task_idx`` этой задачи; берётся его ``prior_prec``. Ошибка -- если
     файла нет или в нём нет совпадения/поля.
+
+    ``ggn_target`` должен совпадать с сохранённым в результатах: prior_prec
+    над весами последнего блока и над весами лифтинга -- разные величины.
+    Старые результаты без поля ``ggn_target`` считаются last-block.
     """
     root = rmi.resolve_path(directory)
     if not root.exists():
@@ -414,15 +431,19 @@ def load_prior_prec_from_results(directory, task_idx):
             continue
         if results.get("prior_prec") is None:
             continue
+        saved_target = results.get("ggn_target", "last-block")
+        if saved_target != ggn_target:
+            continue
         found.append((p, results))
     if not found:
         raise TaskSkipped(
             f"--prior-prec-source: в {root} нет luno_results.pkl с "
-            f"task_idx={task_idx} и prior_prec. "
+            f"task_idx={task_idx}, ggn_target={ggn_target} и prior_prec. "
             f"Укажите папку прогона in_distr-задачи этого task_idx."
         )
     path, results = found[0]
-    print(f"[prior_prec] из {path} (task_idx={task_idx}): "
+    print(f"[prior_prec] из {path} (task_idx={task_idx}, "
+          f"ggn_target={ggn_target}): "
           f"prior_prec={float(results['prior_prec']):.6e}")
     return float(results["prior_prec"])
 
@@ -450,6 +471,36 @@ def find_indexed_file(directory, prefix, suffix, task_idx):
             f"(позиция {task_idx} в {directory})."
         )
         return files[task_idx]
+    return None
+
+
+def find_ggn_terms_file(directory, prefix, task_idx, suffix=".pkl"):
+    """Строгий поиск low-rank GGN-артефакта по ``prefix``.
+
+    В отличие от :func:`find_indexed_file`, не берёт позицию в общем списке:
+    иначе в папке рядом с ``low_rank_terms_0.pkl`` можно случайно выбрать
+    last-block-артефакт вместо ``lifting_low_rank_terms_0.pkl``. Допускаются:
+
+    * точное ``{prefix}_{task_idx}.pkl``;
+    * ``*{prefix}_{task_idx}.pkl`` (например ``{run_prefix}_...``);
+    * единственный файл ``*{prefix}.pkl`` (папка одной задачи).
+    """
+    if directory is None:
+        return None
+    directory = rmi.resolve_path(directory)
+    exact = directory / f"{prefix}_{task_idx}{suffix}"
+    if exact.is_file():
+        return exact
+    files = sorted(Path(f) for f in rmi.get_all_files(str(directory), suffix))
+    by_task = [
+        f for f in files
+        if prefix in f.stem and f.stem.endswith(f"_{task_idx}")
+    ]
+    if by_task:
+        return by_task[0]
+    same = [f for f in files if prefix in f.stem]
+    if len(same) == 1:
+        return same[0]
     return None
 
 
@@ -539,6 +590,86 @@ def make_model_fn(wrapper: TorchFNOWrapper, lifting, projection):
         return projection(out)
 
     return model_fn
+
+
+@dataclass
+class GGNSetup:
+    """Всё, что зависит от выбранного target GGN (last-block / lifting)."""
+
+    target: str
+    model_fn: callable
+    w0: torch.Tensor
+    wrapper: object
+    jacobian_cls: type
+    matvec_cls: type
+    affine: object | None
+    artifact_prefix: str
+
+
+def build_ggn_setup(args, core, core_wrapper: TorchFNOWrapper, core_w0: torch.Tensor,
+                    lifting, projection) -> GGNSetup:
+    """Собирает model_fn/w0/классы якобиана для выбранного --ggn-target.
+
+    lifting-режим использует :class:`TorchLiftingWrapper`: все параметры
+    лифтинга становятся ``w0``, а core и projection заморожены. Аффинная
+    декомпозиция для лифтинга пока не реализована, поэтому ``jv_mode`` там
+    обязан быть ``forward``.
+    """
+    if args.ggn_target == "lifting":
+        if args.jv_mode != "forward":
+            raise ValueError(
+                "--ggn-target lifting поддерживает только --jv-mode forward: "
+                "аффинная декомпозиция для лифтинга не реализована."
+            )
+        try:
+            for p in core.parameters():
+                p.requires_grad_(False)
+        except Exception:
+            pass
+        if projection is not None:
+            try:
+                for p in projection.parameters():
+                    p.requires_grad_(False)
+            except Exception:
+                pass
+        try:
+            core.eval()
+        except Exception:
+            pass
+        if projection is not None:
+            try:
+                projection.eval()
+            except Exception:
+                pass
+        wrapper = TorchLiftingWrapper(
+            lifting, core, projection, dtype=DTYPE
+        )
+        return GGNSetup(
+            target="lifting",
+            model_fn=wrapper.model_fn,
+            w0=wrapper.w0,
+            wrapper=wrapper,
+            jacobian_cls=LiftingWeightJacobian,
+            matvec_cls=LiftingGGNMatvec,
+            affine=None,
+            artifact_prefix="lifting_low_rank_terms",
+        )
+
+    model_fn = make_model_fn(core_wrapper, lifting, projection)
+    affine = (
+        AffineLastBlock(core_wrapper.model, projection, core_wrapper.keys, dtype=DTYPE)
+        if args.jv_mode == "affine" else None
+    )
+    return GGNSetup(
+        target="last-block",
+        model_fn=model_fn,
+        w0=core_w0,
+        wrapper=core_wrapper,
+        jacobian_cls=LastFNOBlockWeightJacobian,
+        matvec_cls=GGNMatvec,
+        affine=affine,
+        artifact_prefix="low_rank_terms",
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -722,7 +853,7 @@ def raw_from_normalized(mean_norm, std_norm, out_normalizer, out_shape):
 # ----------------------------------------------------------------------------
 
 def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor, affine,
-                         mode="forward", fwd_batch=4):
+                         mode="forward", fwd_batch=4, matvec_cls=GGNMatvec):
     xs = []
     for sample in tqdm(
         iter_samples(train_loader, args.max_num_samples),
@@ -736,7 +867,7 @@ def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor, affin
     print(f"[GGN] собрано {len(xs)} сэмплов из train loader.")
     assert xs, "No samples collected for GGN."
 
-    ggn_mv = GGNMatvec(
+    ggn_mv = matvec_cls(
         model_fn, w0, xs, affine=affine, mode=mode, fwd_batch=fwd_batch,
         loss_fn="mse", factor=1.0, vjp_chunk=args.vjp_chunk,
     )
@@ -788,7 +919,8 @@ def load_low_rank_ggn(path, w0):
     if U.shape[0] != w0.numel():
         raise ValueError(
             f"--ggn-checkpoint: U.shape[0]={U.shape[0]} != w0.numel()="
-            f"{w0.numel()} -- GGN от другой модели или другого сплита ({p})."
+            f"{w0.numel()} -- GGN от другого target (--ggn-target), модели "
+            f"или сплита ({p})."
         )
     U = U.to(device=w0.device, dtype=w0.dtype)
     S = S.to(device=w0.device, dtype=w0.dtype)
@@ -800,11 +932,12 @@ def load_low_rank_ggn(path, w0):
 
 def _batch_predictive_stats(model_fn, w0, weight_cov, x, out_normalizer,
                             num_output_channels, affine, mode="forward",
-                            fwd_batch=4, vjp_chunk=64, diag_probes=0):
+                            fwd_batch=4, vjp_chunk=64, diag_probes=0,
+                            jacobian_cls=LastFNOBlockWeightJacobian):
     """(mean_raw, std_raw) для одного входного тензора x в raw-пространстве."""
     with torch.no_grad():
         out_shape = model_fn(x, w0).shape
-    jac = LastFNOBlockWeightJacobian(
+    jac = jacobian_cls(
         model_fn,
         x,
         w0,
@@ -829,7 +962,8 @@ def _batch_predictive_stats(model_fn, w0, weight_cov, x, out_normalizer,
 
 def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
                          out_normalizer, val_loader, affine, objective_name="chi2",
-                         mode="forward", fwd_batch=4):
+                         mode="forward", fwd_batch=4,
+                         jacobian_cls=LastFNOBlockWeightJacobian):
     """Калибровка scalar prior_prec на сэмплах калибровочной части val.
 
     ``val_loader`` здесь -- калибровочная часть val (см. ``--val-calib-frac``);
@@ -891,7 +1025,7 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
             target_raw = sample[0]["y"]
             target = target_raw.reshape(-1)
             out_shape = None  # считается лениво, один forward на сэмпл
-            jac = LastFNOBlockWeightJacobian(
+            jac = jacobian_cls(
                 model_fn, x, w0, affine=affine, mode=mode, fwd_batch=fwd_batch,
                 num_output_channels=num_output_channels,
                 vjp_chunk=args.vjp_chunk,
@@ -1112,7 +1246,8 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
                   data_processor, out_normalizer, task_name, max_samples,
                   affine, metrics_config=None, output_dir=None,
                   mode="forward", fwd_batch=4,
-                  save_images=True, diag_probes=0, channel_names=None):
+                  save_images=True, diag_probes=0, channel_names=None,
+                  jacobian_cls=LastFNOBlockWeightJacobian):
     """Метрики на eval-сэмплах.
 
     Везде, где участвует ``std``, элементы фильтруются по нему: пиксель
@@ -1192,7 +1327,7 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
             mean_raw, std_raw = _batch_predictive_stats(
                 model_fn, w0, cov, x, out_normalizer, wrapper.num_output_channels,
                 affine=affine, mode=mode, fwd_batch=fwd_batch, vjp_chunk=args.vjp_chunk,
-                diag_probes=diag_probes,
+                diag_probes=diag_probes, jacobian_cls=jacobian_cls,
             )
             # Фильтр по std: std==0/nan и near-zero std (std < STD_REL_FLOOR *
             # RMS(|target|) этого поля) дают гигантские chi2/nll даже на
@@ -1387,23 +1522,33 @@ def confirm_exact_diag(args, pipeline):
 # ----------------------------------------------------------------------------
 
 def resolve_low_rank(args, w0, model_fn, pipeline, data_processor, affine, task_idx,
-                     output_dir, run_prefix, asset_cache):
+                     output_dir, run_prefix, asset_cache,
+                     matvec_cls=GGNMatvec, artifact_prefix="low_rank_terms"):
     """Возвращает (low_rank, ggn_source, ggn_checkpoint) для одной задачи.
 
     ``--ggn-checkpoint`` файл -- используется всеми задачами; папка -- берётся
-    файл этой задачи ``low_rank_terms_{task_idx}.pkl`` (с кэшем на task_idx).
+    файл этой задачи ``{artifact_prefix}_{task_idx}.pkl`` (с кэшем на task_idx).
     Если файла нет -- GGN считается на train-лоадере и сохраняется в подпапке
-    задачи как ``{run_prefix}_low_rank_terms.pkl``.
+    задачи как ``{run_prefix}_{artifact_prefix}.pkl``.
+
+    ``artifact_prefix``/``matvec_cls`` выбираются по ``--ggn-target``:
+    last-block использует старые имена, lifting -- ``lifting_low_rank_terms``.
     """
     ggn_path = None
     if args.ggn_checkpoint:
         raw = rmi.resolve_path(args.ggn_checkpoint)
         if raw.is_dir():
-            ggn_path = find_indexed_file(
-                args.ggn_checkpoint, "low_rank_terms", ".pkl", task_idx
-            )
+            if artifact_prefix == "low_rank_terms":
+                ggn_path = find_indexed_file(
+                    args.ggn_checkpoint, artifact_prefix, ".pkl", task_idx
+                )
+            else:
+                # Строгий поиск: рядом могут лежать last-block-артефакты.
+                ggn_path = find_ggn_terms_file(
+                    raw, artifact_prefix, task_idx, ".pkl"
+                )
             if ggn_path is None:
-                print(f"[GGN] в {raw} нет low_rank_terms_{task_idx}.pkl; "
+                print(f"[GGN] в {raw} нет {artifact_prefix}_{task_idx}.pkl; "
                       f"считаю GGN как обычно.")
         else:
             ggn_path = raw
@@ -1424,6 +1569,7 @@ def resolve_low_rank(args, w0, model_fn, pipeline, data_processor, affine, task_
         low_rank = compute_low_rank_ggn(
             args, model_fn, w0, pipeline["train_loader"], data_processor, affine,
             mode=args.jv_mode, fwd_batch=args.fwd_batch,
+            matvec_cls=matvec_cls,
         )
 
         # U имеет форму (d, rank) -- при d = 27.6M и rank = 50 это 5.15 ГиБ. Пишем
@@ -1434,10 +1580,10 @@ def resolve_low_rank(args, w0, model_fn, pipeline, data_processor, affine, task_
             U=low_rank.U.detach().to("cpu"), S=low_rank.S.detach().to("cpu"),
             scalar=low_rank.scalar,
         )
-        terms_path = output_dir / f"{run_prefix}_low_rank_terms.pkl"
+        terms_path = output_dir / f"{run_prefix}_{artifact_prefix}.pkl"
         with open(terms_path, "wb") as f:
             pickle.dump(low_rank_cpu, f)
-        print(f"[save] low_rank_terms -> {terms_path} "
+        print(f"[save] {artifact_prefix} -> {terms_path} "
               f"({terms_path.stat().st_size / 1024 ** 3:.2f} GiB)")
 
     ggn_source = "checkpoint" if ggn_loaded else "computed"
@@ -1466,9 +1612,10 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
     """Полный LUNO-пайплайн одной задачи; результаты пишутся в output_dir.
 
     ``in_distr`` -- задача калибрует prior_prec и строит GGN сама. Иначе
-    значения берутся из общего ``shared``-кэша (по ``task_idx``), заполненного
-    ранее отработавшей in_distr-задачей того же ``task_idx``; если её в этом
-    прогоне не было -- GGN читается из ``--ggn-checkpoint``, а prior_prec из
+    значения берутся из общего ``shared``-кэша (по
+    ``(task_idx, ggn_target)``), заполненного ранее отработавшей
+    in_distr-задачей того же ``task_idx``; если её в этом прогоне не было --
+    GGN читается из ``--ggn-checkpoint``, а prior_prec из
     ``--prior-prec-source``. Если не задано ни то, ни другое -- ``SystemExit``
     (задача пропускается вызывающим кодом с записью ошибки).
     """
@@ -1486,8 +1633,14 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
     # --- нормализаторы и data_processor ---
     data_processor, device = build_data_processor(args, pipeline, task_idx)
 
-    # model_fn: лифтинг -> core(с w) -> проекция (фиксированы лифтинг и проекция).
-    model_fn = make_model_fn(wrapper, lifting, projection)
+    # model_fn/w0/якобиан зависят от --ggn-target. Для last-block это прежний
+    # путь (w -- веса последнего FNO-блока), для lifting -- все параметры
+    # адаптера лифтинга, а core и проекция заморожены.
+    setup = build_ggn_setup(args, core, wrapper, w0, lifting, projection)
+    model_fn = setup.model_fn
+    w0 = setup.w0
+    wrapper = setup.wrapper
+    affine = setup.affine
 
     # Стартовый гейт: Jv выбранного режима против reverse-строк на ОДНОМ батче.
     # Эталон -- обратный режим (AD не трогает спектральный conv "изнутри"); при
@@ -1497,10 +1650,6 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
     # probe = preprocess_sample(
     #     data_processor, next(iter_samples(pipeline["train_loader"], 1))
     # )
-    affine = (
-        AffineLastBlock(wrapper.model, projection, wrapper.keys, dtype=DTYPE)
-        if args.jv_mode == "affine" else None
-    )
     # ok, rel = check_jacobian(
     #     model_fn, probe[0]["x"], w0,
     #     affine=affine, mode=args.jv_mode, fwd_batch=args.fwd_batch,
@@ -1524,11 +1673,16 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
     prior_prec_source = "calibrated"
     ggn_reused = False
     shared_from = None
+    shared_key = (task_idx, setup.target)
+    ggn_label = ("лифтинга" if setup.target == "lifting"
+                 else "последнего фурье-слоя")
     if in_distr:
-        print("\n[GGN] low-rank аппроксимация GGN последнего фурье-слоя:")
+        print(f"\n[GGN] low-rank аппроксимация GGN {ggn_label} "
+              f"(target={setup.target}):")
         low_rank, ggn_source, ggn_checkpoint = resolve_low_rank(
             args, w0, model_fn, pipeline, data_processor, affine, task_idx,
             output_dir, run_prefix, asset_cache,
+            matvec_cls=setup.matvec_cls, artifact_prefix=setup.artifact_prefix,
         )
 
         # --- калибровка на сэмплах калибровочной части val (доля --val-calib-frac) ---
@@ -1540,21 +1694,21 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
             args, model_fn, w0, low_rank, wrapper, data_processor,
             data_processor.out_normalizer, pipeline["calib_loader"], affine,
             objective_name=args.calib_objective, mode=args.jv_mode,
-            fwd_batch=args.fwd_batch,
+            fwd_batch=args.fwd_batch, jacobian_cls=setup.jacobian_cls,
         )
-        shared[task_idx] = (low_rank, prior_args)
-    elif task_idx in shared:
+        shared[shared_key] = (low_rank, prior_args)
+    elif shared_key in shared:
         # Переиспользуем значения in_distr-задачи ЭТОГО прогона. Она --
         # авторитет: GGN-ключи своей luno-секции игнорируем (предупреждаем,
         # если они заданы и расходятся), калибровку не запускаем.
-        low_rank, prior_args = shared[task_idx]
+        low_rank, prior_args = shared[shared_key]
         shared_from = task_idx
         prior_prec_source = "shared"
         ggn_reused = True
         ggn_source, ggn_checkpoint = "shared-in_distr", None
         _warn_ignored_ggn_keys(cfg, args, name)
-        print(f"[shared] task_idx={task_idx}: GGN и prior_prec взяты у "
-              f"in_distr-задачи этого прогона "
+        print(f"[shared] task_idx={task_idx}, target={setup.target}: GGN и "
+              f"prior_prec взяты у in_distr-задачи этого прогона "
               f"(prior_prec={prior_args['prior_prec'].item():.6e})")
     else:
         # Одиночный запуск НЕ-in_distr задачи без in_distr-соседа в прогоне:
@@ -1573,6 +1727,7 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
         low_rank, ggn_source, ggn_checkpoint = resolve_low_rank(
             args, w0, model_fn, pipeline, data_processor, affine, task_idx,
             output_dir, run_prefix, asset_cache,
+            matvec_cls=setup.matvec_cls, artifact_prefix=setup.artifact_prefix,
         )
         if ggn_checkpoint is None:
             raise TaskSkipped(
@@ -1580,7 +1735,9 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
                 f"дал low_rank для этого task_idx, а in_distr-соседа в "
                 f"прогоне нет. Задача пропускается."
             )
-        prec = load_prior_prec_from_results(args.prior_prec_source, task_idx)
+        prec = load_prior_prec_from_results(
+            args.prior_prec_source, task_idx, ggn_target=setup.target
+        )
         prior_args = {
             "prior_prec": torch.as_tensor(
                 prec, dtype=DTYPE, device=w0.device
@@ -1610,7 +1767,7 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
         output_dir=output_dir,
         mode=args.jv_mode, fwd_batch=args.fwd_batch,
         save_images=True, diag_probes=args.diag_hutchinson,
-        channel_names=channel_names,
+        channel_names=channel_names, jacobian_cls=setup.jacobian_cls,
     )
     test_metrics = evaluate_luno(
         args, pipeline["test_loader"], model_fn, w0, low_rank, prior_args, wrapper,
@@ -1620,7 +1777,7 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
         output_dir=output_dir,
         mode=args.jv_mode, fwd_batch=args.fwd_batch,
         save_images=False, diag_probes=args.diag_hutchinson,
-        channel_names=channel_names,
+        channel_names=channel_names, jacobian_cls=setup.jacobian_cls,
     )
 
     results = {
@@ -1629,6 +1786,8 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
         "task_idx": task_idx,
         "task_type": cfg.get("task_type"),
         "in_distr": in_distr,
+        "ggn_target": setup.target,
+        "w0_dim": int(w0.numel()),
         "prior_prec": prior_args["prior_prec"].item(),
         "prior_prec_source": prior_prec_source,
         "ggn_reused": ggn_reused,
@@ -1676,6 +1835,13 @@ def main():
 
     if args.core_checkpoint is None:
         raise SystemExit("--core-checkpoint обязателен.")
+
+    if args.ggn_target == "lifting" and args.jv_mode != "forward":
+        raise SystemExit(
+            "--ggn-target lifting поддерживает только --jv-mode forward: "
+            "аффинная декомпозиция для лифтинга не реализована."
+        )
+    print(f"[ggn] target={args.ggn_target}, jv_mode={args.jv_mode}")
 
     config_path = rmi.resolve_path(args.config)
     config = rmi.load_yaml_config(config_path)
@@ -1755,7 +1921,8 @@ def main():
     _print_mem("after_split_w0", device)
 
     asset_cache = {}
-    # Общий кэш значений in_distr-задач: {task_idx: (low_rank, prior_args)}.
+    # Общий кэш значений in_distr-задач:
+    # {(task_idx, ggn_target): (low_rank, prior_args)}.
     # in_distr-задачи обрабатываются первыми (см. сортировку ниже), поэтому к
     # моменту запуска НЕ-in_distr соседа значения уже готовы.
     shared = {}
@@ -1779,7 +1946,8 @@ def main():
             d.mkdir(parents=True, exist_ok=True)
 
         print(f"\n{'=' * 70}\n[task:{name}] старт (position={position}, "
-              f"task_idx={task_idx}, in_distr={in_distr})\n{'=' * 70}")
+              f"task_idx={task_idx}, in_distr={in_distr}, "
+              f"ggn_target={task_args.ggn_target})\n{'=' * 70}")
         try:
             run_one_task(
                 task_args, cfg, task_idx, model_config, core, wrapper, w0,
@@ -1798,6 +1966,7 @@ def main():
                         "task_name": cfg.get("name"),
                         "task_idx": task_idx,
                         "task_type": cfg.get("task_type"),
+                        "ggn_target": task_args.ggn_target,
                         "in_distr": in_distr,
                         "status": "skipped",
                         "error": f"{type(exc).__name__}: {exc}",
@@ -1814,6 +1983,7 @@ def main():
                         "config": config_path.stem,
                         "task_name": cfg.get("name"),
                         "task_idx": task_idx,
+                        "ggn_target": task_args.ggn_target,
                         "status": "failed",
                         "error": f"{type(exc).__name__}: {exc}",
                         "traceback": traceback.format_exc(),

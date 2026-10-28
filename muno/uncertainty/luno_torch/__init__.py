@@ -1,4 +1,9 @@
-from .adapter import TorchFNOWrapper, discover_last_block_keys, split_wrapper
+from .adapter import (
+    TorchFNOWrapper,
+    TorchLiftingWrapper,
+    discover_last_block_keys,
+    split_wrapper,
+)
 from .calibrate import (
     evaluate_for_given_prior_arguments,
     grid_search,
@@ -15,14 +20,20 @@ from .factory import (
 )
 from .ggn import (
     GGNMatvec,
+    LiftingGGNMatvec,
     LowRankTerms,
     low_rank_curvature,
     low_rank_ggn,
+    low_rank_lifting_ggn,
     plan_low_rank_ggn,
     randomized_eigh,
 )
 from .gp import FNOGPLastLayer, ParametricGaussianProcess
-from .jacobian import LastFNOBlockWeightJacobian, var_of_congruence
+from .jacobian import (
+    LastFNOBlockWeightJacobian,
+    LiftingWeightJacobian,
+    var_of_congruence,
+)
 from .lino_ops import (
     CircularlySymmetricDiagonal,
     Diagonal,

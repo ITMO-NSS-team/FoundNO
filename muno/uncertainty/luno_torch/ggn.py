@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .jacobian import LastFNOBlockWeightJacobian
+from .jacobian import LastFNOBlockWeightJacobian, LiftingWeightJacobian
 from .lino_ops import LinearOperator
 from .progress import tqdm
 
@@ -34,7 +34,12 @@ class GGNMatvec(LinearOperator):
     G v = factor * sum_i J_i^T H J_i v, where for ``loss_fn == "mse"`` the pointwise
     Hessian is H = 2 I (laplax convention). ``model_fn(x, w)`` should be the wrapped
     last-block-parameter forward; ``xs`` is a list of per-sample inputs.
+
+    Subclasses change only *which* parameters are linearized by overriding
+    :attr:`jacobian_cls` (e.g. :class:`LiftingGGNMatvec` for the lifting head).
     """
+
+    jacobian_cls = LastFNOBlockWeightJacobian
 
     def __init__(
         self,
@@ -58,7 +63,7 @@ class GGNMatvec(LinearOperator):
         else:
             self._factor = torch.tensor(factor, dtype=w0.dtype, device=w0.device)
         self._jacobians = [
-            LastFNOBlockWeightJacobian(
+            self.jacobian_cls(
                 model_fn,
                 x,
                 w0,
@@ -134,6 +139,17 @@ class GGNMatvec(LinearOperator):
         for c0 in range(0, k, step):
             self._accum(v[..., c0:c0 + step], out[..., c0:c0 + step])
         return out
+
+
+class LiftingGGNMatvec(GGNMatvec):
+    """GGN matvec over the lifting-adapter weights.
+
+    Identical to :class:`GGNMatvec`, but ``J`` is taken with respect to all
+    parameters of the lifting module while the core and projection are frozen
+    (see :class:`luno_torch.adapter.TorchLiftingWrapper`).
+    """
+
+    jacobian_cls = LiftingWeightJacobian
 
 
 def _orthonormalize(Y: torch.Tensor) -> torch.Tensor:
@@ -451,6 +467,57 @@ def low_rank_curvature(
     if method == "skerch":
         return skerch_low_rank(mv, rank=rank)
     raise ValueError(f"unknown method: {method}")
+
+
+def low_rank_lifting_ggn(
+    model_fn: callable,
+    w0: torch.Tensor,
+    xs: list[torch.Tensor],
+    rank: int = 50,
+    oversample: int = 10,
+    fwd_batch: int = 4,
+    vjp_chunk: int = 64,
+    loss_fn: str = "mse",
+    factor: float | torch.Tensor = 1.0,
+    method: str = "randomized",
+    power_iter: int = 2,
+    seed: int = 0,
+    mem_fraction: float = 1.0,
+    plan: bool = True,
+    strict: bool = False,
+) -> LowRankTerms:
+    """One-shot low-rank GGN of the lifting adapter over the samples ``xs``.
+
+    ``model_fn`` / ``w0`` come from
+    :class:`luno_torch.adapter.TorchLiftingWrapper`: the lifting weights are
+    linearized and the core/projection are frozen. ``Jv`` is computed in
+    forward mode (``torch.func.jvp``), exactly like ``GGNMatvec`` for the last
+    FNO block. All the rank/sketch/memory options behave as in
+    :func:`low_rank_ggn`.
+    """
+    mv = LiftingGGNMatvec(
+        model_fn,
+        w0,
+        xs,
+        mode="forward",
+        fwd_batch=fwd_batch,
+        loss_fn=loss_fn,
+        factor=factor,
+        vjp_chunk=vjp_chunk,
+    )
+    return low_rank_ggn(
+        mv,
+        rank=rank,
+        oversample=oversample,
+        method=method,
+        fwd_batch=fwd_batch,
+        vjp_chunk=vjp_chunk,
+        power_iter=power_iter,
+        seed=seed,
+        mem_fraction=mem_fraction,
+        plan=plan,
+        strict=strict,
+    )
 
 
 def to_dense(mv: LinearOperator) -> torch.Tensor:

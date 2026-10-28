@@ -15,12 +15,12 @@ tasks:
     task_type: in_distr
     luno:
       jv_mode: forward
-      fwd_batch: 1
+      fwd_batch: 2
       vjp_chunk: 16
-      max_rank: 0
+      max_rank: 500
       ggn_method: randomized
       ggn_oversample: 0
-      max_num_samples: 2
+      max_num_samples: 25
       val_calib_frac: 0.8
       diag_hutchinson: 50
       calib_max_samples: 0
@@ -29,7 +29,7 @@ tasks:
       calib_grid_size: 50
       calib_objective: nll
     source:
-      location: url
+      location: local
       format: hdf5
       sample_dim: 0
       variables:
@@ -98,7 +98,7 @@ tasks:
       calib_grid_size: 50
       calib_objective: nll
     source:
-      location: url
+      location: local
       format: hdf5
       sample_dim: 0
       variables:
@@ -167,7 +167,7 @@ tasks:
       calib_grid_size: 50
       calib_objective: nll
     source:
-      location: url
+      location: local
       format: hdf5
       sample_dim: 0
       variables:
@@ -240,7 +240,7 @@ tasks:
       calib_grid_size: 50
       calib_objective: nll
     source:
-      location: url
+      location: local
       format: hdf5
       sample_dim: 0
       variables:
@@ -249,7 +249,7 @@ tasks:
         Vx: Vx
         Vy: Vy
       url: https://darus.uni-stuttgart.de/api/access/datafile/164687
-      path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
+      path: /home/user/Documents/FNO/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
       axis_selection:
         0:
           linspace: [0, 60, 16]

@@ -122,7 +122,8 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         self._ensure_flat()
         if self._vjp_fn is not None:
             return self
-        self._fx = self._flat_fn(self._w0)
+        with torch.no_grad():
+            self._fx = self._flat_fn(self._w0).detach()
         self._vjp_fn = torch.func.vjp(self._flat_fn, self._w0)[1]
         self._vjp_rows = torch.vmap(
             lambda c: self._vjp_fn(c, create_graph=False)[0], in_dims=0
@@ -150,7 +151,14 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         self._vjp_rows = None
         self._vjp_cols = None
         self._bound = None
-        torch.cuda.empty_cache()
+        try:
+            import gc
+
+            gc.collect()
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return self
 
     def _rebuild_vjp(self):
@@ -164,7 +172,8 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         if self._bound is not None:
             return self._bound.fx
         self._ensure_flat()
-        return self._flat_fn(self._w0).detach()
+        with torch.no_grad():
+            return self._flat_fn(self._w0).detach()
 
     def shape(self) -> tuple[int, int]:
         d = self._w0.numel()
@@ -199,45 +208,27 @@ class LastFNOBlockWeightJacobian(LinearOperator):
             bar.close()
 
     def _matmul_forward(self, weights: torch.Tensor) -> torch.Tensor:
-        """J v или J @ W через forward-mode (``torch.func.jvp``), без строк J.
-
-        Одна касательная = один прямой проход сети. Для W формы (d, k) колонки
-        считаются батчем по ``fwd_batch`` через ``torch.vmap``: каждая колонка
-        получает свою касательную, vmap проходит по ней как по батч-измерению.
-
-        Результат пишется в заранее выделенный буфер ``out`` размера (m, k), а не
-        собирается списком чанков с последующим ``torch.cat``: конкатенация
-        держит ОДНОВРЕМЕННО и список чанков (m, k), и результат (m, k), то есть
-        удваивает пик. При d = 27.6M и k = rank это лишние ~5 ГиБ на rank = 50,
-        которых не хватает вместе со скетчем.
-
-        Возвращаемое значение всегда ``requires_grad=False``. При включённом grad
-        mode тангенс ``torch.func.jvp`` наследует град от параметров сети, а
-        присваивание его в ``out`` делает ``out`` grad-трекаемым с ``grad_fn =
-        CopySlices``. Такой тензор удерживает ПОЛНЫЙ прямой граф сети (~0.41 ГиБ
-        при d = 27.6M), и каждый ``J @ W`` привязывает к результату свой граф:
-        запись в накопитель проб (см. ``sample_congruence_probes``) копила их по
-        0.41 ГиБ на чанк и уходила в OOM уже на 35-м из 50. ``.detach()``
-        отбрасывает граф без копирования -- значения побитово те же.
-        """
+        """J v или J @ W через forward-mode (``torch.func.jvp``), без строк J."""
         flat_fn = self._flat_fn
         w0 = self._w0
         if weights.dim() == 1:
-            return torch.func.jvp(flat_fn, (w0,), (weights,))[1].detach()
+            with torch.no_grad():
+                return torch.func.jvp(flat_fn, (w0,), (weights,))[1].detach()
         k = weights.shape[-1]
-        m = self.fx.numel()
         if k == 0:
+            m = self._fx_numel()
             return torch.zeros(m, 0, dtype=w0.dtype, device=w0.device)
+        m = self._fx_numel()
         out = torch.empty(m, k, dtype=w0.dtype, device=w0.device)
         step = max(1, self._fwd_batch)
         for c0 in range(0, k, step):
             c1 = min(c0 + step, k)
-            # (d, b) -> (b, d): каждая строка — отдельное направление для vmap.
             tangents = weights[:, c0:c1].transpose(0, 1).contiguous()
-            outs = torch.vmap(
-                lambda t: torch.func.jvp(flat_fn, (w0,), (t,))[1],
-                in_dims=0, out_dims=0,
-            )(tangents)  # (b, m)
+            with torch.no_grad():
+                outs = torch.vmap(
+                    lambda t: torch.func.jvp(flat_fn, (w0,), (t,))[1],
+                    in_dims=0, out_dims=0,
+                )(tangents)
             out[:, c0:c1] = outs.transpose(0, 1).detach()
             del tangents, outs
         return out
@@ -340,7 +331,59 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         if self._bound is not None:
             return self._bound.fx.numel()
         self._ensure_flat()
-        return self._flat_fn(self._w0).detach().numel()
+        with torch.no_grad():
+            return self._flat_fn(self._w0).detach().numel()
+
+
+class LiftingWeightJacobian(LastFNOBlockWeightJacobian):
+    """Linearized map ``w -> f(x; w)`` for the lifting-adapter weights.
+
+    Same machinery as :class:`LastFNOBlockWeightJacobian`, but ``w`` are the
+    parameters of the lifting module and the rest of the network (core +
+    projection) is frozen. ``Jv`` / ``J @ W`` are computed in forward mode via
+    ``torch.func.jvp``; ``J^T u`` and ``diag(J J^T)`` stay on reverse-mode.
+
+    ``mode="affine"`` is intentionally not supported: it decomposes the *last
+    FNO block* and has no meaning for the lifting head.
+    """
+
+    def __init__(
+        self,
+        model_fn: callable,
+        x: torch.Tensor,
+        w0: torch.Tensor,
+        affine=None,
+        mode: str = "forward",
+        fwd_batch: int = 4,
+        num_output_channels: int | None = None,
+        vjp_chunk: int = 64,
+        vjp_refresh_every: int = 50,
+        diag_probes: int = 0,
+    ):
+        # Принимаем ``affine``/``mode`` ради совместимости с GGNMatvec, но
+        # аффинная декомпозиция определена только для последнего FNO-блока.
+        if affine is not None:
+            raise ValueError(
+                "LiftingWeightJacobian не поддерживает affine: аффинная "
+                "декомпозиция относится к последнему FNO-блоку, а не к лифтингу."
+            )
+        if mode != "forward":
+            raise ValueError(
+                f"LiftingWeightJacobian поддерживает только mode='forward', "
+                f"получено mode={mode!r}."
+            )
+        super().__init__(
+            model_fn,
+            x,
+            w0,
+            affine=None,
+            mode="forward",
+            fwd_batch=fwd_batch,
+            num_output_channels=num_output_channels,
+            vjp_chunk=vjp_chunk,
+            vjp_refresh_every=vjp_refresh_every,
+            diag_probes=diag_probes,
+        )
 
 
 class LastFNOBlockTransposeWeightJacobian(LinearOperator):
@@ -546,6 +589,7 @@ def check_jacobian(
     fwd_batch: int = 4,
     num_probes: int = 3,
     tol: float | None = None,
+    jacobian_cls=LastFNOBlockWeightJacobian,
 ) -> tuple[bool, float]:
     """Проверяет J*v выбранного режима против reverse-строк, возвращает ``(ok, rel)``.
 
@@ -572,7 +616,7 @@ def check_jacobian(
     """
     if tol is None:
         tol = default_check_tol(w0.dtype)
-    jac = LastFNOBlockWeightJacobian(
+    jac = jacobian_cls(
         model_fn, x, w0, affine=affine, mode=mode, fwd_batch=fwd_batch,
     )
     jac._ensure_vjp()

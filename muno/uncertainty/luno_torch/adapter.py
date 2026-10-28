@@ -195,6 +195,151 @@ class TorchFNOWrapper:
         return torch.func.functional_call(self.model, sd, (x,))
 
 
+class TorchLiftingWrapper:
+    """Split a Muno model into (lifting weights) / (fixed core+projection).
+
+    The linearized parameters are *all* parameters of the lifting module (for a
+    neuralop ``ChannelMLP`` that is every ``fcs.<i>.weight`` / ``fcs.<i>.bias``),
+    flattened into ``w0`` in ``named_parameters()`` order. The core and the
+    projection stay fixed.
+
+    This is the lifting counterpart of :class:`TorchFNOWrapper`: the returned
+    ``model_fn(x, w)`` applies the lifting with weights ``w`` and then the
+    frozen core/projection, so ``torch.func.jvp`` over ``w`` gives ``J v`` for
+    the full end-to-end model.
+
+    Parameters
+    ----------
+    lifting:
+        The lifting adapter module (e.g. ``neuralop.layers.channel_mlp.ChannelMLP``).
+    core:
+        Frozen core model (FNO-like), applied after the lifting.
+    projection:
+        Frozen projection adapter, applied after the core. ``None`` -- identity.
+    dtype:
+        dtype used for the GP computations. The modules themselves are expected
+        to be on the right device/dtype already (as in the existing pipeline,
+        call ``.to(device=device).to(dtype=...)`` before constructing this).
+    num_output_channels:
+        Optional override for the number of output channels (kept for parity
+        with :class:`TorchFNOWrapper`; not needed by the forward-mode Jacobian).
+    """
+
+    def __init__(
+        self,
+        lifting: torch.nn.Module,
+        core: torch.nn.Module,
+        projection: torch.nn.Module | None = None,
+        dtype: torch.dtype = torch.float64,
+        num_output_channels: int | None = None,
+    ):
+        self.lifting = lifting
+        self.core = core
+        self.projection = projection
+        self.dtype = dtype
+        self._core_requires_grad = None
+        self._proj_requires_grad = None
+        try:
+            self._core_requires_grad = [p.requires_grad for p in self.core.parameters()]
+            for p in self.core.parameters():
+                p.requires_grad_(False)
+        except Exception:
+            self._core_requires_grad = None
+        if self.projection is not None:
+            try:
+                self._proj_requires_grad = [p.requires_grad for p in self.projection.parameters()]
+                for p in self.projection.parameters():
+                    p.requires_grad_(False)
+            except Exception:
+                self._proj_requires_grad = None
+        try:
+            self.core.eval()
+        except Exception:
+            pass
+        if self.projection is not None:
+            try:
+                self.projection.eval()
+            except Exception:
+                pass
+
+        params = list(lifting.named_parameters())
+        if not params:
+            raise ValueError(
+                "TorchLiftingWrapper: у лифтинга нет параметров "
+                f"({type(lifting).__module__}.{type(lifting).__qualname__})."
+            )
+        for name, p in params:
+            if p.is_complex():
+                raise NotImplementedError(
+                    f"TorchLiftingWrapper: комплексный параметр '{name}' не "
+                    "поддерживается -- GGN лифтинга считается по вещественному w0."
+                )
+        self._param_names = [name for name, _ in params]
+        self._param_shapes = [tuple(p.shape) for _, p in params]
+        self._param_numels = [p.numel() for _, p in params]
+        offsets = []
+        offset = 0
+        for n in self._param_numels:
+            offsets.append(offset)
+            offset += n
+        self._param_offsets = offsets
+        self._total_numel = offset
+
+        self.device = params[0][1].device
+        self.num_output_channels = (
+            num_output_channels
+            if num_output_channels is not None
+            else getattr(core, "out_channels", None)
+            or getattr(projection, "out_channels", None)
+        )
+
+    def param_layout(self) -> list[tuple[str, tuple[int, ...], int, int]]:
+        """``[(name, shape, numel, offset), ...]`` -- раскладка плоского ``w0``."""
+        return [
+            (name, shape, numel, offset)
+            for name, shape, numel, offset in zip(
+                self._param_names,
+                self._param_shapes,
+                self._param_numels,
+                self._param_offsets,
+            )
+        ]
+
+    @property
+    def w0(self) -> torch.Tensor:
+        """Flat vector of all lifting parameters in ``named_parameters()`` order."""
+        return torch.cat(
+            [
+                p.detach().reshape(-1).to(dtype=self.dtype, device=self.device)
+                for _, p in self.lifting.named_parameters()
+            ]
+        )
+
+    def reconstruct(self, w: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Build a partial state_dict (lifting parameters only) from ``w``."""
+        w = w.to(dtype=self.dtype, device=self.device)
+        if w.numel() != self._total_numel:
+            raise ValueError(
+                f"TorchLiftingWrapper.reconstruct: w.numel()={w.numel()} != "
+                f"{self._total_numel} (d лифтинга)."
+            )
+        sd: dict[str, torch.Tensor] = {}
+        for name, shape, numel, offset in self.param_layout():
+            sd[name] = w[offset : offset + numel].reshape(shape)
+        return sd
+
+    def model_fn(self, x: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+        """lifting(params) -> fixed core -> fixed projection."""
+        x = x.to(dtype=self.dtype, device=self.device)
+        z = torch.func.functional_call(
+            self.lifting, self.reconstruct(params), (x,)
+        )
+        z = self.core(z)
+        if self.projection is not None:
+            z = self.projection(z)
+        return z
+
+
 def split_wrapper(
     wrapper: TorchFNOWrapper,
 ) -> tuple[callable, torch.Tensor]:
