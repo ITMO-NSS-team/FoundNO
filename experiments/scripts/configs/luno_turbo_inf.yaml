@@ -20,9 +20,10 @@ tasks:
       max_rank: 500
       ggn_method: randomized
       ggn_oversample: 0
-      max_num_samples: 25
+      ggn_sample_batch: 4
+      max_num_samples: 1000
       val_calib_frac: 0.8
-      diag_hutchinson: 50
+      diag_hutchinson: 16
       calib_max_samples: 0
       calib_grid_min: -3.0
       calib_grid_max: 3.0

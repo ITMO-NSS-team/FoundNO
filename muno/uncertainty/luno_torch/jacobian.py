@@ -93,6 +93,7 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         # Аффинное состояние (z, s0, a0) кэшируется отдельно и тоже освобождается.
         self._flat_fn = None
         self._fx = None
+        self._m = None
         self._vjp_fn = None
         self._vjp_rows = None
         self._vjp_cols = None
@@ -147,6 +148,8 @@ class LastFNOBlockWeightJacobian(LinearOperator):
     def _release_vjp(self):
         """Освобождает удержанный forward-граф и аффинное состояние; следующий вызов пересчитает."""
         self._fx = None
+        self._m = None
+        self._diag_JJT_cache = None
         self._vjp_fn = None
         self._vjp_rows = None
         self._vjp_cols = None
@@ -170,14 +173,26 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         # fx — это f(x, w0), достаточно одного прямого прохода; обратный граф для
         # этого не нужен, поэтому берём его без удержания графа.
         if self._bound is not None:
-            return self._bound.fx
+            fx = self._bound.fx
+            if self._m is None:
+                self._m = fx.numel()
+            if self._fx is None:
+                self._fx = fx.detach()
+            return fx
+        if self._fx is not None:
+            if self._m is None:
+                self._m = self._fx.numel()
+            return self._fx
         self._ensure_flat()
         with torch.no_grad():
-            return self._flat_fn(self._w0).detach()
+            fx = self._flat_fn(self._w0).detach()
+        self._fx = fx
+        self._m = fx.numel()
+        return self._fx
 
     def shape(self) -> tuple[int, int]:
         d = self._w0.numel()
-        m = self.fx.numel()
+        m = self._fx_numel()
         return m, d
 
     def _chunked_rows(self):
@@ -328,11 +343,19 @@ class LastFNOBlockWeightJacobian(LinearOperator):
 
     def _fx_numel(self) -> int:
         """Размер выхода f(x, w0) без построения и удержания обратного графа."""
+        if self._m is not None:
+            return self._m
         if self._bound is not None:
-            return self._bound.fx.numel()
+            m = self._bound.fx.numel()
+            self._m = m
+            return m
         self._ensure_flat()
         with torch.no_grad():
-            return self._flat_fn(self._w0).detach().numel()
+            fx = self._flat_fn(self._w0).detach()
+        self._m = fx.numel()
+        if self._fx is None:
+            self._fx = fx
+        return self._m
 
 
 class LiftingWeightJacobian(LastFNOBlockWeightJacobian):
