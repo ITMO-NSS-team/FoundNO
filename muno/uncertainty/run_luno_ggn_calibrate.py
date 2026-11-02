@@ -240,6 +240,8 @@ def parse_args():
                         "--sketch-blocksize у skerch на ro_sketch не влияет.")
     p.add_argument("--max-num-samples", type=int, default=25,
                    help="Макс. число сэмплов для GGN (как max_num_of_samples в luno).")
+    p.add_argument("--ggn-sample-batch", type=int, default=4,
+                   help="Сколько сэмплов держать на GPU одновременно при расчёте GGN.")
     p.add_argument("--val-calib-frac", type=float, default=0.8,
                    help="Доля val, отдаваемая калибровке prior_prec. Остаток "
                         "(1 - доля) идёт на валидацию с картинками и метриками "
@@ -284,6 +286,7 @@ PER_TASK_LUNO_KEYS = {
     "ggn_method": str,
     "ggn_oversample": int,
     "max_num_samples": int,
+    "ggn_sample_batch": int,
     "val_calib_frac": float,
     "diag_hutchinson": int,
     "calib_max_samples": int,
@@ -863,13 +866,19 @@ def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor, affin
         leave=False,
     ):
         sample = preprocess_sample(data_processor, sample)
-        xs.append(sample[0]["x"])
+        xs.append(sample[0]["x"].detach().cpu())
     print(f"[GGN] собрано {len(xs)} сэмплов из train loader.")
     assert xs, "No samples collected for GGN."
 
+    sample_batch_size = getattr(args, "ggn_sample_batch", 1)
+    try:
+        sample_batch_size = int(sample_batch_size)
+    except Exception:
+        sample_batch_size = 1
     ggn_mv = matvec_cls(
         model_fn, w0, xs, affine=affine, mode=mode, fwd_batch=fwd_batch,
         loss_fn="mse", factor=1.0, vjp_chunk=args.vjp_chunk,
+        sample_batch_size=sample_batch_size,
     )
     _print_mem("ggn_mv", w0.device)
 
@@ -1801,6 +1810,7 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
         "max_rank": args.max_rank,
         "ggn_method": args.ggn_method,
         "ggn_oversample": args.ggn_oversample,
+        "ggn_sample_batch": getattr(args, "ggn_sample_batch", 1),
         "max_num_samples_ggn": args.max_num_samples,
         # Откуда взят low-rank: "checkpoint" -- загружен из --ggn-checkpoint
         # (артефакт не переписывался), "computed" -- посчитан на train loader.

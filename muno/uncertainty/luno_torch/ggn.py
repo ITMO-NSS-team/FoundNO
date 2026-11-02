@@ -53,28 +53,31 @@ class GGNMatvec(LinearOperator):
         factor: float | torch.Tensor = 1.0,
         num_output_channels: int | None = None,
         vjp_chunk: int = 64,
+        sample_batch_size: int = 1,
     ):
         self._model_fn = model_fn
         self._w0 = w0
-        self._xs = [x.detach().to(dtype=w0.dtype, device=w0.device) for x in xs]
+        self._affine = affine
+        self._mode = mode
+        self._fwd_batch = int(fwd_batch)
+        self._num_output_channels = num_output_channels
+        self._vjp_chunk = vjp_chunk
+        self._sample_batch_size = max(1, int(sample_batch_size))
         self._loss_fn = loss_fn
         if isinstance(factor, torch.Tensor):
             self._factor = factor.to(dtype=w0.dtype, device=w0.device)
         else:
             self._factor = torch.tensor(factor, dtype=w0.dtype, device=w0.device)
-        self._jacobians = [
-            self.jacobian_cls(
-                model_fn,
-                x,
-                w0,
-                affine=affine,
-                mode=mode,
-                fwd_batch=fwd_batch,
-                num_output_channels=num_output_channels,
-                vjp_chunk=vjp_chunk,
-            )
-            for x in self._xs
-        ]
+        # Храним сэмплы на CPU, чтобы не занимать всю GPU память под все входы
+        self._xs_cpu = []
+        for x in xs:
+            if torch.is_tensor(x):
+                self._xs_cpu.append(x.detach().to(device="cpu", dtype=w0.dtype))
+            else:
+                self._xs_cpu.append(x)
+        self._xs = self._xs_cpu
+        # Для обратной совместимости, если где-то используется
+        self._jacobians = []
 
     def shape(self) -> tuple[int, int]:
         d = self._w0.numel()
@@ -89,35 +92,43 @@ class GGNMatvec(LinearOperator):
         return self._w0.device
 
     def _accum(self, vv: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-        """Суммирует по сэмплам ``sum_s J_s^T (2 J_s v)`` для блока направлений ``vv``.
-
-        Пишет результат в переданный ``out`` (взгляд в буфер вызывающего кода).
-        Так одновременно живут только ``vv``, один ``Jv``, один результат VJP и
-        ``out`` -- без ``torch.zeros_like`` на весь блок и без ``2.0 * Jv``.
-        При d = 27.6M каждый лишний полноразмерный буфер стоит ~0.1 ГиБ на
-        столбец, что при rank = 50 и есть разница между OOM и запуском.
-        """
+        """Суммирует по сэмплам ``sum_s J_s^T (2 J_s v)`` для блока направлений ``vv``."""
         out.zero_()
         bar = tqdm(
-            total=len(self._jacobians), desc="[GGN] сэмплы", unit="smp",
+            total=len(self._xs_cpu), desc="[GGN] сэмплы", unit="smp",
             leave=False, position=0,
         )
-        for jac in self._jacobians:
-            # Порядок важен для пика памяти: сначала Jv выбранным прямым режимом
-            # (обратный граф для этого не нужен), затем -- граф только ради J^T.
-            # После сэмпла всё освобождается: в памяти живёт не более одного
-            # удержанного forward-графа за матвек (иначе max_num_samples графов ~ OOM).
-            Jv = jac._matmul(vv)
-            jac._ensure_vjp()
-            gv = jac._vjp_cols(Jv)
-            del Jv
-            out.add_(gv)
-            del gv
-            jac._release_vjp()
-            bar.update(1)
+        device = self._w0.device
+        step_dir = max(1, int(self._fwd_batch))
+        for batch_start in range(0, len(self._xs_cpu), self._sample_batch_size):
+            batch_end = min(batch_start + self._sample_batch_size, len(self._xs_cpu))
+            x_batch_cpu = self._xs_cpu[batch_start:batch_end]
+            x_batch_gpu = []
+            for x_c in x_batch_cpu:
+                x_g = x_c.to(device=device)
+                x_batch_gpu.append(x_g)
+            for x_g in x_batch_gpu:
+                jac = self.jacobian_cls(
+                    self._model_fn,
+                    x_g,
+                    self._w0,
+                    affine=self._affine,
+                    mode=self._mode,
+                    fwd_batch=self._fwd_batch,
+                    num_output_channels=self._num_output_channels,
+                    vjp_chunk=self._vjp_chunk,
+                )
+                Jv = jac._matmul(vv)
+                jac._ensure_vjp()
+                gv = jac._vjp_cols(Jv)
+                del Jv
+                out.add_(gv)
+                del gv
+                jac._release_vjp()
+                del jac, x_g
+                bar.update(1)
+            del x_batch_gpu
         bar.close()
-        # Множитель MSE 2 и внешний factor применяются один раз к результату,
-        # чтобы не материализовать отдельный тензор 2.0 * Jv на (d, fwd_batch).
         out *= 2.0 * self._factor
         return out
 
@@ -128,14 +139,9 @@ class GGNMatvec(LinearOperator):
             out = torch.empty(d, 1, dtype=self._w0.dtype, device=self._w0.device)
             self._accum(v.unsqueeze(-1), out)
             return out.squeeze(-1)
-        # Скетч low-rank GGN -- это блок (d, q) направлений, и при d = 27.6M
-        # каждый буфер (d, k) стоит ~0.1 ГиБ на столбец. Результат выделяется
-        # один раз целиком, а чанки пишутся в его столбцы: список чанков с
-        # последующим ``torch.cat`` держал бы одновременно и чанки (d, q), и
-        # результат (d, q), то есть удваивал пик на ~5 ГиБ при rank = 50.
         k = v.shape[-1]
         out = torch.empty(d, k, dtype=self._w0.dtype, device=self._w0.device)
-        step = max(1, int(self._jacobians[0]._fwd_batch))
+        step = max(1, int(self._fwd_batch))
         for c0 in range(0, k, step):
             self._accum(v[..., c0:c0 + step], out[..., c0:c0 + step])
         return out
@@ -448,6 +454,7 @@ def low_rank_curvature(
     factor: float | torch.Tensor = 1.0,
     method: str = "randomized",
     seed: int = 0,
+    sample_batch_size: int = 1,
 ) -> LowRankTerms:
     """One-shot low-rank GGN of the last FNO block over the data samples ``xs``."""
     mv = GGNMatvec(
@@ -459,6 +466,7 @@ def low_rank_curvature(
         fwd_batch=fwd_batch,
         loss_fn=loss_fn,
         factor=factor,
+        sample_batch_size=sample_batch_size,
     )
     if method == "randomized":
         n, _ = mv.shape()
@@ -485,6 +493,7 @@ def low_rank_lifting_ggn(
     mem_fraction: float = 1.0,
     plan: bool = True,
     strict: bool = False,
+    sample_batch_size: int = 1,
 ) -> LowRankTerms:
     """One-shot low-rank GGN of the lifting adapter over the samples ``xs``.
 
@@ -504,6 +513,7 @@ def low_rank_lifting_ggn(
         loss_fn=loss_fn,
         factor=factor,
         vjp_chunk=vjp_chunk,
+        sample_batch_size=sample_batch_size,
     )
     return low_rank_ggn(
         mv,
