@@ -88,7 +88,7 @@ class ParameterLoading(metaclass=ParamContainerMeta):
 
 class GenericLoss(object):
     def __init__(self, loss = torch.nn.MSELoss):
-        self._eval = loss()
+        self._eval = loss
 
     def __call__(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None, *args, **kwargs):
         try:

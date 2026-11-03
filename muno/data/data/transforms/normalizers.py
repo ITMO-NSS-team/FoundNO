@@ -232,7 +232,8 @@ class UnitGaussianNormalizer(Transform):
     def cuda(self):
         self.mean = self.mean.cuda()
         self.std = self.std.cuda()
-        self.mask = self.mask.cuda()
+        if self.mask is not None:
+            self.mask = self.mask.cuda()
         return self
 
     def cpu(self):
@@ -288,6 +289,10 @@ class UnitGaussianNormalizer(Transform):
         assert ('mean' in loaded_dict.keys()) and ('std' in loaded_dict.keys()), 'Missing mean and std from loaded norm. dict'
         self.mean = loaded_dict['mean']
         self.std  = loaded_dict['std']
+        if ('mask' in loaded_dict.keys()):
+            self.mask  = loaded_dict['mask']
+        else:
+            self.mask  = None
 
 class DictUnitGaussianNormalizer(DictTransform):
     """DictUnitGaussianNormalizer composes

@@ -6,32 +6,28 @@ import csv
 import time
 from functools import reduce
 
-from pathlib import Path
+from pathlib import Path, PosixPath
 
 import math
 
 from functools import singledispatchmethod
-from typing import Tuple, List, Union
+from typing import Tuple, List, Union, Dict
 
 import numpy as np
 import torch
-
-import torch.distributed as dist
-from torch.distributed.optim import DistributedOptimizer
-from torch.distributed.rpc import RRef
 
 import dill
 
 from neuralop.data.transforms.data_processors import DataProcessor
 
-from .data_utils import Dataset, Heatmap
+from muno.utils.data_utils import Dataset, Heatmap
 from torch.utils.data import DataLoader
 from muno.models.muno import Muno
 from muno.data.benchmarks.datasets import MultiPhysicsDataset
 
-from .logger import Logger
-from .optimizer_utils import set_optimizer, set_scheduler
-from .training_utils import LpLoss
+from muno.utils.logger import Logger
+from muno.utils.optimizer_utils import set_optimizer, set_scheduler
+from muno.utils.training_utils import LpLoss
 
 
 class Trainer(object):
@@ -66,9 +62,23 @@ class Trainer(object):
 
         self.gradient_accumulation_steps = 1
 
+        self._sample_vis_path = None
+
         if device is not None:
             self.to(device)
 
+    def setSampleVisPath(self, path: str, heatmap_save_kwargs: dict = None):
+        print(f'Set saving path for visualization: {path}.')
+        if heatmap_save_kwargs is None:
+            heatmap_save_kwargs = {}
+
+        self._visualize_kwargs = heatmap_save_kwargs
+        if not isinstance(path, PosixPath):
+            self._sample_vis_path = Path(path)
+        else:
+            self._sample_vis_path = path
+
+        self._sample_vis_path.mkdir(parents=True, exist_ok=True)
 
     @singledispatchmethod
     def buildModel(self, model):
@@ -155,18 +165,7 @@ class Trainer(object):
 
     def to(self, device: str = 'cuda'):
         self.device = device
-
-        # if self._single_model:
         self.model.to(device)
-
-        # else:
-        #     if self.main_fno is None or self.input_adapters is None or self.output_adapters is None:
-        #         raise AttributeError('Hidden Fourier NO layers and projection or liftings are not yet declared.')
-
-        #     self.main_fno.to(device)
-        #     for idx, _ in enumerate(self.input_adapters):
-        #         self.input_adapters[idx].to(device)
-        #         self.output_adapters[idx].to(device)
 
     def setLogger(self, filename, logger: Logger = None, log_level=logging.INFO, logger_name: str = "FoundationalFNO"):
         if logger is None:
@@ -262,20 +261,6 @@ class Trainer(object):
             self.model = torch.load(f=model_path, pickle_module=dill, **_SAVE_LOAD_PARAMS)
         else:
             self.model = Muno.load(f=model_path, **_SAVE_LOAD_PARAMS)
-            # if use_data_parallel:
-            #     self.model = self.model.toDataParallel(devices=devices)
-
-        # model = basicLoadModel(model_path, self._SAVE_LOAD_PARAMS)
-        # if isinstance(model, tuple):
-        #     self._single_model = False
-
-        #     self.input_adapters = model[0]
-        #     self.main_fno = model[1]
-        #     self.output_adapters = model[2]
-        # else:
-        #     self.model = model
-        #     self.params_to_optimize = [{'params': self.model.parameters()}, ]
-        #     self._single_model = True
 
     def loadData(self, file):
         pass
@@ -287,19 +272,9 @@ class Trainer(object):
         train_loader: muno.data.benchmarks.datasets.MultiPhysicsDataset, 
         val_loader: muno.data.benchmarks.datasets.MultiPhysicsDataset,
         '''
-        # if isinstance(train_loader, DataLoader):
-        #     train_loader = [train_loader, ]
-        # if isinstance(val_loader, DataLoader):
-        #     val_loader = [val_loader, ]
-
         # track number of training examples in batch
         self.n_samples = len(train_loader)
         self.n_samples_val = len(val_loader)
-
-        # if isinstance(data_processor, DataProcessor):
-        #     data_processor = [data_processor, ]
-        # elif data_processor is None:
-        #     data_processor = [None, ]
 
         self._training_start_time = time.perf_counter()
 
@@ -308,24 +283,11 @@ class Trainer(object):
 
         best_train_loss = np.inf
 
-        # if self._single_model:
         n_params = sum(p.numel() for p in self.model.parameters())
         init_log = 'Initializing training of model of type' + \
                     ' {} | epochs: {} | n params: {}'.format(type(self.model),
                                                             train_epochs,
                                                             n_params)
-
-        # else:
-        #     n_params = sum(p.numel() for p in self.input_adapters[0].parameters()) + \
-        #                sum(p.numel() for p in self.main_fno.parameters()) + \
-        #                sum(p.numel() for p in self.output_adapters[0].parameters())
-
-        #     init_log = 'Initializing training of model of type' + \
-        #                ' {}, {}, {} | epochs: {} | n params: {}'.format(type(self.input_adapters[0]),
-        #                                                                 type(self.main_fno),
-        #                                                                 type(self.output_adapters[0]),
-        #                                                                 train_epochs,
-        #                                                                 n_params)
 
         self._logger.write(init_log)
 
@@ -338,8 +300,6 @@ class Trainer(object):
                 data_processor,
             )
 
-            # print(f"Epoch {epoch} on globrank {self.global_rank} localrank {self.local_rank}: train_loss={train_loss}, val_loss={val_loss}")
-
             if train_loss < best_train_loss:
                 best_train_loss = train_loss
 
@@ -347,11 +307,6 @@ class Trainer(object):
                 self.logTraining(train_loss=train_loss, val_loss=val_loss, lr=0)
 
         return self.model
-    
-        # if self._single_model:
-        #     return self.model
-        # else:
-        #     return self.input_adapters, self.main_fno, self.output_adapters
 
     def trainSingleEpoch(self, epoch, train_loader: List[DataLoader], val_loader: List[DataLoader],
                          training_loss, data_processor: None, # List[DataProcessor] = [None, ],  # training: bool = True,
@@ -377,8 +332,7 @@ class Trainer(object):
 
         self.model.train()
 
-        if data_processor is not None: # [0]
-            # for idx in range(len(data_processor)):
+        if data_processor is not None:
             data_processor.train()
 
         train_loss = 0.0
@@ -388,7 +342,7 @@ class Trainer(object):
 
         for idx, sample in enumerate(train_loader):
             loss = self.trainOneBatch(
-                epoch,
+                epoch, idx,
                 sample,
                 training_loss,
                 data_processor,
@@ -437,7 +391,7 @@ class Trainer(object):
             n_fine_samples = self.n_samples_val
 
             for idx, sample in enumerate(val_loader):
-                loss = self.trainOneBatch(epoch, sample, training_loss,
+                loss = self.trainOneBatch(epoch, idx, sample, training_loss,
                                           data_processor, training=False)
                 if torch.isnan(loss).item():
                     n_fine_samples -= 1
@@ -502,11 +456,44 @@ class Trainer(object):
                 "Save paths have to be strings in case of a single model."
         self._save_paths = paths
 
+
+    def visualizeDatasetTrajectories(self, prefix: str, predictions: Dict[int, torch.Tensor], 
+                                     references: Dict[int, Dict[str, torch.Tensor]] = None,
+                                     batch_indexes: Dict[int, int] = None) -> None:
+        """
+        Visualize the passed trajectories.
+        """
+        assert batch_indexes.keys() == predictions.keys(), \
+            "Batch indexes have to be passed as dictionary with keys, same as predictions keys."
+        if self.local_rank != 0 or not self._sample_vis_path:
+            # print(f'Not visualizing: rank - {self.local_rank} and path - {self._sample_vis_path}')
+            return None
+
+        for key, prediction in predictions.items():
+            for chan_idx in range(prediction.shape[1]):
+                filename = os.path.join(self._sample_vis_path, f"Viz_{prefix}_phys_{key}_chan_{chan_idx}")
+                title = f"Prediction: {prefix} {key}, channel: {chan_idx}"
+
+                ref = references[key]["y"][batch_indexes[key], chan_idx, -1] if references is not None else None
+                if prediction.ndim == 5:    # B - C - T - X - Y
+                    Heatmap(prediction[batch_indexes[key], chan_idx, -1], ref, title = title,
+                            filename = filename, save_only = True, **self._visualize_kwargs)
+                elif prediction.ndim == 6: # B  - C  - T  - X  - Y  - Z
+                    x_mid = int(prediction.shape[3] // 2)
+                    Heatmap(prediction[batch_indexes[key], chan_idx, -1, x_mid], ref, title = title,
+                            filename = filename, save_only = True, **self._visualize_kwargs)
+                else:
+                    warnings.warn(f"Trying to visualize data of unexpected dimension: expected 5 or 6, matching")
+
+
     def onEpochEnd(self, *args, **kwargs):
         """
         Save model checkpoint when validation loss improves.
         Returns True if a checkpoint was saved on this epoch.
         """
+        if self.local_rank != 0:
+            return False
+
         checkpoint_saved = False
 
         if kwargs["val_loss"] < self._best_val_loss:
@@ -516,28 +503,12 @@ class Trainer(object):
             directory = Path(self._backup_loc)
             directory.mkdir(parents=True, exist_ok=True)
 
-            # if self._muno_model:
-            #     assert isinstance(self._save_paths, (tuple, list)), (
-            #         "Save paths have to be tuple/list in case of a multiple adapter model."
-            #     )
-            #     assert isinstance(self._save_paths[1], str), (
-            #         "Save path for a core has to be a string in case of a multiple adapter model."
-            #     )
-            #     assert all(
-            #         isinstance(self._save_paths[idx], (tuple, list))
-            #         for idx in [0, 2]
-            #     ), "Save paths for adapters have to be passed as list/tuple of strings."
-
-            #     self.saveModel(self._save_paths)
-            # else:
-            #     assert isinstance(self._save_paths, str), (
-            #         "Save paths have to be strings in case of a single model."
-            #     )
-            self.saveModel(self.save_paths)                
+            self.saveModel(self.save_paths)
 
         return checkpoint_saved
 
-    def trainOneBatch(self, idx, sample, training_loss, data_processor=None, training: bool = False):
+
+    def trainOneBatch(self, epoch_idx, batch_idx, sample, training_loss, data_processor=None, training: bool = False):
         """Run one batch of input through model
            and return training loss on outputs
 
@@ -573,14 +544,6 @@ class Trainer(object):
 
         if self.mixed_precision:
             raise NotImplementedError('No mixed precision functionality implemented!')
-            with torch.autocast(device_type=self.autocast_device_type):
-                if self._single_model:
-                    out = self.model(sample["x"])
-                else:
-                    out = self.input_adapters[sample["eq_idx"][0].item()](sample["x"])
-                    out = self.main_fno(out)
-                    out = self.output_adapters[sample["eq_idx"][0].item()](out)
-
         else:
             out = self.model({key: sample[key]["x"] for key in sample})
 
@@ -588,6 +551,10 @@ class Trainer(object):
             out, sample = data_processor.postprocess(out, sample, training=training)
 
         mask = {bkey: (sample[bkey]["mask"] if "mask" in sample[bkey] else None) for bkey in sample.keys()}
+
+        if batch_idx == 0:
+            prefix = f'train_{epoch_idx}' if training else f'val_{epoch_idx}'
+            self.visualizeDatasetTrajectories(prefix, out, sample, {idx : 0 for idx in out.keys()})
 
         if self.mixed_precision:
             with torch.autocast(device_type=self.autocast_device_type):

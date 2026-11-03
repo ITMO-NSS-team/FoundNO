@@ -337,7 +337,8 @@ class FNOBlocks(nn.Module):
                 index: int = 0,
                 skips: Dict[int, Union[torch.Tensor, TensorDict]] = None,
                 skip_handlers: Dict[Tuple[int, int, int, str], SkipLike] = None, 
-                output_shape: Tuple[int] = None) -> torch.Tensor:
+                output_shape: Tuple[int] = None,
+                skip_separate_idx = None) -> torch.Tensor:
         if skips is None:
             skips = {}
 
@@ -345,17 +346,32 @@ class FNOBlocks(nn.Module):
             skip_handlers = {}
 
         if self.preactivation:
-            x = self.forward_with_preactivation(x, skips, skip_handlers, index, output_shape)
+            x = self.forward_with_preactivation(x, skips, skip_handlers, index, output_shape, skip_separate_idx)
         else:
-            x = self.forward_with_postactivation(x, skips, skip_handlers, index, output_shape) 
+            x = self.forward_with_postactivation(x, skips, skip_handlers, index, output_shape, skip_separate_idx) 
 
         if index in [skip.info()[1] for skip in skip_handlers.values()]:
             skips[index] = x
 
         return x, skips
 
-    def forward_with_postactivation(self, x, skips, skip_handlers, index=0, output_shape=None):
-        x = self.proceedWithSkips(x, index, skips, skip_handlers, 'i')
+    def proceedWithSkips(self, x: torch.Tensor,
+                         layer_idx: int,
+                         skips: Dict[int, torch.Tensor],
+                         skip_handlers: Dict[Tuple[int, int, int, str], SkipLike],
+                         position: Literal['i', 'a'],
+                         output_shape = None) -> torch.Tensor:
+        for skip in skip_handlers.values():
+            if skip.info()[2] == layer_idx and skip.info()[3] == position:
+                x = skip(x, skips[skip.info()[1]], output_shape)
+
+        return x
+
+    def forward_with_postactivation(self, x, skips, skip_handlers, index=0, output_shape=None, skip_separate_idx=None):
+        if skip_separate_idx is None:
+            skip_separate_idx = index
+
+        x = self.proceedWithSkips(x, skip_separate_idx, skips, skip_handlers, 'i')
 
         if self.stabilizer == "tanh":
             if self.complex_data:
@@ -365,7 +381,7 @@ class FNOBlocks(nn.Module):
 
         x = self.convs[index](x, output_shape=output_shape)
 
-        x = self.proceedWithSkips(x, index, skips, skip_handlers, 'a', output_shape)
+        x = self.proceedWithSkips(x, skip_separate_idx, skips, skip_handlers, 'a', output_shape)
 
         if self.norm is not None:
             x = self.norm[self.n_norms * index](x)
@@ -384,26 +400,17 @@ class FNOBlocks(nn.Module):
 
         return x
 
-    def proceedWithSkips(self, x: torch.Tensor,
-                         layer_idx: int,
-                         skips: Dict[int, torch.Tensor],
-                         skip_handlers: Dict[Tuple[int, int, int, str], SkipLike],
-                         position: Literal['i', 'a'],
-                         output_shape = None) -> torch.Tensor:
-        for skip in skip_handlers.values():
-            if skip.info()[2] == layer_idx and skip.info()[3] == position:
-                x = skip(x, skips[skip.info()[1]], output_shape)
-
-        return x
-
     def forward_with_preactivation(self, x, skips: Dict[int, torch.Tensor], 
                                    skip_handlers: Dict[Tuple[int, int, int, str], SkipLike],
-                                   index = 0, output_shape = None): # external_skips_under_activ: torch.Tensor = None, 
+                                   index = 0, output_shape = None, skip_separate_idx=None): # external_skips_under_activ: torch.Tensor = None, 
         # Apply non-linear activation (and norm)
         # before this block's convolution/forward pass:
         # TODO: Shall we add film skip here?
         
-        x = self.proceedWithSkips(x, index, skips, skip_handlers, 'i')
+        if skip_separate_idx is None:
+            skip_separate_idx = index
+
+        x = self.proceedWithSkips(x, skip_separate_idx, skips, skip_handlers, 'i')
 
         if not INITIAL_ACTIVATION_DISABLED:
             x = self.non_linearity(x)
@@ -419,7 +426,7 @@ class FNOBlocks(nn.Module):
 
         x = self.convs[index](x, output_shape=output_shape)
 
-        x = self.proceedWithSkips(x, index, skips, skip_handlers, 'a', output_shape)
+        x = self.proceedWithSkips(x, skip_separate_idx, skips, skip_handlers, 'a', output_shape)
 
         if index < (self.n_layers - 1):
             x = self.non_linearity(x)

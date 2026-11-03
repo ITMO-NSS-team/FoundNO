@@ -15,7 +15,7 @@ import torch
 from neuralop.layers.channel_mlp import ChannelMLP
 # from neuralop.layers.spectral_convolution import SpectralConv
 from muno.layers.spectral_convolution import SpectralConv
-from neuralop.models import UNO #, FNO
+#from neuralop.models import UNO #, FNO
 
 from muno.utils.training_utils import validateOperator
 
@@ -25,6 +25,7 @@ from muno.layers.embeddings import GridEmbeddingND
 from muno.models.muno import Muno
 from muno.models.fno import FNO
 from muno.models.cno import CFNO
+from muno.models.uno import UNO
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -55,6 +56,8 @@ def _local_attn_fno():
 def _pecoda_no():
     return _load_class_from_file("muno/models/pecoda.py", "PeCODANO")
 
+# UNO_N_LAYERS = 5
+# UNO_
 
 MODEL_REGISTRY = {
     "fno": {
@@ -125,10 +128,50 @@ MODEL_REGISTRY = {
                 "n_layers": 4,
                 "n_modes": {"t": 1, "x": 32}, # [10, 40, 40],
                 "disable_lifting_and_projection": True,
-                "conv_module": SpectralConv # FactorizedDimensionSpectralConv # SpectralConv # 
+                "conv_module": SpectralConv, # FactorizedDimensionSpectralConv # SpectralConv #
+                "implementation": 'reconstructed' 
             }, 
             {
                 "hidden_channels": 80,
+                "n_layers": 2,
+                "n_dim": 3,
+                "non_linearity": torch.nn.functional.gelu,
+            },
+        ],
+    },
+    "adapted_uno": {
+        "kind": "adapter_core_adapter",
+        "model": [_post_lift_mamba_lifting, UNO, ChannelMLP],
+        "params": [
+            {
+                "width": 100,
+                "use_mamba_kwargs": None,
+                "mamba_fallback_kernel": 9,
+                "padding": 0,
+                "n_dim": 3,
+                "non_linearity": torch.nn.functional.gelu,
+            },
+            {
+                "hidden_channels": 100,
+                "n_layers": 4,
+                "uno_n_modes": [[16, 24, 24]] * 4,
+                "uno_out_channels": [100, 140, 140, 100],
+                "uno_scalings": [
+                    [1.0, 1.0, 1.0],
+                    [0.5, 0.5, 0.5],
+                    [1.0, 1.0, 1.0],
+                    # [1.0, 1.0, 1.0],
+                    [2.0, 2.0, 2.0],
+                ],
+                "non_linearity": torch.nn.functional.gelu,
+                "horizontal_skips_map": {3: 0,}, # 3: 1},
+                "channel_mlp_skip": "linear",
+                "disable_lifting_and_projection": True,
+                "conv_module": SpectralConv, # FactorizedDimensionSpectralConv # SpectralConv #
+                "implementation": 'reconstructed' 
+            }, 
+            {
+                "hidden_channels": 100,
                 "n_layers": 2,
                 "n_dim": 3,
                 "non_linearity": torch.nn.functional.gelu,
@@ -193,6 +236,37 @@ MODEL_REGISTRY = {
             },
         ],
     },
+    "adapted_cfno_no_mamba": {
+        "kind": "adapter_core_adapter",
+        "model": [ChannelMLP, CFNO, ChannelMLP],
+        "params": [
+            {
+                "hidden_channels": 32,
+                "n_layers": 2,
+                "n_dim": 3,
+                "non_linearity": torch.nn.functional.gelu,
+            },
+            {
+                "hidden_channels": 80,
+                "n_layers": 4,
+                "n_modes": {"t": 16, "x": 16}, # [10, 40, 40],
+                "disable_lifting_and_projection": True,
+                "local_branch": "parallel", # parallel
+                "diff_kernels": "parallel",
+                "global_token": "off",
+                "autoregressive_mode": False,
+                "arch": "spatial-temporal",
+                "conv_module": SpectralConv,
+                "residual_u0": False
+            }, 
+            {
+                "hidden_channels": 80,
+                "n_layers": 2,
+                "n_dim": 3,
+                "non_linearity": torch.nn.functional.gelu,
+            },
+        ],
+    },        
     "dno": {
         "kind": "adapter_core_adapter",
         "model": [ChannelMLP, FNO, ChannelMLP],

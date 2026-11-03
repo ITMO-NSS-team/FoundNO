@@ -309,7 +309,7 @@ class PostLiftMambaProcessorND(nn.Module):
             out = out.view(B, T, H, W, C).permute(0, 4, 1, 2, 3).contiguous()
 
         # print('out.shape', out.shape)
-        return out
+        return out + x_lift
 
 
 # FNO subclass: apply Mamba after lifting (post-lift)

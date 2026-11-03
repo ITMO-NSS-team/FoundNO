@@ -178,7 +178,6 @@ def evaluate_multitask_loaders(
 
     return results
 
-
 def save_metrics(metrics, output_dir, filename_stem):
     metrics_dir = Path(output_dir) / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)

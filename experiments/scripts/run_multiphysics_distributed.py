@@ -42,7 +42,9 @@ from muno.data.benchmarks.datasets import MultiPhysicsDataset
 from muno.data.benchmarks.normalization import build_data_processors
 from muno.data.benchmarks.inspections import inspect_tasks
 from muno.utils.custom_trainer import Trainer
-from muno.utils.training_utils import BalancedRelL2Loss
+from muno.utils.training_utils import BalancedRelL2Loss, GenericLoss
+from muno.utils.metrics_physical import spectral_nrmse
+from muno.utils.metrics import rmse
 from muno.utils.model_factory import build_model, load_from_dir
 from muno.data.benchmarks.evaluation import (
     evaluate_multitask_loaders,
@@ -159,6 +161,8 @@ def parse_args():
     parser.add_argument("--core-checkpoint", default=None, help="Path to pre-trained core checkpoints.")
     parser.add_argument("--lift-checkpoint-dir", default=None, help="Path to pre-trained core checkpoints.")
     parser.add_argument("--proj-checkpoint-dir", default=None, help="Path to pre-trained core checkpoints.")
+    #Add more arguments for other tasks of loading a skip connection from a checkpoint
+    parser.add_argument("--skip-checkpoint-dir", default=None, help="Path to pre-trained core checkpoints.")
 
     parser.add_argument("--run-name", default=None, help="Name, with which the training results will be stored.")
     parser.add_argument("--output-root", default=None)
@@ -198,33 +202,47 @@ def main():
         else output_config.get("root", "runs")
     )
 
-    run_prefix = args.run_name if args.run_name is not None else config_path.stem
-    run_name = f"{run_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    output_dir = resolve_path(output_root) / run_name
-    checkpoint_dir = output_dir / "checkpoints"
-    log_dir = output_dir / "logs"
-
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
     local_rank = os.environ["LOCAL_RANK"]
     print(f'Local rank is {local_rank} of type {type(local_rank)}')
 
-    task_configs = config["tasks"]
-    inspections_config = config.get("inspections", {})
 
-    if inspections_config.get("enabled", False) and local_rank == 0:
-        inspect_tasks(
-            task_configs,
-            output_dir / "inspections"
-        )
+    if local_rank == '0':
+        run_prefix = args.run_name if args.run_name is not None else config_path.stem
+        run_name = f"{run_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        output_dir = resolve_path(output_root) / run_name
+        checkpoint_dir = output_dir / "checkpoints"
+        log_dir = output_dir / "logs"
 
-    if local_rank == 0:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        task_configs = config["tasks"]
+        inspections_config = config.get("inspections", {})
+
+        if inspections_config.get("enabled", False):
+            inspect_tasks(
+                task_configs,
+                output_dir / "inspections"
+            )
+
+        sync = [output_dir, checkpoint_dir, log_dir, task_configs]
+
         train_set, val_set, test_set, metadata = loadData(task_configs) # download = True to be executed with respect to the config, load data from net
+    else:
+        sync = [None, None, None, None]
 
     dist.barrier() # A barrier to avoid loading from net in subprocesses
-    if local_rank != 0:
+
+    print(f'Before sync: {local_rank} - {sync}')
+    dist.broadcast_object_list(sync, src=0)
+    print(f'After sync: {local_rank} - {sync}')
+    output_dir, checkpoint_dir, log_dir, task_configs = sync
+
+    if local_rank != '0':
         train_set, val_set, test_set, metadata = loadData(task_configs) # 
+
+    TRAINER_BATCH_SIZE = 2
+    VAL_BATCH_SIZE = 1
 
     train_set = MultiPhysicsDataset(train_set)
     val_set   = MultiPhysicsDataset(val_set)
@@ -236,9 +254,9 @@ def main():
                                        drop_last=True, seed=seed)
     test_sampler  = DistributedSampler(test_set, num_replicas=int(os.environ["WORLD_SIZE"]), rank=int(local_rank), 
                                        drop_last=True, seed=seed)
-    train_loader = DataLoader(dataset = train_set, sampler = train_sampler, shuffle = False)
-    val_loader =   DataLoader(dataset = val_set,   sampler = val_sampler, shuffle = False)
-    test_loader =  DataLoader(dataset = test_set,  sampler = test_sampler, shuffle = False)
+    train_loader = DataLoader(dataset = train_set, batch_size=TRAINER_BATCH_SIZE, sampler = train_sampler, shuffle = False)
+    val_loader =   DataLoader(dataset = val_set, batch_size=VAL_BATCH_SIZE, sampler = val_sampler, shuffle = False)
+    test_loader =  DataLoader(dataset = test_set, sampler = test_sampler, shuffle = False)
     
     loader_channels = getLoadersChannels(train_loader)
     write_run_metadata(output_dir, config_path, config, metadata, loader_channels)
@@ -247,7 +265,7 @@ def main():
     
     core_checkpoint = load_from_dir(args.core_checkpoint)[CORE_IDX] if args.core_checkpoint is not None else None
     liftings = load_from_dir(args.lift_checkpoint_dir) if args.lift_checkpoint_dir is not None else None
-    projections = load_from_dir(args.lift_checkpoint_dir) if args.proj_checkpoint_dir is not None else None
+    projections = load_from_dir(args.proj_checkpoint_dir) if args.proj_checkpoint_dir is not None else None
 
     model_blocks = build_model(loader_channels, model_config, 
                                core_checkpoint, liftings, projections)
@@ -255,17 +273,20 @@ def main():
     print(f'local_rank: {local_rank}, lengths: {train_set._data_lens}, \
             replicas: {train_sampler.num_replicas}, samples: {train_sampler.num_samples}')
 
-    model = Muno(liftings = model_blocks[0], core = model_blocks[1], projections = model_blocks[2])
+    model = Muno(liftings = model_blocks[0], core = model_blocks[1], projections = model_blocks[2], rollover_mode='rollout')
     model.to(device=device)
     
     DEFAULT_MODE = 'pretrain' # insert selection of the mode from a config
     model.setMode(DEFAULT_MODE)
 
-    model = DistributedDataParallel(model, device_ids=[int(local_rank)], output_device=int(local_rank))
+    model = DistributedDataParallel(model, device_ids=[int(local_rank)], output_device=int(local_rank), 
+                                    find_unused_parameters=True)
 
     print(f'model.device_ids are {model.device_ids}')
 
     trainer = Trainer(backup_loc=str(checkpoint_dir))
+
+    trainer.setSampleVisPath(path = output_dir / "vis")
 
     trainer.gradient_accumulation_steps = int(training_config["gradient_accumulation_steps"])
     print(f"gradient_accumulation_steps: {trainer.gradient_accumulation_steps}")
@@ -292,7 +313,7 @@ def main():
         n_dim=model_config.get("n_dim", 2),
         params_scheduler=build_scheduler_config(training_config, epochs),
         params_opt=build_optimizer_config(training_config),
-        trainer_loss=BalancedRelL2Loss()
+        trainer_loss=[GenericLoss(rmse), GenericLoss(spectral_nrmse)]
     )
 
     data_processors = build_data_processors(
@@ -300,8 +321,10 @@ def main():
         config=config.get("normalization"),
         device=device
     )
-    print(f'build_data_processors result is {type(data_processors)} : {data_processors}')
-    save_data_processors(data_processors, output_dir)
+    if local_rank == '0':
+        # TODO: add more elegant solution to the sync between processes
+        print(f'build_data_processors result is {type(data_processors)} : {data_processors}')
+        save_data_processors(data_processors, output_dir)
 
     trainer.train(
         train_loader=train_loader,
@@ -310,9 +333,8 @@ def main():
         data_processor=data_processors
     )
 
-
     dist.barrier() # A barrier to avoid loading from net in subprocesses
-    if local_rank == 0:
+    if local_rank == '0':
         metrics_config = config.get("metrics", {})
         evaluation_config = config.get("evaluation", {})
         evaluate_after_training = evaluation_config.get("after_training", True)

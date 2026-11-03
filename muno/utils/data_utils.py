@@ -13,32 +13,74 @@ except ImportError:
 import torch.nn.functional as F
 import numpy as np
 
-from typing import Tuple, List, Callable
+from typing import Tuple, List, Callable, Literal
 
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 
 from torch.utils.data import Dataset
 # from torch.utils.data.distributed import DistributedSampler
 
 from .domains import Domain
 
-def Heatmap(Matrix, interval = None, area = ((0, 1), (0, 1)), xlabel = '', ylabel = '', figsize=(8,6), filename = None, title = ''):
-    y, x = np.meshgrid(np.linspace(area[0][0], area[0][1], Matrix.shape[0]), np.linspace(area[1][0], area[1][1], Matrix.shape[1]))
-    fig, ax = plt.subplots(figsize = figsize)
-    plt.xlabel(xlabel)
-    ax.set(ylabel=ylabel)
-    ax.xaxis.labelpad = -10
-    if interval:
-        c = ax.pcolormesh(x, y, np.transpose(Matrix), cmap='RdBu', vmin=interval[0], vmax=interval[1])    
+def checkHeatmapInput(inp):
+    assert isinstance(inp, np.ndarray), 'Input has to be a numpy array'
+    assert inp.ndim   == 2, 'Input matrix has to be a flat 2D array'
+
+def Heatmap(matrix, comp_matrix = None, diff: bool = False, interval = None, area = ((0, 1), (0, 1)),
+            xlabel = '', ylabel = '', figsize=(8,6), filename = None, title = '',
+            format: Literal['png', 'pdf', 'eps',] = 'png', save_only: bool = False):
+    if isinstance(matrix, torch.Tensor):
+        matrix = matrix.detach().cpu().numpy()
+    checkHeatmapInput(matrix)
+
+    if comp_matrix is not None:
+        if isinstance(comp_matrix, torch.Tensor):
+            comp_matrix = comp_matrix.detach().cpu().numpy()
+
+        checkHeatmapInput(comp_matrix)
+        plot_args = [matrix, comp_matrix]
+        if diff:
+            plot_args.append(np.abs(matrix - comp_matrix))
+            figsize = (1.8*figsize[0], 0.6*figsize[1])            
+        else:
+            figsize = (1.6*figsize[0], 0.8*figsize[1])
     else:
-        c = ax.pcolormesh(x, y, np.transpose(Matrix), cmap='RdBu', vmin=min(-abs(np.max(Matrix)), -abs(np.min(Matrix))),
-                          vmax=max(abs(np.max(Matrix)), abs(np.min(Matrix)))) 
-    # set the limits of the plot to the limits of the data
-    ax.axis([x.min(), x.max(), y.min(), y.max()])
-    fig.colorbar(c, ax=ax)
-    plt.title(title)
-    plt.show()
-    if type(filename) != type(None): plt.savefig(filename + '.eps', format='eps')
+        plot_args = [matrix,]
+    
+
+    y, x = np.meshgrid(np.linspace(area[0][0], area[0][1], matrix.shape[0]), np.linspace(area[1][0], area[1][1], matrix.shape[1]))
+    n_cols = 1 if comp_matrix is None else 2 + int(diff)
+    fig, ax = plt.subplots(ncols=n_cols, figsize = figsize)
+
+    if isinstance(ax, mpl.axes._axes.Axes):
+        ax = [ax,]
+
+    for idx in range(n_cols):
+        ax[idx].set(xlabel=xlabel, ylabel=ylabel)
+        ax[idx].xaxis.labelpad = -10
+        if interval:
+            c = ax[idx][0].pcolormesh(x, y, np.transpose(plot_args[idx]), cmap='RdBu', vmin=interval[0], vmax=interval[1])    
+        else:
+            c = ax[idx].pcolormesh(x, y, np.transpose(plot_args[idx]), cmap='RdBu', 
+                                   vmin=min(-abs(np.max(plot_args[idx])), -abs(np.min(plot_args[idx]))),
+                                   vmax=max(abs(np.max(plot_args[idx])), abs(np.min(plot_args[idx])))) 
+        # set the limits of the plot to the limits of the data
+        if idx == 0 and len(ax) > 1:
+            ax[idx].set_title(title + (title != '') * ' ' + "prediction")
+        if idx == 1:
+            ax[idx].set_title("reference")
+        if idx == 2:
+            ax[idx].set_title("difference")
+        
+        
+        ax[idx].axis([x.min(), x.max(), y.min(), y.max()])
+        fig.colorbar(c, ax=ax[idx])
+
+    plt.tight_layout()
+    if type(filename) != type(None): plt.savefig(filename + f'.{format}', format=format)
+    if save_only:
+        plt.close()
 
 
 def syncSuffle(*input: torch.Tensor):

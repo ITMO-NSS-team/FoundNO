@@ -29,7 +29,7 @@ from muno.utils.seed import set_global_seed
 from muno.data.benchmarks.config_io import load_yaml_config
 from muno.data.benchmarks.multiphysics_loaders import (
     build_multitask_loaders,
-    get_loaders_channels,
+    getLoadersChannels,
     build_multitask_datasets
 )
 
@@ -207,7 +207,7 @@ def main():
     val_loader   = DataLoader(dataset = val_set,   shuffle = False)
     test_loader  = DataLoader(dataset = test_set,  shuffle = False)    
 
-    loader_channels = get_loaders_channels(train_loader)
+    loader_channels = getLoadersChannels(train_loader)
     print("loader_channels:", loader_channels)
 
     write_run_metadata(output_dir, config_path, config, metadata, loader_channels)

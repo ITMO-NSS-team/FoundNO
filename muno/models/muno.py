@@ -49,6 +49,7 @@ class Muno(nn.Module):
         assert single_model is None or (liftings is None and core is None and projections is None), \
             'incorrect setting of the Muno model: either single_model or liftings, core and projections have to be None'
 
+        self._frozen = False
         self._rollover_mode: Final = rollover_mode
         self._training_mode = autoreg_training_mode
 
@@ -90,6 +91,13 @@ class Muno(nn.Module):
     #     self._horizontal_skips_map[]
     # TODO: implement correct mapping method
 
+    @property
+    def adapters_num(self):
+        if self._single_model:
+            return 1
+        else:
+            return len(self._liftings)
+
     def setAdapter(self, lifting: torch.nn.Module, projection: torch.nn.Module, skip: Dict[int, SkipLike] = None):
         self._liftings.append(lifting)
         self._projections.append(projection)
@@ -105,7 +113,7 @@ class Muno(nn.Module):
             self._skip_handlers.append(skip)
 
     def setSkips(self, skips: List[Union[List[SkipLike], Dict[Any, SkipLike]]]):
-        assert len(skips) == len(self._liftings), \
+        assert len(skips) == self.adapters_num, \
             'Length of passed skips does not match the number of adapteres'
         if all([isinstance(skip, list) for skip in skips]):
             self._skip_handlers = [{hash(single_skip): single_skip for single_skip in skip} for skip in skips]
@@ -116,7 +124,7 @@ class Muno(nn.Module):
 
     def to(self, device):
         if not self._single_model:
-            for idx, _ in enumerate(self._liftings):
+            for idx in range(self.adapters_num):
                 self._liftings[idx].to(device=device)
                 self._projections[idx].to(device=device)
                 
@@ -202,6 +210,19 @@ class Muno(nn.Module):
         
         return to_slice, skip_args
 
+    def freezeParameters(self):
+        self.eval()
+
+        for param in self.parameters():
+            param.requires_grad = False
+        self._frozen = True
+
+    def unfreezeParameters(self):
+        self.train()
+        
+        for param in self.parameters():
+            param.requires_grad  = True
+        self._frozen = False
 
     @singledispatchmethod
     def forward(self, x, adapter_idx: int = 0, output_shape = None, **kwargs):
@@ -210,7 +231,7 @@ class Muno(nn.Module):
     @forward.register
     def _(self, x: dict, adapter_idx: int = None, output_shape = None, **kwargs) -> Dict[int, torch.Tensor]:
         # Argument x is expected to have forms of Dict[int, torch.Tensor]
-        assert len(x) == len(self._liftings), 'Mismatching adapters and problems in forward inputs.'
+        assert len(x) == self.adapters_num, 'Mismatching adapters and problems in forward inputs.'
         if adapter_idx is not None:
             warnings.warn(f"Calling dict-mapped forward desipte having explicitly passed adapter index: {adapter_idx}.")
         # if len(self._skip_handlers) != 0:
@@ -295,14 +316,19 @@ class Muno(nn.Module):
         modelled_channels = tuple([i for i in range(x.shape[1]) if i not in skips_channels])
         with torch.no_grad():        
             pred = x[:, modelled_channels, 0:1, ...].repeat(*[1, 1, t_max] + [1,]*(x.ndim-3))
+        # print(f'In _forward_autoreg: pred shape is {pred.shape}')
 
         for t_idx in range(1, t_max): # Asserting, that we need to start from idx 0, may be subject to change
             if kwargs["autoreg_training_mode"] == 'rolling_origin':
-                pred[:, :, t_idx:t_idx+1, ...] = x[:, modelled_channels, t_idx-1:t_idx, ...] + \
-                                                 t_step * self._forward_simple(x[:, :, t_idx-1:t_idx, ...],
-                                                                               adapter_idx=adapter_idx,
-                                                                               output_shape=output_shape,
-                                                                               **kwargs)
+                # pred[:, :, t_idx:t_idx+1, ...] = x[:, modelled_channels, t_idx-1:t_idx, ...] + \
+                #                                  t_step * self._forward_simple(x[:, :, t_idx-1:t_idx, ...],
+                #                                                                adapter_idx=adapter_idx,
+                #                                                                output_shape=output_shape,
+                #                                                                **kwargs)
+                pred[:, :, t_idx:t_idx+1, ...] = self._forward_simple(x[:, :, t_idx-1:t_idx, ...],
+                                                                      adapter_idx=adapter_idx,
+                                                                      output_shape=output_shape,
+                                                                      **kwargs)                
 
             elif kwargs["autoreg_training_mode"] == 'full':
                 with torch.no_grad():
@@ -310,29 +336,17 @@ class Muno(nn.Module):
                     # replacing modelled channels, leaving forcings, and other features
                     x_modified[:, modelled_channels, ...] = pred[:, :, t_idx-1:t_idx, ...] 
 
-                pred[:, :, t_idx:t_idx+1, ...] = pred[:, :, t_idx-1:t_idx] + t_step * self._forward_simple(x_modified,
-                                                                                                           adapter_idx=adapter_idx,
-                                                                                                           output_shape=output_shape,
-                                                                                                           **kwargs)                
+                # pred[:, :, t_idx:t_idx+1, ...] = pred[:, :, t_idx-1:t_idx] + t_step * self._forward_simple(x_modified,
+                #                                                                                            adapter_idx=adapter_idx,
+                #                                                                                            output_shape=output_shape,
+                #                                                                                            **kwargs)    
+
+                pred[:, :, t_idx:t_idx+1, ...] = self._forward_simple(x_modified, adapter_idx=adapter_idx, 
+                                                                      output_shape=output_shape, **kwargs)                                   
             else:
                 raise RuntimeError("kwargs['autoreg_training_mode'] argument is missing from _forward_autoreg")
 
         return pred
-
-
-    # def _forward_autoreg_full(self, x: torch.Tensor, adapter_idx: int = 0, output_shape = None, **kwargs):
-    #     pass
-                # with torch.no_grad():
-                #     x_modified = x[:, :, t_idx-1:t_idx, ...]
-                #     prev_pred = x[:, modelled_channels, t_idx-1:t_idx, ...]
-                # pred[:, :, t_idx:t_idx+1, ...] = prev_pred + t_step * self._forward_simple(x_modified,
-                #                                                                            adapter_idx=adapter_idx,
-                #                                                                            output_shape=output_shape,
-                #                                                                            **kwargs)
-
-                # with torch.no_grad():
-                #     x_modified = x[:, :, t_idx-1:t_idx, ...]
-                #     prev_pred = x[:, modelled_channels, t_idx-1:t_idx, ...]    
 
     @classmethod
     def load(cls, model_path: Union[str, Tuple[Union[None, str, Tuple[str]]]], _SAVE_LOAD_PARAMS: dict = {}):
@@ -388,7 +402,7 @@ class Muno(nn.Module):
             elif isinstance(model_path[0], (list, tuple)):
                 assert (isinstance(model_path[2], (list, tuple)) and len(model_path[0]) == len(model_path[2])), \
                     'If a list/tuple is a path for lifting model, a list/tuple has to be a path for proj. too.'
-                assert len(self._liftings) == len(model_path[2]), 'Mismatching numbers of filenames and submodels.'
+                assert self.adapters_num == len(model_path[2]), 'Mismatching numbers of filenames and submodels.'
                 for idx in range(len(model_path[0])):
                     torch.save(obj=self._liftings[idx], pickle_module=dill, f=model_path[0][idx],
                                **_SAVE_LOAD_PARAMS)
@@ -414,3 +428,112 @@ class Muno(nn.Module):
         parallelized = torch.nn.DataParallel(self, device_ids = devices, dim = dim)
         parallelized.to(devices[0])
         return parallelized
+
+class CompositeMuno(nn.Module):
+    def __init__(self, models: torch.nn.ModuleList, *args, **kwargs):
+        CompositeMuno.validateSubmodels(models)
+        
+        super().__init__()
+        self._submodels = models
+        self._frozen_idx = 0
+
+    @staticmethod
+    def validateSubmodels(models: torch.nn.ModuleList) -> None:
+        '''
+        Method to validate submodels, passed into CompositeMuno.
+        '''
+        for model in models:
+            assert isinstance(model, (Muno, torch.nn.ModuleList)), \
+                f'Invalid submodel type: expected Muno or torch.nn.ModuleList, got {type(model)}.'
+
+        adapters_num = models[0].adapters_num if isinstance(models[0], Muno) else len(models[0])
+        for model in models[1:]:
+            if isinstance(model, Muno):    
+                assert adapters_num == model.adapters_num, \
+                    f'All submodels must have the same number of adapters: expecting {adapters_num}, got {model.adapters_num}.'
+            else:
+                assert adapters_num == len(model), \
+                    f'All submodels must have the same number of adapters: expecting {adapters_num}, got {len(model)}.'
+
+    def forward(self, x, adapter_idx: int = 0, max_model_idx: int = None, 
+                output_shape = None, *args, **kwargs) -> torch.Tensor:
+        if max_model_idx == -1:
+            max_model_idx = len(self._submodels)   
+
+        if max_model_idx is None:
+            max_model_idx = self._frozen_idx
+
+        for i in range(max_model_idx):
+            if isinstance(self._submodels[i], torch.nn.ModuleList):
+                x  = self._submodels[i][adapter_idx](x, *args, **kwargs)
+            else:
+                x = self._submodels[i](x, adapter_idx, output_shape, *args, **kwargs)
+        return x
+
+    def toDataParallel(self, devices: Union[List[int], int] = [], dim: int = 0) -> torch.nn.DataParallel:
+        if isinstance(devices, int):
+            devices = [devices,]
+
+        self.to(devices[0])
+        parallelized = torch.nn.DataParallel(self, device_ids = devices, dim = dim)
+        parallelized.to(devices[0])
+        return parallelized
+
+    def freezeSubmodel(self, idx: int) -> None:
+        if idx >= len(self._submodels):
+            raise ValueError(f"Cannot freeze submodel {idx} as it is out of range")
+        
+        self._submodels[idx].eval()
+        for param in self._submodels[idx].parameters():
+            param.requires_grad = False
+
+    def freezeNextSubmodel(self) -> None:
+        self._frozen_idx += 1
+        if self._frozen_idx  >= len(self._submodels):
+            raise ValueError(f"Cannot freeze submodel {self._frozen_idx} as it is out of range")
+        
+        self.freezeSubmodel(self._frozen_idx)
+
+    def unfreezeSubmodel(self, idx: int) -> None:
+        if idx >= len(self._submodels):
+            raise ValueError(f"Cannot unfreeze submodel {idx} as it is out of range")
+        
+        self._submodels[idx].train()
+        for param in self._submodels[idx].parameters():
+            param.requires_grad = True
+
+    def unfreezeAllSubmodels(self) -> None:
+        for idx in range(self._frozen_idx):
+            self.unfreezeSubmodel(idx)
+
+    def save(self, paths: List[Union[str, Tuple[str, List[str]]]], _SAVE_LOAD_PARAMS: List[dict] = None) -> None:
+        assert len(paths) == len(self._submodels), \
+            f"Number of paths must match number of submodels, instead got {len(paths)} and {len(self._submodels)}"
+
+        if _SAVE_LOAD_PARAMS is None:
+            _SAVE_LOAD_PARAMS = [{None}] * len(paths)
+
+        for model, path, params in zip(self._submodels, paths, _SAVE_LOAD_PARAMS):
+            if isinstance(model, Muno):
+                model.save(path, params)
+            else:
+                for ad_idx, submodel_adapter in enumerate(model):
+                    torch.save(obj=submodel_adapter, pickle_module=dill, f=path[ad_idx],
+                               **params)
+
+    @classmethod
+    def load(cls, prototype: List[bool], # prototype defines structure: if True - Muno model, if False - ModuleList
+             model_path: List[Union[str, Tuple[Union[None, str, Tuple[str]]]]],
+             _SAVE_LOAD_PARAMS: List[dict] = None, *args, **kwargs):
+        if _SAVE_LOAD_PARAMS is None:
+            _SAVE_LOAD_PARAMS = [{None}] * len(model_path)
+
+        submodels = []
+        for muno_flag, path, params in zip(prototype, model_path, _SAVE_LOAD_PARAMS):
+            if muno_flag:
+                model = Muno.load(path, params)
+            else:
+                model = torch.load(path, pickle_module=dill, **params)
+            submodels.append(model)
+
+        return cls(submodels, *args, **kwargs)

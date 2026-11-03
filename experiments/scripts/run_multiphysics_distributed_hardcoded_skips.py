@@ -249,7 +249,7 @@ def main():
     liftings = load_from_dir(args.lift_checkpoint_dir) if args.lift_checkpoint_dir is not None else None
     projections = load_from_dir(args.lift_checkpoint_dir) if args.proj_checkpoint_dir is not None else None
 
-    model_blocks = build_model([(5, 5)], model_config, 
+    model_blocks = build_model(loader_channels, model_config, 
                                core_checkpoint, liftings, projections)
 
     print(f'local_rank: {local_rank}, lengths: {train_set._data_lens}, \
@@ -264,8 +264,9 @@ def main():
 
     # skips = [None,] # * len(loader_channels)
     skip_handlers = [generateFiLMSkips(model, film_gen_kwargs = {'input_channels': (4, 5),
-                                                         'num_layers': 3,
-                                                         'layers_widths': 5})]
+                                                                 'num_layers': 3,
+                                                                 'layers_widths': 5},
+                                       skip_targets = [0,])]
     model.setSkips(skip_handlers)
 
 

@@ -178,6 +178,8 @@ class CNOBranch(nn.Module):
         if x.ndim == 5 and self._autoregressive_mode:
             to_unsqueeze = True
             x = x.squeeze(2)
+        else:
+            to_unsqueeze = False
 
         if self._autoregressive_mode:
             dim_idx = 2

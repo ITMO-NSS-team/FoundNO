@@ -23,6 +23,7 @@ from neuralop.layers.spectral_convolution import SpectralConv
 import torch.nn as nn
 import torch.nn.functional as F
 
+#
 
 class DNO(nn.Module):
     def __init__(self, n_modes, in_channels, out_channels,

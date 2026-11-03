@@ -1,6 +1,9 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
+from tensordict import TensorDict
+
+from typing import Dict, Tuple, Union
 
 # Set warning filter to show each warning only once
 import warnings
@@ -8,11 +11,12 @@ import warnings
 warnings.filterwarnings("once", category=UserWarning)
 
 from neuralop.layers.channel_mlp import ChannelMLP
-from neuralop.layers.spectral_convolution import SpectralConv
 from neuralop.layers.skip_connections import skip_connection
 from neuralop.layers.padding import DomainPadding
 
+from muno.layers.spectral_convolution import SpectralConv
 from muno.layers.fno_block import FNOBlocks
+from muno.layers.skips import SkipLike
 
 from neuralop.layers.resample import resample
 from neuralop.layers.embeddings import GridEmbedding2D, GridEmbeddingND
@@ -120,6 +124,7 @@ class UNO(nn.Module):
         Neural Operators" (2022). TMLR 2022, https://arxiv.org/pdf/2204.11127.
     """
 
+    # TODO: implement logic of automatic construction of default U-net FNO with downsampling from 2-nd layer
     def __init__(
         self,
         in_channels,
@@ -127,7 +132,7 @@ class UNO(nn.Module):
         hidden_channels,
         lifting_channels=256,
         projection_channels=256,
-        positional_embedding="grid",
+        positional_embedding=None,# "grid",
         n_layers=4,
         uno_out_channels=None,
         uno_n_modes=None,
@@ -209,7 +214,7 @@ class UNO(nn.Module):
                 raise ValueError(f'Error: expected {self.n_dim}-d positional embeddings, got {positional_embedding}')
         elif isinstance(positional_embedding, GridEmbeddingND):
             self.positional_embedding = positional_embedding
-        elif positional_embedding == None:
+        elif positional_embedding is None:
             self.positional_embedding = None
         else:
             raise ValueError(
@@ -329,7 +334,7 @@ class UNO(nn.Module):
                 non_linearity=non_linearity,
             )
 
-    def forward(self, x, **kwargs):
+    def _forward_legacy(self, x, **kwargs):
         if kwargs:
             warnings.warn(
                 f"UNO.forward() received unexpected keyword arguments: {list(kwargs.keys())}. "
@@ -368,6 +373,63 @@ class UNO(nn.Module):
             if layer_idx == self.n_layers - 1:
                 cur_output = output_shape
             x = self.fno_blocks[layer_idx](x, output_shape=cur_output)
+
+            if layer_idx in self.horizontal_skips_map.values():
+                skip_outputs[layer_idx] = self.horizontal_skips[str(layer_idx)](x)
+
+        if self.domain_padding is not None:
+            x = self.domain_padding.unpad(x)
+
+        if not self._disable_lifting_and_projection:
+            x = self.projection(x)
+        return x
+
+    def forward(self, x: torch.Tensor, skips_direct: Dict[int, Union[torch.Tensor, TensorDict]], 
+                skip_handlers: Dict[Tuple[int, int, int, str], SkipLike] = None, 
+                output_shape=None, **kwargs):
+#        print(f'In the input: x.shape is {x.shape}')
+
+        if kwargs:
+            warnings.warn(
+                f"UNO.forward() received unexpected keyword arguments: {list(kwargs.keys())}. "
+                "These arguments will be ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        if self.positional_embedding is not None:
+            x = self.positional_embedding(x)
+
+        if not self._disable_lifting_and_projection:
+            x = self.lifting(x)
+
+        if self.domain_padding is not None:
+            x = self.domain_padding.pad(x)
+        output_shape = [
+            int(round(i * j))
+            for (i, j) in zip(x.shape[-self.n_dim :], self.end_to_end_scaling_factor)
+        ]
+
+        skip_outputs = {}
+        cur_output = None
+        for layer_idx in range(self.n_layers):
+            if layer_idx in self.horizontal_skips_map.keys():
+                skip_val = skip_outputs[self.horizontal_skips_map[layer_idx]]
+                resolution_scaling_factors = [
+                    m / n for (m, n) in zip(x.shape, skip_val.shape)
+                ]
+                resolution_scaling_factors = resolution_scaling_factors[-1 * self.n_dim :]
+                t = resample(
+                    skip_val, resolution_scaling_factors, list(range(-self.n_dim, 0))
+                )
+                x = torch.cat([x, t], dim=1)
+
+            if layer_idx == self.n_layers - 1:
+                cur_output = output_shape
+#            print(f'Getting fno_block for layer {layer_idx}: x.shape is {x.shape}')
+
+            x, _ = self.fno_blocks[layer_idx](x, index = 0, skips = skips_direct, skip_handlers = skip_handlers, # TODO: fix addition into skips
+                                              output_shape = cur_output, skip_separate_idx = layer_idx)
 
             if layer_idx in self.horizontal_skips_map.values():
                 skip_outputs[layer_idx] = self.horizontal_skips[str(layer_idx)](x)
