@@ -21,9 +21,7 @@ tasks:
         Vy: Vy
       url: https://darus.uni-stuttgart.de/api/access/datafile/164687
       path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
-      # axis_selection:
-      #   0:
-      #     slice: [0, 21, 1]
+
     adapter:
       type: temporal
       variable_names: [density, pressure, Vx, Vy]
@@ -195,49 +193,79 @@ tasks:
         shuffle: false
         drop_last: false
 
-  - name: thewell_shear_flow
+  - name: pdebench_ns_incom
     source:
-      location: huggingface
-      format: concat_thewell_hdf5
-      repo_id: polymathic-ai/shear_flow
-      cache_dir: data/train/shear_flow/hf_cache
-      field_groups:
-        t0_fields: [tracer, pressure]
-        t1_fields: [velocity]
-        t2_fields: []
+      location: url
+      format: concat_hdf5
+      variable_path: velocity
+      sample_dim: 0
       axis_selection:
         0:
-          slice: [0, 60, 1]
+          linspace: [0, 500, 16]
         1:
-          slice: [0, 128, 1]
+          slice: [0, 512, 4]
         2:
-          slice: [0, 256, 1]
+          slice: [0, 512, 4]
       files:
-        - filename: data/train/shear_flow_Reynolds_1e5_Schmidt_5e-1.hdf5
-        - filename: data/valid/shear_flow_Reynolds_1e5_Schmidt_5e-1.hdf5
-        - filename: data/test/shear_flow_Reynolds_1e5_Schmidt_5e-1.hdf5
-        - filename: data/train/shear_flow_Reynolds_1e5_Schmidt_5e0.hdf5
-        - filename: data/valid/shear_flow_Reynolds_1e5_Schmidt_5e0.hdf5
-
+        - filename: ns_incom_inhom_2d_512-0.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133280
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-0.h5
+        - filename: ns_incom_inhom_2d_512-1.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/136439
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-1.h5
+        - filename: ns_incom_inhom_2d_512-10.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133309
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-10.h5
+        - filename: ns_incom_inhom_2d_512-25.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133619
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-25.h5
+        - filename: ns_incom_inhom_2d_512-50.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133678
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-50.h5
+        - filename: ns_incom_inhom_2d_512-75.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133694
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-75.h5
+        - filename: ns_incom_inhom_2d_512-100.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133267
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-100.h5
+        - filename: ns_incom_inhom_2d_512-150.h5
+          url: https://darus.uni-stuttgart.de/api/access/datafile/133602
+          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-150.h5
     adapter:
       type: temporal
-      variable_name: data
-      data_order: TCHW
+      variable_name: null
+      data_order: TXYC
       temporal_mode: initial_to_trajectory
       input_time_index: 0
       output_time_indices: all
       flatten_time_to_channels: false
-      benchmark_name: TheWell
-      physics_name: shear_flow
+      benchmark_name: PDEBench
+      physics_name: ns_incom
+    split:
+      type: ratios
+      train: 0.8
+      val: 0.1
+      test: 0.1
+    loaders:
+      train:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: false
+      val:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 4
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
 
-    # adapter:
-    #   type: temporal
-    #   variable_name: data
-    #   data_order: TCHW
-    #   temporal_mode: window
-    #   flatten_time_to_channels: false
-    #   benchmark_name: TheWell
-    #   physics_name: shear_flow
 
     split:
       type: ratios
