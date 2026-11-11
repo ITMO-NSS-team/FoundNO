@@ -17,11 +17,14 @@ tasks:
       jv_mode: forward
       fwd_batch: 2
       vjp_chunk: 16
-      max_rank: 500
+      max_rank: 25
       ggn_method: randomized
       ggn_oversample: 0
       ggn_sample_batch: 4
-      max_num_samples: 1000
+      # Авторитетный checkpoint in_distr-задачи; остальные задачи task_idx
+      # наследуют его автоматически.
+      ggn_checkpoint: weights/pdebench_2d_cfd/luno_turbo_inf_lifting_low_rank_terms.pkl
+      max_num_samples: 500
       val_calib_frac: 0.8
       diag_hutchinson: 16
       calib_max_samples: 0
@@ -84,7 +87,7 @@ tasks:
   - name: pdebench_2d_cfd_M1.0
     task_idx: 0
     luno:
-      jv_mode: affine
+      jv_mode: forward
       fwd_batch: 4
       vjp_chunk: 16
       max_rank: 0
@@ -153,7 +156,7 @@ tasks:
   - name: pdebench_2d_cfd_Eta1e-08
     task_idx: 0
     luno:
-      jv_mode: affine
+      jv_mode: forward
       fwd_batch: 4
       vjp_chunk: 16
       max_rank: 0
@@ -226,7 +229,7 @@ tasks:
   - name: pdebench_2d_cfd_time
     task_idx: 0
     luno:
-      jv_mode: affine
+      jv_mode: forward
       fwd_batch: 4
       vjp_chunk: 16
       max_rank: 0
@@ -298,13 +301,14 @@ tasks:
     task_idx: 4
     task_type: in_distr
     luno:
-      jv_mode: affine
-      fwd_batch: 4
+      jv_mode: forward
+      fwd_batch: 2
       vjp_chunk: 16
-      max_rank: 0
+      max_rank: 25
       ggn_method: randomized
-      ggn_oversample: 0
-      max_num_samples: 2
+      ggn_oversample: 10
+      max_num_samples: 200
+      ggn_sample_batch: 4
       val_calib_frac: 0.8
       diag_hutchinson: 50
       calib_max_samples: 0
@@ -372,7 +376,7 @@ tasks:
   - name: thewell_shear_flow_1e4_Schmidt_1e1
     task_idx: 4
     luno:
-      jv_mode: affine
+      jv_mode: forward
       fwd_batch: 4
       vjp_chunk: 16
       max_rank: 0
@@ -446,7 +450,7 @@ tasks:
   - name: thewell_shear_flow_1e5_Schmidt_1e0
     task_idx: 4
     luno:
-      jv_mode: affine
+      jv_mode: forward
       fwd_batch: 4
       vjp_chunk: 16
       max_rank: 0
@@ -520,7 +524,7 @@ tasks:
   - name: thewell_shear_flow_1e5_Schmidt_1e1
     task_idx: 4
     luno:
-      jv_mode: affine
+      jv_mode: forward
       fwd_batch: 4
       vjp_chunk: 16
       max_rank: 0
@@ -595,7 +599,7 @@ tasks:
   - name: thewell_shear_flow_1e4_Schmidt_1e-1
     task_idx: 4
     luno:
-      jv_mode: affine
+      jv_mode: forward
       fwd_batch: 4
       vjp_chunk: 16
       max_rank: 0
@@ -670,7 +674,7 @@ tasks:
   - name: thewell_shear_flow_time
     task_idx: 4
     luno:
-      jv_mode: affine
+      jv_mode: forward
       fwd_batch: 4
       vjp_chunk: 16
       max_rank: 0
@@ -745,7 +749,7 @@ tasks:
   - name: thewell_shear_flow_space
     task_idx: 4
     luno:
-      jv_mode: affine
+      jv_mode: forward
       fwd_batch: 4
       vjp_chunk: 16
       max_rank: 0

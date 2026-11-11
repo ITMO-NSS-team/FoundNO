@@ -440,12 +440,23 @@ def _cov_sqrt_isotropic_lowrank(
     Возвращает ``(scale, U, coeff)`` с ``Sigma^{1/2} = scale*(I + U diag(coeff) U^T)``.
     ``S`` может быть отрицательным (после ``linverse``), но ``S/s + 1 = 1 - r > 0``,
     поэтому корень определён.
+
+    ``sqrt(S/s + 1) - 1`` вычисляется через устойчивую форму
+    ``a / (sqrt(1 + a) + 1)``, ``a = S/s``: при ``a ~ -1`` прямое вычитание
+    теряет точность, и ``1 + a`` в float32 может стать отрицательным, дав NaN.
     """
     U = Sigma.U
     scalar = Sigma.scalar
     if not isinstance(scalar, torch.Tensor):
         scalar = torch.tensor(scalar, dtype=U.dtype, device=U.device)
-    coeff = torch.sqrt(Sigma.S / scalar + 1.0) - 1.0
+    # Считаем в float64: после linverse Sigma.S/Sigma.scalar близко к -1,
+    # и разность 1 + a в float32 округляется в 0 или отрицательное число.
+    a = Sigma.S.to(torch.float64) / scalar.to(torch.float64)
+    # Для корректной ковариации a >= -1; меньшее значение -- ошибка округления
+    # в linverse. Ограничение не даёт coeff уйти ниже -1.
+    a = a.clamp_min(-1.0)
+    r = (1.0 + a).clamp_min(0.0)
+    coeff = (a / (torch.sqrt(r) + 1.0)).to(dtype=U.dtype)
     return torch.sqrt(scalar), U, coeff
 
 
