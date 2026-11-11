@@ -241,7 +241,7 @@ def main():
     if local_rank != '0':
         train_set, val_set, test_set, metadata = loadData(task_configs) # 
 
-    TRAINER_BATCH_SIZE = 2
+    TRAINER_BATCH_SIZE = 1
     VAL_BATCH_SIZE = 1
 
     train_set = MultiPhysicsDataset(train_set)

@@ -32,6 +32,15 @@ tasks:
       flatten_time_to_channels: false
       benchmark_name: PDEBench
       physics_name: 2d_cfd
+
+      extra_channels:
+        - name: grid_txy_normalize
+          type: coordinates
+          source: custom
+          axes: [ t, x, y ]
+          normalize: true
+          target: x
+
     trajectory_selection:
       count: 2000
       strategy: first
@@ -60,7 +69,7 @@ tasks:
         pin_memory: false
         shuffle: false
         drop_last: false
-
+      
 
   - name: poseidon_ce
     source:
@@ -225,12 +234,12 @@ tasks:
         - filename: ns_incom_inhom_2d_512-75.h5
           url: https://darus.uni-stuttgart.de/api/access/datafile/133694
           path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-75.h5
-        - filename: ns_incom_inhom_2d_512-100.h5
-          url: https://darus.uni-stuttgart.de/api/access/datafile/133267
-          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-100.h5
-        - filename: ns_incom_inhom_2d_512-150.h5
-          url: https://darus.uni-stuttgart.de/api/access/datafile/133602
-          path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-150.h5
+        # - filename: ns_incom_inhom_2d_512-100.h5
+        #   url: https://darus.uni-stuttgart.de/api/access/datafile/133267
+        #   path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-100.h5
+        # - filename: ns_incom_inhom_2d_512-150.h5
+        #   url: https://darus.uni-stuttgart.de/api/access/datafile/133602
+        #   path: /workspace/data/PDEBench_data/NS_Incom/ns_incom_inhom_2d_512-150.h5
     adapter:
       type: temporal
       variable_name: null
@@ -302,19 +311,22 @@ normalization:
   max_fit_batches: 40
 
 model:
-  type: adapted_uno
+  type: adapted_cfno # _no_mamba
   n_dim: 3
-#  hidden_channels: 160
+  hidden_channels: 90
   lifting_layers: 2
   projection_layers: 2
-#  core_layers: 4
-#  n_modes: [16, 16, 16]
+  n_modes:
+    t: 12
+    x: 24
+  cno_levels: 4
+  cno_blocks: 4
 
 training:
   epochs: 10
   device: cuda
   train_main_fno: true
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 1
   optimizer:
     optimizer: adamw
     lr: 0.001

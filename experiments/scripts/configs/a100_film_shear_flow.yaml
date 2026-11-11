@@ -147,12 +147,12 @@ tasks:
         #     x: [ 0.0, 1.0 ]
         #     y: [ -1.0, 1.0 ]
 
-#        - name: grid_txy_normalize
-#          type: coordinates
-#          source: custom
-#          axes: [ t, x, y ]
-#          normalize: true
-#          target: x
+        - name: grid_txy_normalize
+          type: coordinates
+          source: custom
+          axes: [ t, x, y ]
+          normalize: true
+          target: x
         #######
 
     trajectory_selection:

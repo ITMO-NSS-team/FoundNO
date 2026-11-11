@@ -52,6 +52,8 @@ from muno.data.benchmarks.evaluation import (
     save_metrics,
 )
 
+from neuralop.layers.channel_mlp import ChannelMLP
+
 from muno.models.scOT.model import ScOTConfig, ScOT
 from muno.models.muno import Muno
 
@@ -255,10 +257,11 @@ def main():
         'Swin model does not non-square domains, thus problem has to be redefined (e.g. resampled, if possible) via the config'
     
     CORE_IDX = 0
-    
-    # core_checkpoint = load_from_dir(args.core_checkpoint)[CORE_IDX] if args.core_checkpoint is not None else None
-    # liftings = load_from_dir(args.lift_checkpoint_dir) if args.lift_checkpoint_dir is not None else None
-    # projections = load_from_dir(args.proj_checkpoint_dir) if args.proj_checkpoint_dir is not None else None
+
+    from muno.utils.model_factory import load_from_dir
+    core_checkpoint = load_from_dir(args.core_checkpoint)[CORE_IDX] if args.core_checkpoint is not None else None
+    liftings_checkpoint = load_from_dir(args.lift_checkpoint_dir) if args.lift_checkpoint_dir is not None else None
+    projections_checkpoint = load_from_dir(args.proj_checkpoint_dir) if args.proj_checkpoint_dir is not None else None
 
     # model_blocks = build_model(loader_channels, model_config, 
     #                            core_checkpoint, liftings, projections)
@@ -276,35 +279,58 @@ def main():
         "embed_dim": 48,
     }
 
+    COMMON_CHANNELS = 12
 
+    liftings, projections = [], []
+    if liftings_checkpoint is not None:
+        assert len(liftings_checkpoint) == len(loader_channels)
+        liftings = liftings_checkpoint
 
-    scot_configs = ScOTConfig(image_size=resolutions[0][0],
-                              patch_size=sccf_config["patch_size"],
-                              num_channels=loader_channels[0][0],
-                              num_out_channels=loader_channels[0][1],
-                              embed_dim=sccf_config["embed_dim"],
-                              depths=sccf_config["depths"],
-                              num_heads=sccf_config["num_heads"],
-                              skip_connections=sccf_config["skip_connections"],
-                              window_size=sccf_config["window_size"],
-                              mlp_ratio=sccf_config["mlp_ratio"],
-                              qkv_bias=True,
-                              hidden_dropout_prob=0.0,  # default
-                              attention_probs_dropout_prob=0.0,  # default
-                              drop_path_rate=0.0,
-                              hidden_act="gelu",
-                              use_absolute_embeddings=False,
-                              initializer_range=0.02,
-                              layer_norm_eps=1e-5,
-                              p=1,
-                              channel_slice_list_normalized_loss=None,
-                              residual_model="convnext",
-                              use_conditioning=True,
-                              learn_residual=False,)
+    if projections_checkpoint is not None:
+        assert len(projections_checkpoint) == len(loader_channels)
+        projections = projections_checkpoint
 
-    model = ScOT(scot_configs)
+    for c_in, c_out in loader_channels:
+        if liftings_checkpoint is None:
+            liftings.append(ChannelMLP(c_in, COMMON_CHANNELS, n_layers= 2,n_dim = 3,
+                                    non_linearity = torch.nn.functional.gelu))
 
-    model = Muno(single_model=model)
+        if projections_checkpoint is None:
+            projections.append(ChannelMLP(COMMON_CHANNELS, c_out, n_layers= 2,n_dim = 3,
+                                    non_linearity = torch.nn.functional.gelu))
+
+    if core_checkpoint is None:
+        scot_configs = ScOTConfig(image_size=resolutions[0][0],
+                                patch_size=sccf_config["patch_size"],
+                                num_channels=COMMON_CHANNELS, # loader_channels[0][0],
+                                num_out_channels=COMMON_CHANNELS, # loader_channels[0][1],
+                                embed_dim=sccf_config["embed_dim"],
+                                depths=sccf_config["depths"],
+                                num_heads=sccf_config["num_heads"],
+                                skip_connections=sccf_config["skip_connections"],
+                                window_size=sccf_config["window_size"],
+                                mlp_ratio=sccf_config["mlp_ratio"],
+                                qkv_bias=True,
+                                hidden_dropout_prob=0.0,  # default
+                                attention_probs_dropout_prob=0.0,  # default
+                                drop_path_rate=0.0,
+                                hidden_act="gelu",
+                                use_absolute_embeddings=False,
+                                initializer_range=0.02,
+                                layer_norm_eps=1e-5,
+                                p=1,
+                                channel_slice_list_normalized_loss=None,
+                                residual_model="convnext",
+                                use_conditioning=True,
+                                learn_residual=False,)
+
+        model = ScOT(scot_configs)
+    else:
+        model = core_checkpoint
+    
+
+    model = Muno(liftings = liftings, core=model, projections = projections, rollover_mode='rollout')
+    
     # model = Muno(liftings = model_blocks[0], core = model_blocks[1], projections = model_blocks[2], rollover_mode='autoreg')
     model.to(device=device)
     
@@ -333,12 +359,12 @@ def main():
     trainer.buildModel(model)
     trainer.to(device)
 
-    # trainer.save_paths = (
-    #     [], # [str(checkpoint_dir / f"lift_{idx}.pt") for idx in range(len(model_blocks[0]))],
-    #     str(checkpoint_dir / "core.pt"),
-    #     [], # [str(checkpoint_dir / f"proj_{idx}.pt") for idx in range(len(model_blocks[0]))]
-    # )
-    trainer.save_paths = str(checkpoint_dir / "core.pt")
+    trainer.save_paths = (
+        [str(checkpoint_dir / f"lift_{idx}.pt") for idx in range(len(liftings))],
+        str(checkpoint_dir / "core.pt"),
+        [str(checkpoint_dir / f"proj_{idx}.pt") for idx in range(len(projections))] # [], #
+    )
+    # trainer.save_paths = str(checkpoint_dir / "core.pt")
 
     trainer.buildOptimizer(
         n_dim=model_config.get("n_dim", 2),
