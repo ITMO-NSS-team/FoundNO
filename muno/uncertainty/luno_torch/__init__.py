@@ -28,6 +28,7 @@ from .ggn import (
     plan_low_rank_ggn,
     randomized_eigh,
 )
+from .kfac import KFACLastBlock, KFACTerms
 from .gp import FNOGPLastLayer, ParametricGaussianProcess
 from .jacobian import (
     LastFNOBlockWeightJacobian,

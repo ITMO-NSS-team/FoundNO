@@ -14,23 +14,40 @@ tasks:
     task_idx: 0
     task_type: in_distr
     luno:
+      # Метод UQ. ggn_target: lifting -- полная GGN лифтинга (d x d, ~3e4)
+      # сэмплированием выхода, калибруются prior_prec и температура;
+      # last-block -- низкоранговая GGN последнего блока (max_rank,
+      # ggn_oversample, ggn_power_iter) или ggn_method: kfac.
+      # max_rank: 0 -- метод Iso (только изотропный prior) для любого target.
+      ggn_target: lifting
+      # max_rank: 0
       jv_mode: forward
+      # fwd_batch 2 быстрее на колонку, чем 4 (прошлый прогон: 0.175 с против
+      # 0.215 с на колонку для CFD 16x128x128) и требует меньше памяти.
       fwd_batch: 2
       vjp_chunk: 16
-      max_rank: 25
-      ggn_method: randomized
-      ggn_oversample: 0
-      ggn_sample_batch: 4
-      # Авторитетный checkpoint in_distr-задачи; остальные задачи task_idx
-      # наследуют его автоматически.
-      ggn_checkpoint: weights/pdebench_2d_cfd/luno_turbo_inf_lifting_low_rank_terms.pkl
-      max_num_samples: 500
+      # GGN: 1000 сэмплов x ggn_mc котангенсов (обратных проходов). ggn_mc: 0 --
+      # авто, сэмплов x ggn_mc >= 1.1 d (здесь 34): оценка полного ранга.
+      # Оценка ~1.7 ч + eigh 29640x29640 (на GPU, при нехватке памяти -- на CPU).
+      max_num_samples: 1000
+      ggn_mc: 0
+      # Для лифтинга низкоранговый чекпойнт (как этот, ранг 25) игнорируется,
+      # и GGN считается заново; новый полный артефакт (~3.5 ГБ) пишется в папку
+      # задачи. Остальные задачи task_idx наследуют GGN in_distr-задачи.
+      #ggn_checkpoint: weights/pdebench_2d_cfd/luno_turbo_inf_lifting_low_rank_terms.pkl
       val_calib_frac: 0.8
+      # Одно число проб на всех задачах CFD: шум оценки std (~1/sqrt(2*16),
+      # около 18 %) одинаков, и метрики задач сравнимы между собой.
       diag_hutchinson: 16
-      calib_max_samples: 0
-      calib_grid_min: -3.0
-      calib_grid_max: 3.0
-      calib_grid_size: 50
+      # Калибровка: при полном базисе дисперсия считается отдельными пробами на
+      # каждого кандидата (25 x 16 JVP на сэмпл) -> 16 сэмплов (~20 мин); для
+      # двух скаляров (prior_prec, температура) по 1e6 элементов на сэмпл этого
+      # хватает. Грид шире: prior_prec конкурирует с собственными значениями
+      # GGN (до ~1e11), масштаб std задаёт температура.
+      calib_max_samples: 16
+      calib_grid_min: -2.0
+      calib_grid_max: 10.0
+      calib_grid_size: 25
       calib_objective: nll
     source:
       location: local
@@ -87,20 +104,14 @@ tasks:
   - name: pdebench_2d_cfd_M1.0
     task_idx: 0
     luno:
+      # GGN и prior_prec наследуются от in_distr-задачи pdebench_2d_cfd (тот же
+      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
+      # должен совпадать с in_distr-задачей.
+      ggn_target: lifting
       jv_mode: forward
-      fwd_batch: 4
-      vjp_chunk: 16
-      max_rank: 0
-      ggn_method: randomized
-      ggn_oversample: 0
-      max_num_samples: 2
+      fwd_batch: 2
       val_calib_frac: 0.8
-      diag_hutchinson: 50
-      calib_max_samples: 0
-      calib_grid_min: -3.0
-      calib_grid_max: 3.0
-      calib_grid_size: 50
-      calib_objective: nll
+      diag_hutchinson: 16
     source:
       location: local
       format: hdf5
@@ -156,20 +167,14 @@ tasks:
   - name: pdebench_2d_cfd_Eta1e-08
     task_idx: 0
     luno:
+      # GGN и prior_prec наследуются от in_distr-задачи pdebench_2d_cfd (тот же
+      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
+      # должен совпадать с in_distr-задачей.
+      ggn_target: lifting
       jv_mode: forward
-      fwd_batch: 4
-      vjp_chunk: 16
-      max_rank: 0
-      ggn_method: randomized
-      ggn_oversample: 0
-      max_num_samples: 2
+      fwd_batch: 2
       val_calib_frac: 0.8
-      diag_hutchinson: 50
-      calib_max_samples: 0
-      calib_grid_min: -3.0
-      calib_grid_max: 3.0
-      calib_grid_size: 50
-      calib_objective: nll
+      diag_hutchinson: 16
     source:
       location: local
       format: hdf5
@@ -229,20 +234,14 @@ tasks:
   - name: pdebench_2d_cfd_time
     task_idx: 0
     luno:
+      # GGN и prior_prec наследуются от in_distr-задачи pdebench_2d_cfd (тот же
+      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
+      # должен совпадать с in_distr-задачей.
+      ggn_target: lifting
       jv_mode: forward
-      fwd_batch: 4
-      vjp_chunk: 16
-      max_rank: 0
-      ggn_method: randomized
-      ggn_oversample: 0
-      max_num_samples: 2
+      fwd_batch: 2
       val_calib_frac: 0.8
-      diag_hutchinson: 50
-      calib_max_samples: 0
-      calib_grid_min: -3.0
-      calib_grid_max: 3.0
-      calib_grid_size: 50
-      calib_objective: nll
+      diag_hutchinson: 16
     source:
       location: local
       format: hdf5
@@ -253,7 +252,7 @@ tasks:
         Vx: Vx
         Vy: Vy
       url: https://darus.uni-stuttgart.de/api/access/datafile/164687
-      path: /home/user/Documents/FNO/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
+      path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
       axis_selection:
         0:
           linspace: [0, 60, 16]
@@ -301,20 +300,30 @@ tasks:
     task_idx: 4
     task_type: in_distr
     luno:
+      # Метод UQ. ggn_target: lifting -- полная GGN лифтинга (d x d, ~3e4)
+      # сэмплированием выхода, калибруются prior_prec и температура;
+      # last-block -- низкоранговая GGN последнего блока (max_rank,
+      # ggn_oversample, ggn_power_iter) или ggn_method: kfac.
+      # max_rank: 0 -- метод Iso (только изотропный prior) для любого target.
+      ggn_target: lifting
+      # max_rank: 0
       jv_mode: forward
+      # fwd_batch 2 быстрее на колонку, чем 4 (прошлый прогон: 0.175 с против
+      # 0.215 с на колонку для CFD 16x128x128) и требует меньше памяти.
       fwd_batch: 2
       vjp_chunk: 16
-      max_rank: 25
-      ggn_method: randomized
-      ggn_oversample: 10
+      # Train-выборка маленькая: 200 = все сэмплы; ggn_mc: 0 -- авто,
+      # сэмплов x ggn_mc >= 1.1 d.
       max_num_samples: 200
-      ggn_sample_batch: 4
+      ggn_mc: 0
       val_calib_frac: 0.8
+      # Задачи shear flow дешёвые (единицы сэмплов в val/test): больше проб --
+      # меньше шума std; одно число на всех задачах shear flow.
       diag_hutchinson: 50
       calib_max_samples: 0
-      calib_grid_min: -3.0
-      calib_grid_max: 3.0
-      calib_grid_size: 50
+      calib_grid_min: -2.0
+      calib_grid_max: 10.0
+      calib_grid_size: 25
       calib_objective: nll
     source:
       location: huggingface
@@ -376,20 +385,14 @@ tasks:
   - name: thewell_shear_flow_1e4_Schmidt_1e1
     task_idx: 4
     luno:
+      # GGN и prior_prec наследуются от in_distr-задачи thewell_shear_flow (тот же
+      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
+      # должен совпадать с in_distr-задачей.
+      ggn_target: lifting
       jv_mode: forward
-      fwd_batch: 4
-      vjp_chunk: 16
-      max_rank: 0
-      ggn_method: randomized
-      ggn_oversample: 0
-      max_num_samples: 2
+      fwd_batch: 2
       val_calib_frac: 0.8
       diag_hutchinson: 50
-      calib_max_samples: 0
-      calib_grid_min: -3.0
-      calib_grid_max: 3.0
-      calib_grid_size: 50
-      calib_objective: nll
     source:
       location: huggingface
       format: concat_thewell_hdf5
@@ -450,20 +453,14 @@ tasks:
   - name: thewell_shear_flow_1e5_Schmidt_1e0
     task_idx: 4
     luno:
+      # GGN и prior_prec наследуются от in_distr-задачи thewell_shear_flow (тот же
+      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
+      # должен совпадать с in_distr-задачей.
+      ggn_target: lifting
       jv_mode: forward
-      fwd_batch: 4
-      vjp_chunk: 16
-      max_rank: 0
-      ggn_method: randomized
-      ggn_oversample: 0
-      max_num_samples: 2
+      fwd_batch: 2
       val_calib_frac: 0.8
       diag_hutchinson: 50
-      calib_max_samples: 0
-      calib_grid_min: -3.0
-      calib_grid_max: 3.0
-      calib_grid_size: 50
-      calib_objective: nll
     source:
       location: huggingface
       format: concat_thewell_hdf5
@@ -524,20 +521,14 @@ tasks:
   - name: thewell_shear_flow_1e5_Schmidt_1e1
     task_idx: 4
     luno:
+      # GGN и prior_prec наследуются от in_distr-задачи thewell_shear_flow (тот же
+      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
+      # должен совпадать с in_distr-задачей.
+      ggn_target: lifting
       jv_mode: forward
-      fwd_batch: 4
-      vjp_chunk: 16
-      max_rank: 0
-      ggn_method: randomized
-      ggn_oversample: 0
-      max_num_samples: 2
+      fwd_batch: 2
       val_calib_frac: 0.8
       diag_hutchinson: 50
-      calib_max_samples: 0
-      calib_grid_min: -3.0
-      calib_grid_max: 3.0
-      calib_grid_size: 50
-      calib_objective: nll
     source:
       location: huggingface
       format: concat_thewell_hdf5
@@ -599,20 +590,14 @@ tasks:
   - name: thewell_shear_flow_1e4_Schmidt_1e-1
     task_idx: 4
     luno:
+      # GGN и prior_prec наследуются от in_distr-задачи thewell_shear_flow (тот же
+      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
+      # должен совпадать с in_distr-задачей.
+      ggn_target: lifting
       jv_mode: forward
-      fwd_batch: 4
-      vjp_chunk: 16
-      max_rank: 0
-      ggn_method: randomized
-      ggn_oversample: 0
-      max_num_samples: 2
+      fwd_batch: 2
       val_calib_frac: 0.8
       diag_hutchinson: 50
-      calib_max_samples: 0
-      calib_grid_min: -3.0
-      calib_grid_max: 3.0
-      calib_grid_size: 50
-      calib_objective: nll
     source:
       location: huggingface
       format: concat_thewell_hdf5
@@ -674,20 +659,14 @@ tasks:
   - name: thewell_shear_flow_time
     task_idx: 4
     luno:
+      # GGN и prior_prec наследуются от in_distr-задачи thewell_shear_flow (тот же
+      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
+      # должен совпадать с in_distr-задачей.
+      ggn_target: lifting
       jv_mode: forward
-      fwd_batch: 4
-      vjp_chunk: 16
-      max_rank: 0
-      ggn_method: randomized
-      ggn_oversample: 0
-      max_num_samples: 2
+      fwd_batch: 2
       val_calib_frac: 0.8
       diag_hutchinson: 50
-      calib_max_samples: 0
-      calib_grid_min: -3.0
-      calib_grid_max: 3.0
-      calib_grid_size: 50
-      calib_objective: nll
     source:
       location: huggingface
       format: concat_thewell_hdf5
@@ -749,20 +728,15 @@ tasks:
   - name: thewell_shear_flow_space
     task_idx: 4
     luno:
+      # GGN и prior_prec наследуются от in_distr-задачи thewell_shear_flow (тот же
+      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
+      # должен совпадать с in_distr-задачей.
+      ggn_target: lifting
       jv_mode: forward
-      fwd_batch: 4
-      vjp_chunk: 16
-      max_rank: 0
-      ggn_method: randomized
-      ggn_oversample: 0
-      max_num_samples: 2
+      # Полное разрешение 256x512: в прошлом прогоне OOM при fwd_batch 4.
+      fwd_batch: 1
       val_calib_frac: 0.8
       diag_hutchinson: 50
-      calib_max_samples: 0
-      calib_grid_min: -3.0
-      calib_grid_max: 3.0
-      calib_grid_size: 50
-      calib_objective: nll
     source:
       location: huggingface
       format: concat_thewell_hdf5
@@ -778,9 +752,9 @@ tasks:
         0:
           linspace: [0, 20, 16]
         1:
-          slice: [0, 256, 1]
+          slice: [0, 256, 2]
         2:
-          slice: [0, 512, 1]
+          slice: [0, 512, 2]
       files:
         - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
         - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5

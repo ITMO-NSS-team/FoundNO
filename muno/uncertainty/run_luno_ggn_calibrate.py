@@ -29,7 +29,6 @@ import torch
 from torch.func import functional_call
 from torch.utils.data import DataLoader, Subset
 
-from scipy.stats import spearmanr
 import dill
 
 from muno.data.benchmarks.datasets import MultiPhysicsDataset
@@ -48,7 +47,7 @@ from luno_torch.adapter import (
     ref_state_dict,
     split_wrapper,
 )
-from luno_torch.affine import AffineLastBlock
+from luno_torch.affine import AffineLastBlock, AffineLastBlockError, LastBlockSuffix
 from luno_torch.calibrate import (
     STD_REL_FLOOR,
     chi_squared,
@@ -57,12 +56,22 @@ from luno_torch.calibrate import (
     std_valid_mask,
 )
 from luno_torch.factory import create_luno_cov
-from luno_torch.ggn import GGNMatvec, LiftingGGNMatvec, LowRankTerms, low_rank_ggn
+from metrics_uq import log_rmse_over_rmv, normalized_ause, reliability_bin_sums
+from luno_torch.ggn import (
+    GGNMatvec,
+    LiftingGGNMatvec,
+    LowRankTerms,
+    auto_ggn_mc,
+    low_rank_ggn,
+    sampled_full_ggn,
+)
+from luno_torch.kfac import KFACLastBlock, KFACTerms
 from luno_torch.jacobian import (
     LastFNOBlockWeightJacobian,
     LiftingWeightJacobian,
     check_jacobian,
     default_check_tol,
+    _var_of_congruence_hutchinson,
     sample_congruence_probes,
     var_from_congruence_probes,
     var_of_congruence,
@@ -76,14 +85,34 @@ from check_split import _resolve_key_owner
 DTYPE = torch.float32
 CDTYPE = torch.complex64
 
-# Percentile levels for the per-sample sqrt(chi2) metric (percent over samples).
-SQRT_CHI2_PERCENTILES = (5, 25, 50, 75, 95)
 
-# Перцентили элементного sqrt(chi2) внутри одного канала (percent по элементам
-# канала, затем среднее по сэмплам). Отдельная константа, не из
-# SQRT_CHI2_PERCENTILES: там перцентили берутся МЕЖДУ сэмплами. Для каждого
-# уровня -- свой набор поканальных метрик и свой valid-счётчик.
-PER_CHANNEL_PCT = (80, 90, 99)
+def _install_pickle_compat():
+    """Совместимость чекпойнтов, сохранённых dill вместе с исходным модулем.
+
+    Адаптеры вроде ``PostLiftMambaLifting`` сериализованы dill целиком, со
+    ссылками на модуль ``muno/models/mamba_fno.py``, а тот импортирует
+    ``torch.utils.data.Dataset``. Старые torch держали в
+    ``torch.utils.data.dataset`` типовую переменную ``T_co``; в новых её нет, и
+    unpickle падает с ``Can't get attribute 'T_co'``. Подставляем эквивалент,
+    только если атрибута нет: на старых torch это no-op.
+    """
+    import typing
+
+    import torch.utils.data.dataset as _tud
+
+    if not hasattr(_tud, "T_co"):
+        _tud.T_co = typing.TypeVar("T_co", covariant=True)
+
+# Квантили элементного sqrt(chi2) = |остаток|/std внутри канала (и внутри каждой
+# пары (канал, t)), затем среднее по сэмплам.
+PER_CHANNEL_PCT = (50, 75, 80, 90, 99)
+
+# Число бинов предсказанного std для ENCE и кривой надёжности (равные доли
+# пикселей внутри каждой пары (канал, t); на поле 128x128 -- ~1600 точек на бин).
+ENCE_BINS = 10
+
+# Те же квантили для |N(0, 1)| -- ориентиры идеально откалиброванного гаусса.
+GAUSS_ABS_QUANTILES = {50: 0.674, 75: 1.150, 80: 1.282, 90: 1.645, 99: 2.576}
 
 
 # ----------------------------------------------------------------------------
@@ -124,6 +153,12 @@ def parse_args():
                    help="Сколько колонок J@W считать одним батчем через vmap "
                         "(только для --jv-mode forward). Больше -- быстрее, но "
                         "кратно больше памяти.")
+    p.add_argument("--jacobian-check", action="store_true",
+                   help="Перед GGN сравнить J*v (forward-режим) с reverse-строками "
+                        "на одном train-сэмпле и упасть при расхождении. Нужен при "
+                        "смене ядра (трансформер, CNO, ...) или версии torch: "
+                        "неподдерживаемая forward-AD операция проявится здесь, а "
+                        "не молча кривой кривизной.")
     p.add_argument("--check-probes", type=int, default=3,
                    help="Сколько строк J использовать в стартовом self-check.")
     p.add_argument("--check-tol", type=float, default=None,
@@ -155,8 +190,13 @@ def parse_args():
                         "считается как обычно (сохранение артефакта тоже). Битый или "
                         "несовместимый (другая d) файл -- ошибка.")
     p.add_argument("--ggn-method", type=str, default="randomized",
-                   choices=["randomized", "skerch"],
-                   help="Метод низкоранговой аппроксимации GGN. "
+                   choices=["randomized", "skerch", "kfac"],
+                   help="Метод аппроксимации GGN. 'kfac' -- НЕ низкоранговая, а "
+                        "кронекерова кривизна по Фурье-модам последнего блока "
+                        "(luno_torch.kfac): один проход по сэмплам, без буферов "
+                        "(d, rank); только --ggn-target last-block, числа с "
+                        "low-rank не совпадают (другая аппроксимация). Остальные "
+                        "-- низкоранговые: "
                         "'randomized' (по умолчанию) держит 2 полноразмерных "
                         "буфера и доходит до rank ~50 на GPU ~16 ГиБ; 'skerch' "
                         "(seigh) держит 3 буфера плюс блок шума, поэтому при "
@@ -167,6 +207,29 @@ def parse_args():
                         "пик памяти линейно растёт вместе с q. Единственный "
                         "параметр, реально влияющий на память скетча: "
                         "--sketch-blocksize у skerch на ro_sketch не влияет.")
+    p.add_argument("--ggn-power-iter", type=int, default=2,
+                   help="Число степенных итераций randomized-скетча. Проходов по "
+                        "train-сэмплам -- power_iter + 1 (финальная проекция "
+                        "берётся из того же скетча, Nystrom). 2 (по умолчанию) "
+                        "-- точность прежней схемы за 3 прохода вместо 4; 1 -- "
+                        "2 прохода, ведущие собственные пары точны, в плоском "
+                        "хвосте спектра ошибка до процентов.")
+    p.add_argument("--prefix-cache", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Для --ggn-target last-block: считать замороженный "
+                        "префикс (лифтинг + блоки до последнего) один раз на "
+                        "сэмпл и дифференцировать только хвост сети. Тот же "
+                        "якобиан, меньше работы. --no-prefix-cache -- прежний "
+                        "путь через всю сеть.")
+    p.add_argument("--ggn-mc", type=int, default=0,
+                   help="--ggn-target lifting: число случайных котангенсов "
+                        "(обратных проходов) на train-сэмпл для полной "
+                        "сэмплированной GGN. 0 -- авто: n_samples * n_mc >= "
+                        "1.1 d, чтобы оценка была полного ранга.")
+    p.add_argument("--kfac-mc", type=int, default=8,
+                   help="Только --ggn-method kfac: число случайных котангенсов "
+                        "(backward через хвост сети) на сэмпл для фактора "
+                        "градиентов.")
     p.add_argument("--max-num-samples", type=int, default=25,
                    help="Макс. число сэмплов для GGN (как max_num_of_samples в luno).")
     p.add_argument("--ggn-sample-batch", type=int, default=4,
@@ -214,12 +277,16 @@ def _optional_str(value):
 # стартового self-check (--check-probes/--check-tol), которые остаются общими.
 # ggn_checkpoint -- исключение: это явный per-task путь, а не путь по task_idx.
 PER_TASK_LUNO_KEYS = {
+    "ggn_target": str,
     "jv_mode": str,
     "fwd_batch": int,
     "vjp_chunk": int,
     "max_rank": int,
     "ggn_method": str,
     "ggn_oversample": int,
+    "ggn_power_iter": int,
+    "kfac_mc": int,
+    "ggn_mc": int,
     "max_num_samples": int,
     "ggn_sample_batch": int,
     "ggn_checkpoint": _optional_str,
@@ -233,8 +300,9 @@ PER_TASK_LUNO_KEYS = {
 }
 
 _LUNO_KEY_CHOICES = {
+    "ggn_target": ("last-block", "lifting"),
     "jv_mode": ("forward", "affine"),
-    "ggn_method": ("randomized", "skerch"),
+    "ggn_method": ("randomized", "skerch", "kfac"),
     "calib_objective": ("chi2", "nll"),
 }
 
@@ -424,10 +492,14 @@ def load_prior_prec_from_results(directory, task_idx, ggn_target="last-block"):
             f"Укажите папку прогона in_distr-задачи этого task_idx."
         )
     path, results = found[0]
+    temperature = results.get("temperature")
     print(f"[prior_prec] из {path} (task_idx={task_idx}, "
           f"ggn_target={ggn_target}): "
-          f"prior_prec={float(results['prior_prec']):.6e}")
-    return float(results["prior_prec"])
+          f"prior_prec={float(results['prior_prec']):.6e}"
+          + (f", temperature={float(temperature):.6e}" if temperature is not None else ""))
+    return float(results["prior_prec"]), (
+        float(temperature) if temperature is not None else None
+    )
 
 
 def find_indexed_file(directory, prefix, suffix, task_idx):
@@ -586,10 +658,21 @@ class GGNSetup:
     matvec_cls: type
     affine: object | None
     artifact_prefix: str
+    # bind(x) -> (model_fn, state): пер-сэмпловая привязка, срезающая
+    # замороженный префикс (см. luno_torch.affine.LastBlockSuffix). None --
+    # якобиан идёт через полный model_fn.
+    bind: callable | None = None
+    # KFAC-контекст (--ggn-method kfac): вместо LowRankTerms по пайплайну идут
+    # KFACTerms, а дисперсию считает kfac.mean_and_var.
+    kfac: object | None = None
+    # Лифтинг: полная GGN d x d сэмплированием выхода (luno_torch.ggn.
+    # sampled_full_ggn) вместо низкорангового скетча; калибруется вместе с
+    # температурой.
+    full_sampled: bool = False
 
 
-def build_ggn_setup(args, core, core_wrapper: TorchFNOWrapper, core_w0: torch.Tensor,
-                    lifting, projection) -> GGNSetup:
+def build_ggn_setup(args, core, core_wrapper: TorchFNOWrapper | None,
+                    core_w0: torch.Tensor | None, lifting, projection) -> GGNSetup:
     """Собирает model_fn/w0/классы якобиана для выбранного --ggn-target.
 
     lifting-режим использует :class:`TorchLiftingWrapper`: все параметры
@@ -597,6 +680,11 @@ def build_ggn_setup(args, core, core_wrapper: TorchFNOWrapper, core_w0: torch.Te
     декомпозиция для лифтинга пока не реализована, поэтому ``jv_mode`` там
     обязан быть ``forward``.
     """
+    use_kfac = args.ggn_method == "kfac"
+    if use_kfac and args.ggn_target != "last-block":
+        raise ValueError(
+            "--ggn-method kfac реализован только для --ggn-target last-block."
+        )
     if args.ggn_target == "lifting":
         if args.jv_mode != "forward":
             raise ValueError(
@@ -635,13 +723,43 @@ def build_ggn_setup(args, core, core_wrapper: TorchFNOWrapper, core_w0: torch.Te
             matvec_cls=LiftingGGNMatvec,
             affine=None,
             artifact_prefix="lifting_low_rank_terms",
+            full_sampled=True,
         )
 
+    if core_wrapper is None:
+        raise ValueError(
+            "--ggn-target last-block требует FNO-сплит ядра (TorchFNOWrapper), "
+            "а он не построен."
+        )
     model_fn = make_model_fn(core_wrapper, lifting, projection)
     affine = (
         AffineLastBlock(core_wrapper.model, projection, core_wrapper.keys, dtype=DTYPE)
         if args.jv_mode == "affine" else None
     )
+    # В forward-режиме срезаем замороженный префикс: структуру блока проверяет
+    # тот же AffineLastBlock. Если блок устроен иначе (norm, preactivation,
+    # факторизованный вес...) -- честно идём через всю сеть.
+    kfac = None
+    if use_kfac:
+        # Здесь отката нет: без аффинной структуры блока KFAC по модам не определён.
+        kfac = KFACLastBlock(
+            AffineLastBlock(
+                core_wrapper.model, projection, core_wrapper.keys, dtype=DTYPE
+            ),
+            model_fn, core_w0,
+        )
+    bind = None
+    if not use_kfac and args.jv_mode == "forward" and getattr(args, "prefix_cache", True):
+        try:
+            bind = LastBlockSuffix(
+                AffineLastBlock(
+                    core_wrapper.model, projection, core_wrapper.keys, dtype=DTYPE
+                ),
+                model_fn, core_w0,
+            ).bind
+            print("[prefix-cache] включён: префикс сети считается один раз на сэмпл.")
+        except AffineLastBlockError as exc:
+            print(f"[prefix-cache] недоступен, якобиан идёт через всю сеть: {exc}")
     return GGNSetup(
         target="last-block",
         model_fn=model_fn,
@@ -650,7 +768,9 @@ def build_ggn_setup(args, core, core_wrapper: TorchFNOWrapper, core_w0: torch.Te
         jacobian_cls=LastFNOBlockWeightJacobian,
         matvec_cls=GGNMatvec,
         affine=affine,
-        artifact_prefix="low_rank_terms",
+        artifact_prefix="kfac_terms" if use_kfac else "low_rank_terms",
+        bind=bind,
+        kfac=kfac,
     )
 
 
@@ -726,8 +846,11 @@ def load_task_adapters(args, task_idx, asset_cache):
         )
     print(f"[assets] task_idx={task_idx}: lifting={lift_path.name}, "
           f"projection={proj_path.name}")
-    lifting = torch.load(lift_path, pickle_module=dill)
-    projection = torch.load(proj_path, pickle_module=dill)
+    _install_pickle_compat()
+    # map_location="cpu": чекпойнты сохранены с CUDA-тензорами; на нужное
+    # устройство адаптеры переносятся в run_one_task.
+    lifting = torch.load(lift_path, pickle_module=dill, map_location="cpu")
+    projection = torch.load(proj_path, pickle_module=dill, map_location="cpu")
     asset_cache[key] = (lifting, projection)
     return lifting, projection
 
@@ -835,7 +958,8 @@ def raw_from_normalized(mean_norm, std_norm, out_normalizer, out_shape):
 # ----------------------------------------------------------------------------
 
 def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor, affine,
-                         mode="forward", fwd_batch=4, matvec_cls=GGNMatvec):
+                         mode="forward", fwd_batch=4, matvec_cls=GGNMatvec,
+                         bind=None):
     xs = []
     for sample in tqdm(
         iter_samples(train_loader, args.max_num_samples),
@@ -857,7 +981,7 @@ def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor, affin
     ggn_mv = matvec_cls(
         model_fn, w0, xs, affine=affine, mode=mode, fwd_batch=fwd_batch,
         loss_fn="mse", factor=1.0, vjp_chunk=args.vjp_chunk,
-        sample_batch_size=sample_batch_size,
+        sample_batch_size=sample_batch_size, bind=bind,
     )
     _print_mem("ggn_mv", w0.device)
 
@@ -869,9 +993,78 @@ def compute_low_rank_ggn(args, model_fn, w0, train_loader, data_processor, affin
         device=str(w0.device),
         dtype=w0.dtype,
         fwd_batch=fwd_batch,
+        power_iter=getattr(args, "ggn_power_iter", 2),
     )
     print(f"[GGN] low-rank terms: U={tuple(low_rank.U.shape)} S={tuple(low_rank.S.shape)}")
     return low_rank
+
+
+def compute_kfac_terms(args, kfac, train_loader, data_processor):
+    """KFAC-факторы последнего блока по train-сэмплам (один проход)."""
+    xs = []
+    for sample in tqdm(
+        iter_samples(train_loader, args.max_num_samples),
+        total=args.max_num_samples,
+        desc="[KFAC] загрузка сэмплов",
+        unit="smp",
+        leave=False,
+    ):
+        sample = preprocess_sample(data_processor, sample)
+        xs.append(sample[0]["x"].detach().cpu())
+    print(f"[KFAC] собрано {len(xs)} сэмплов из train loader.")
+    assert xs, "No samples collected for KFAC."
+    terms = kfac.fit(xs, n_mc=getattr(args, "kfac_mc", 8), seed=0)
+    print(f"[KFAC] факторы: мод={terms.num_modes} {tuple(terms.mode_shape)}, "
+          f"A={tuple(terms.QA.shape)} B={tuple(terms.QB.shape)}, "
+          f"сэмплов={terms.n_samples}, n_mc={getattr(args, 'kfac_mc', 8)}")
+    return terms
+
+
+def compute_sampled_ggn(args, model_fn, w0, train_loader, data_processor,
+                        jacobian_cls, fwd_batch=2, bind=None):
+    """Полная GGN лифтинга сэмплированием выхода (один проход по train)."""
+    xs = []
+    for sample in tqdm(
+        iter_samples(train_loader, args.max_num_samples),
+        total=args.max_num_samples, desc="[GGN] загрузка сэмплов",
+        unit="smp", leave=False,
+    ):
+        sample = preprocess_sample(data_processor, sample)
+        xs.append(sample[0]["x"].detach().cpu())
+    print(f"[GGN] собрано {len(xs)} сэмплов из train loader.")
+    assert xs, "No samples collected for GGN."
+    n_mc = getattr(args, "ggn_mc", 0)
+    if n_mc <= 0:
+        n_mc = auto_ggn_mc(w0.numel(), len(xs), fwd_batch)
+        print(f"[GGN] ggn_mc=auto -> {n_mc} котангенсов на сэмпл")
+    elif len(xs) * n_mc < w0.numel():
+        print(f"[GGN] ВНИМАНИЕ: сэмплов x ggn_mc = {len(xs) * n_mc:,} < d = "
+              f"{w0.numel():,}: оценка GGN неполного ранга, в остальных "
+              f"направлениях работает только prior.")
+    return sampled_full_ggn(
+        model_fn, w0, xs, jacobian_cls, n_mc=n_mc, fwd_batch=fwd_batch,
+        vjp_chunk=args.vjp_chunk, bind=bind,
+    )
+
+
+def load_kfac_terms(path, w0):
+    """Читает KFACTerms из pickle; ``None``, если файла нет (как load_low_rank_ggn)."""
+    p = rmi.resolve_path(path)
+    if not p.is_file():
+        print(f"[KFAC] checkpoint: файла нет ({p}); считаю факторы как обычно.")
+        return None
+    with open(p, "rb") as f:
+        terms = pickle.load(f)
+    if not isinstance(terms, KFACTerms):
+        raise TypeError(
+            f"KFAC checkpoint: ожидался KFACTerms, получен "
+            f"{type(terms).__name__} ({p}). Для --ggn-method kfac нужен "
+            f"*_kfac_terms.pkl, а не low-rank артефакт."
+        )
+    terms = terms.to(device=w0.device, dtype=w0.dtype)
+    print(f"[KFAC] загружен из {p}: мод={terms.num_modes}, "
+          f"сэмплов={terms.n_samples}, device={terms.QA.device}")
+    return terms
 
 
 def load_low_rank_ggn(path, w0):
@@ -921,13 +1114,31 @@ def load_low_rank_ggn(path, w0):
 def _batch_predictive_stats(model_fn, w0, weight_cov, x, out_normalizer,
                             num_output_channels, affine, mode="forward",
                             fwd_batch=4, vjp_chunk=64, diag_probes=0,
-                            jacobian_cls=LastFNOBlockWeightJacobian):
-    """(mean_raw, std_raw) для одного входного тензора x в raw-пространстве."""
-    with torch.no_grad():
-        out_shape = model_fn(x, w0).shape
+                            jacobian_cls=LastFNOBlockWeightJacobian,
+                            bind=None, out_shape=None, kfac=None):
+    """(mean_raw, std_raw) для одного входного тензора x в raw-пространстве.
+
+    При ``kfac`` (KFACLastBlock) ``weight_cov`` -- пара ``(KFACTerms, prior_prec)``.
+
+    ``out_shape`` -- форма выхода модели ``(B, C_out, ...)``; у регрессии она
+    совпадает с формой target, поэтому вызывающий код передаёт её готовой и
+    отдельный forward ради формы не нужен. ``bind`` -- см. ``GGNSetup.bind``.
+    """
+    if out_shape is None:
+        with torch.no_grad():
+            out_shape = model_fn(x, w0).shape
+    if kfac is not None:
+        terms, prior_prec = weight_cov
+        mean_norm, var = kfac.mean_and_var(
+            x, terms, [float(prior_prec)], n_probe=diag_probes, chunk=fwd_batch,
+        )
+        return raw_from_normalized(
+            mean_norm, torch.sqrt(var[0]), out_normalizer, out_shape
+        )
+    fn, state = bind(x) if bind is not None else (model_fn, x)
     jac = jacobian_cls(
-        model_fn,
-        x,
+        fn,
+        state,
         w0,
         affine=affine,
         mode=mode,
@@ -951,8 +1162,23 @@ def _batch_predictive_stats(model_fn, w0, weight_cov, x, out_normalizer,
 def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
                          out_normalizer, val_loader, affine, objective_name="chi2",
                          mode="forward", fwd_batch=4,
-                         jacobian_cls=LastFNOBlockWeightJacobian):
+                         jacobian_cls=LastFNOBlockWeightJacobian, bind=None,
+                         kfac=None, temperature=False):
     """Калибровка scalar prior_prec на сэмплах калибровочной части val.
+
+    ``temperature=True`` (полная GGN лифтинга): вместе с ``prior_prec``
+    подбирается температура ``T``, ``Sigma = T (prec I + G)^{-1}``. При полной
+    кривизне ``prior_prec`` влияет только на слабо определённые направления,
+    и общий масштаб std ему не подвластен. Для NLL оптимальная ``T`` при
+    фиксированном кандидате -- в замкнутом виде, ``T* = mean(r²/σ²)`` по
+    валидным элементам, поэтому лишних проходов нет: кандидат оценивается по
+    NLL при своей ``T*``. Только для ``objective="nll"`` (при ``chi2``
+    температура делает chi2 = 1 у любого кандидата).
+
+    Путь оценки дисперсии выбирается по стоимости: общие пробы ``(A, B, W)``
+    стоят ``k + n_probe`` JVP на сэмпл (``k`` -- столбцов ``U``), пробы на
+    кандидата -- ``n_grid * n_probe``. При полном базисе (``k = d``) второй
+    дешевле; шум ``Z`` общий для всех кандидатов (common random numbers).
 
     ``val_loader`` здесь -- калибровочная часть val (см. ``--val-calib-frac``);
     сколько из неё реально взять, решает ``--calib-max-samples`` (0 -- все).
@@ -988,11 +1214,29 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
     # cov строится по кандидату, а не по сэмплу: linverse переиспользует тот же
     # low_rank.U, поэтому все объекты держат один и тот же буфер (0.55 ГиБ при
     # rank 5) и весят O(k) каждый.
-    covs = [create_luno_cov(low_rank, {"prior_prec": p}) for p in grid]
+    # KFAC: ковариация в пространстве весов не строится вовсе, дисперсию по
+    # всему гриду разом отдаёт kfac.mean_and_var (общий шум на всех кандидатах).
+    if kfac is not None:
+        if n_probe <= 0:
+            raise SystemExit("--ggn-method kfac требует --diag-hutchinson > 0.")
+        covs = [None] * len(grid)
+    else:
+        covs = [create_luno_cov(low_rank, {"prior_prec": p}) for p in grid]
     n_grid = len(covs)
+    if temperature and objective_name != "nll":
+        raise SystemExit(
+            "Калибровка с температурой (полная GGN лифтинга) поддерживает только "
+            "--calib-objective nll: при chi2 температура делает chi2 = 1 у любого "
+            "кандидата prior_prec."
+        )
+    k_cols = 0 if kfac is not None else int(low_rank.U.shape[1])
+    per_candidate = (kfac is None and n_probe > 0
+                     and k_cols + n_probe > n_grid * n_probe)
     _print_mem("calib_covs", w0.device)
+    # Суммы по ВАЛИДНЫМ элементам на кандидата: r²/σ² (chi2), log σ и их число.
+    # NLL собирается из них в конце (с температурой или без).
     chi2_acc = torch.zeros(n_grid, dtype=torch.float64, device=w0.device)
-    nll_acc = torch.zeros(n_grid, dtype=torch.float64, device=w0.device)
+    logstd_acc = torch.zeros(n_grid, dtype=torch.float64, device=w0.device)
     # Число ВАЛИДНЫХ по std элементов на кандидата грида: std масштабируется
     # sqrt(prior_prec), поэтому маска (и знаменатель objective) у кандидатов
     # разные. Элементы с std==0/nan и near-zero std отбрасываются -- иначе
@@ -1001,6 +1245,10 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
     n_elem_total = 0
     num_output_channels = wrapper.num_output_channels
     how = f"Хатчинсон n_probe={n_probe}" if n_probe > 0 else "точный обратный путь"
+    if per_candidate:
+        how += f", пробы на кандидата ({n_grid * n_probe} JVP/сэмпл вместо {k_cols + n_probe})"
+    if temperature:
+        how += ", + температура"
     print(f"\n[calibrate] prior_prec: {n_calib}/{n_total} сэмплов calib-loader, "
           f"{n_grid} кандидатов грида, objective={objective_name}, {how}, "
           f"fwd_batch={fwd_batch}")
@@ -1012,29 +1260,46 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
             x = sample[0]["x"]
             target_raw = sample[0]["y"]
             target = target_raw.reshape(-1)
-            out_shape = None  # считается лениво, один forward на сэмпл
-            jac = jacobian_cls(
-                model_fn, x, w0, affine=affine, mode=mode, fwd_batch=fwd_batch,
-                num_output_channels=num_output_channels,
-                vjp_chunk=args.vjp_chunk,
-            )
+            # Форма выхода модели совпадает с формой target (регрессия поле в
+            # поле), поэтому отдельный forward ради неё не нужен.
+            out_shape = target_raw.shape
+            jac = var_grid = None
+            if kfac is None:
+                fn, state = bind(x) if bind is not None else (model_fn, x)
+                jac = jacobian_cls(
+                    fn, state, w0, affine=affine, mode=mode, fwd_batch=fwd_batch,
+                    num_output_channels=num_output_channels,
+                    vjp_chunk=args.vjp_chunk,
+                )
             A = B = W = None
             try:
-                # fx == f(x, w0) уже ПЛОСКИЙ (см. _flat_fn), поэтому из него
-                # нельзя брать out_shape: нормализатору нужна форма
-                # (B, C_out, ...) для поканального broadcasting, иначе
-                # (65536,) * (4,1,1,1) раздувается до (4,1,1,65536) и chi2
-                # падает на несовпадении размеров с target. Форму берём отдельным
-                # forward'ом -- один раз на сэмпл, как в _batch_predictive_stats.
-                if out_shape is None:
-                    with torch.no_grad():
-                        out_shape = model_fn(x, w0).shape
-                mean_norm = jac.fx.reshape(-1)
+                # fx == f(x, w0) уже ПЛОСКИЙ (см. _flat_fn), а нормализатору
+                # нужна форма (B, C_out, ...) для поканального broadcasting --
+                # она берётся из target выше.
+                if kfac is not None:
+                    mean_norm, var_grid = kfac.mean_and_var(
+                        x, low_rank, grid, n_probe=n_probe, chunk=fwd_batch,
+                    )
+                else:
+                    mean_norm = jac.fx.reshape(-1)
+                if mean_norm.numel() != target.numel():
+                    raise RuntimeError(
+                        f"Размер выхода модели ({mean_norm.numel()}) не совпал с "
+                        f"target ({target.numel()}, форма {tuple(target_raw.shape)})."
+                    )
                 scale = torch.sqrt(torch.mean(target.double() ** 2))
-                if n_probe > 0:
+                Z = None
+                if per_candidate:
+                    Z = torch.empty(w0.numel(), n_probe, dtype=w0.dtype,
+                                    device=w0.device).bernoulli_(0.5).mul_(2).sub_(1)
+                elif kfac is None and n_probe > 0:
                     A, B, W = sample_congruence_probes(jac, covs[0].U, n_probe)
                 for i, cov in enumerate(covs):
-                    if n_probe > 0:
+                    if kfac is not None:
+                        var_norm = var_grid[i]
+                    elif per_candidate:
+                        var_norm = _var_of_congruence_hutchinson(jac, cov, n_probe, Z=Z)
+                    elif n_probe > 0:
                         var_norm = var_from_congruence_probes(A, B, W, cov)
                     else:
                         var_norm = var_of_congruence(jac, cov)
@@ -1050,21 +1315,16 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
                         continue
                     sr_v = sr[valid].double()
                     std_v = std_raw[valid].double()
-                    if objective_name == "chi2":
-                        chi2_acc[i] += (sr_v ** 2).sum()
-                    else:
-                        nll_acc[i] += (
-                            0.5 * sr_v ** 2
-                            + std_v.log()
-                            + 0.5 * math.log(2.0 * math.pi)
-                        ).sum()
+                    chi2_acc[i] += (sr_v ** 2).sum()
+                    logstd_acc[i] += std_v.log().sum()
                     n_valid_acc[i] += n_valid
                 n_elem_total += target.numel()
             finally:
                 # Граф forward-замыкания (model_fn, x) держится за self, а в
                 # точном пути -- ещё и обратный граф. Освобождаем сразу: сам jac
                 # подавится привязкой в начале следующей итерации.
-                jac._release_vjp()
+                if jac is not None:
+                    jac._release_vjp()
             bar.update(1)
     finally:
         bar.close()
@@ -1075,10 +1335,16 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
             f"{n_total}, --calib-max-samples={args.calib_max_samples}."
         )
     n_valid_safe = n_valid_acc.clamp_min(1.0)
+    half_log_2pi = 0.5 * math.log(2.0 * math.pi)
+    temps = None
     if objective_name == "chi2":
         objective = (chi2_acc / n_valid_safe - 1.0).abs()
+    elif temperature:
+        # NLL(T) = 0.5 chi2/T + 0.5 log T + mean log σ + const -> T* = mean chi2.
+        temps = chi2_acc / n_valid_safe
+        objective = 0.5 + 0.5 * temps.log() + logstd_acc / n_valid_safe + half_log_2pi
     else:
-        objective = nll_acc / n_valid_safe
+        objective = (0.5 * chi2_acc + logstd_acc) / n_valid_safe + half_log_2pi
     if not bool(torch.isfinite(objective).all()):
         raise RuntimeError(
             f"Objective калибровки не конечен ({objective.tolist()}, "
@@ -1087,11 +1353,19 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
         )
     best_idx = int(objective.argmin())
     best_prec = grid[best_idx]
-    print(f"[calibrate] best prior_prec={best_prec.item():.6e}, "
+    out = {"prior_prec": best_prec, "objective": objective_name,
+           "samples": n_calib, "diag_probes": n_probe}
+    t_str = ""
+    if temps is not None:
+        out["temperature"] = float(temps[best_idx])
+        t_str = f", temperature={out['temperature']:.6e}"
+    edge = (" -- ВНИМАНИЕ: оптимум на краю грида, расширьте "
+            "calib_grid_min/calib_grid_max"
+            if best_idx in (0, n_grid - 1) else "")
+    print(f"[calibrate] best prior_prec={best_prec.item():.6e}{t_str}, "
           f"{objective_name}={float(objective[best_idx]):.6e} "
-          f"(на {n_calib} сэмплах, {n_grid} кандидатов)")
-    return {"prior_prec": best_prec, "objective": objective_name,
-            "samples": n_calib, "diag_probes": n_probe}
+          f"(на {n_calib} сэмплах, {n_grid} кандидатов){edge}")
+    return out
 
 
 def mask_image_outliers(x, vmax=10.0):
@@ -1137,28 +1411,11 @@ def save_luno_images(pred, band, target, output_prefix, batch_idx):
                    "luno sqrt(chi2)")
 
 
-def spearman_corr(a, b) -> float:
-    """Коэффициент корреляции Спирмена по двум плоским векторам одного сэмпла.
-
-    Оба тензора неподвижно переводятся в numpy (rank-корреляция считается по
-    рангам, точность float32 достаточно). Если кто-то из векторов вырожден
-    (min == max), rho не определён: возвращаем nan БЕЗ вызова scipy, иначе
-    scipy выпустит ConstantInputWarning на каждом сэмпле -- то есть на сотни
-    строк в логе. Вырожденные сэмплы выбрасываются из среднего (см.
-    mean_finite), о чём evaluate_luno печатает spearman_valid=k/n.
-    """
-    a = a.detach().reshape(-1).float().cpu().numpy()
-    b = b.detach().reshape(-1).float().cpu().numpy()
-    if a.size < 2 or a.min() == a.max() or b.min() == b.max():
-        return float("nan")
-    return float(spearmanr(a, b).statistic)
-
-
 def mean_finite(values) -> float:
     """Среднее по конечным значениям; nan, если конечных нет вообще.
 
     Нужно для метрик, которые считаются на сэмпл и могут дать nan на
-    вырожденном сэмпле (luno_spearman_std_resid): один плохой сэмпл не должен
+    вырожденном сэмпле (например, AUSE с нулевым знаменателем): один плохой сэмпл не должен
     обнулять всю метрику.
     """
     finite = [v for v in values if math.isfinite(v)]
@@ -1183,51 +1440,131 @@ def per_channel_p99(pred, std, target, pct=PER_CHANNEL_PCT) -> list:
 
     Формы ``(B=1, C, ...)``: ось канала = 1 (см.
     ``_get_channelwise_reduce_dims`` и ``canonical_image``), режем как
-    ``t[0, c]``. В отличие от ``luno_sqrt_chi2_p*`` (RMS приведённого
-    sqrt(chi2) на сэмпл, перцентили МЕЖДУ сэмплами) здесь перцентиль берётся
-    ПО ЭЛЕМЕНТАМ внутри одного канала -- это хвосты распределения
-    стандартизованного остатка, посмотренные отдельно на каждом поле.
+    ``t[0, c]``. Перцентиль берётся ПО ЭЛЕМЕНТАМ внутри одного канала (все
+    пиксели и моменты времени) -- это хвосты распределения стандартизованного
+    остатка, посмотренные отдельно на каждом поле.
 
     ``pct`` -- одно число или последовательность уровней (по умолчанию
-    ``PER_CHANNEL_PCT = (80, 90, 99)``). Возвращает список СПИСКОВ: по одному
-    списку длины C на каждый уровень, в порядке ``pct`` (для одного числа --
-    список из одного списка).
+    ``PER_CHANNEL_PCT``). Возвращает список СПИСКОВ: по одному списку длины C
+    на каждый уровень, в порядке ``pct`` (для одного числа -- список из одного
+    списка).
 
-    ``std == 0`` даёт inf, а один inf отравил бы весь перцентиль (``quantile``
-    возвращает nan), поэтому не-конечные значения переводятся в nan и
-    отбрасываются ``nanquantile``'ом. Дополнительно элементы с невалидным std
-    (nan или ``std < STD_REL_FLOOR * RMS(|target|)`` этого поля) тоже
-    отбрасываются -- near-zero std портит хвост. Пустой канал (нет конечных
-    значений) даёт nan.
+    Фильтра по величине std нет: обработка ``std == 0`` -- см.
+    :func:`_grouped_sqrt_chi2_quantiles`.
     """
     if pred.shape[0] != 1:
         raise ValueError(
             f"per_channel_p99: ожидался батч из одного сэмпла (B=1), "
             f"получено {pred.shape[0]}"
         )
-    levels = [pct] if isinstance(pct, (int, float)) else list(pct)
+    return _grouped_sqrt_chi2_quantiles(pred, std, target, pct, pred.shape[1])
+
+
+def per_channel_time_sqrt_chi2(pred, std, target, pct=PER_CHANNEL_PCT) -> list:
+    """Те же перцентили sqrt(chi2), что в :func:`per_channel_p99`, но внутри
+    каждой пары (канал, момент времени).
+
+    Формы ``(B=1, C, T, *space)`` (ось канала 1, ось времени 2); без оси времени
+    (``ndim < 5``) ``T = 1``. Обработка ``std == 0`` -- та же, что у
+    поканальной версии. Возвращает список по уровням ``pct``,
+    в каждом -- ``C`` списков длины ``T``.
+    """
+    if pred.shape[0] != 1:
+        raise ValueError(
+            f"per_channel_time_sqrt_chi2: ожидался батч из одного сэмпла (B=1), "
+            f"получено {pred.shape[0]}"
+        )
     n_ch = pred.shape[1]
+    n_t = pred.shape[2] if pred.dim() >= 5 else 1
+    flat = _grouped_sqrt_chi2_quantiles(pred, std, target, pct, n_ch * n_t)
+    return [[row[c * n_t:(c + 1) * n_t] for c in range(n_ch)] for row in flat]
+
+
+def _grouped_sqrt_chi2_quantiles(pred, std, target, pct, n_groups) -> list:
+    """Перцентили ``|pred - target| / std`` по группам ``reshape(n_groups, -1)``.
+
+    Фильтра по величине std нет. Отношение при ``std == 0`` и ненулевом
+    остатке -- ``+inf``: такой пиксель честно лежит в верхнем хвосте и меняет
+    квантиль, только если таких пикселей больше ``1 - q``. Отбрасываются лишь
+    неопределённые отношения: ``0/0`` (нулевые и остаток, и std) и NaN.
+
+    ``nanquantile`` интерполирует между соседними порядковыми статистиками, и
+    при ``inf`` на границе это даёт ``inf*0 = nan``. Поэтому ``inf`` на время
+    подменяется большим конечным числом, а результат выше порога возвращается
+    в ``inf``. Пустая группа даёт nan.
+
+    Возвращает список по уровням ``pct``, в каждом -- ``n_groups`` значений.
+    """
+    levels = [pct] if isinstance(pct, (int, float)) else list(pct)
     if pred.numel() == 0:
-        return [[float("nan")] * n_ch for _ in levels]
-    scale = torch.sqrt(torch.mean(target.double() ** 2))
-    valid = std_valid_mask(std, scale)
-    sq = torch.where(
-        valid,
-        (pred - target).abs() / std,
-        torch.full_like(std, float("nan")),
-    ).reshape(n_ch, -1)
-    if sq.numel() == 0:
-        return [[float("nan")] * n_ch for _ in levels]
-    sq = torch.nan_to_num(sq, nan=float("nan"),
-                          posinf=float("nan"), neginf=float("nan"))
-    # nanquantile по (n_ch, elems) с осью dim=1 и вектором уровней даёт
-    # (n_levels, n_ch); транспонируем в список по уровням. Уровни обязаны быть
-    # на том же устройстве, что и sq (иначе quantile падает на CUDA).
+        return [[float("nan")] * n_groups for _ in levels]
+    ratio = ((pred - target).abs().double() / std.double()).reshape(n_groups, -1)
+    big = torch.finfo(torch.float64).max / 4
+    ratio = torch.where(torch.isposinf(ratio), torch.full_like(ratio, big), ratio)
+    # Уровни -- на том же устройстве, что и ratio (иначе quantile падает на CUDA).
     q_levels = torch.tensor(
-        [p / 100.0 for p in levels], dtype=sq.dtype, device=sq.device
+        [p / 100.0 for p in levels], dtype=ratio.dtype, device=ratio.device
     )
-    q = torch.nanquantile(sq, q_levels, dim=1)
+    q = torch.nanquantile(ratio, q_levels, dim=1)  # (n_levels, n_groups)
+    q = torch.where(q >= big / 2, torch.full_like(q, float("inf")), q)
     return [[float(v) for v in row] for row in q]
+
+
+def mean_non_nan(values) -> float:
+    """Среднее, где пропускаются только nan, а ``inf`` сохраняется.
+
+    Для квантилей sqrt(chi2): ``inf`` у сэмпла значит, что больше ``1 - q``
+    пикселей имеют ``std == 0`` при ненулевой ошибке, и это должно быть видно в
+    итоговом числе, а не молча выпасть из среднего.
+    """
+    kept = [v for v in values if not math.isnan(v)]
+    return sum(kept) / len(kept) if kept else float("nan")
+
+
+def ause_by_channel_time(pred, std, target) -> list:
+    """Нормированная AUSE для каждой пары (канал, момент времени) одного сэмпла.
+
+    Формы ``(B=1, C, T, *space)`` -- ось канала 1, ось времени 2 (как у
+    временных адаптеров, ``data_order: TXY``). Для полей без оси времени
+    (``ndim < 5``) вся пространственная часть канала -- одна группа, ``T = 1``.
+
+    Пиксели ранжируются внутри одного поля (канал, t): при общей сортировке
+    порядок определялся бы разницей масштабов каналов и ростом ошибки со
+    временем, а не тем, где std внутри поля указывает на ошибку.
+
+    Возвращает список ``C`` списков длины ``T`` (см. :func:`normalized_ause`).
+    """
+    if pred.shape[0] != 1:
+        raise ValueError(
+            f"ause_by_channel_time: ожидался батч из одного сэмпла (B=1), "
+            f"получено {pred.shape[0]}"
+        )
+    n_ch = pred.shape[1]
+    n_t = pred.shape[2] if pred.dim() >= 5 else 1
+    err2 = (pred - target) ** 2
+    ratio = normalized_ause(std.reshape(n_ch * n_t, -1), err2.reshape(n_ch * n_t, -1))
+    return ratio.reshape(n_ch, n_t).tolist()
+
+
+def reliability_by_channel_time(pred, std, target, n_bins=ENCE_BINS):
+    """Суммы для кривой надёжности по бинам std внутри каждой пары (канал, t).
+
+    Раскладка осей как у :func:`ause_by_channel_time`. Возвращает
+    ``(sum_std2, sum_err2, count)`` формы ``(C, T, n_bins)`` в float64 на CPU --
+    их складывают по сэмплам (см. :func:`metrics_uq.reliability_bin_sums`).
+    """
+    if pred.shape[0] != 1:
+        raise ValueError(
+            f"reliability_by_channel_time: ожидался батч из одного сэмпла (B=1), "
+            f"получено {pred.shape[0]}"
+        )
+    n_ch = pred.shape[1]
+    n_t = pred.shape[2] if pred.dim() >= 5 else 1
+    sums = reliability_bin_sums(
+        std.reshape(n_ch * n_t, -1), ((pred - target) ** 2).reshape(n_ch * n_t, -1),
+        n_bins=n_bins,
+    )
+    return tuple(x.reshape(n_ch, n_t, n_bins).cpu() for x in sums)
 
 
 def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
@@ -1235,64 +1572,61 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
                   affine, metrics_config=None, output_dir=None,
                   mode="forward", fwd_batch=4,
                   save_images=True, diag_probes=0, channel_names=None,
-                  jacobian_cls=LastFNOBlockWeightJacobian):
-    """Метрики на eval-сэмплах.
+                  jacobian_cls=LastFNOBlockWeightJacobian, bind=None,
+                  kfac=None):
+    """Метрики неопределённости и точности на eval-сэмплах, ВСЕ -- по каналам.
 
-    Везде, где участвует ``std``, элементы фильтруются по нему: пиксель
-    валиден, если ``std`` конечен и ``std >= STD_REL_FLOOR * RMS(|target|)``
-    этого поля (STD_REL_FLOOR = 1e-6). std==0/nan и near-zero std дают
-    гигантские chi2/nll даже на считанных пикселях и топят средние. Отбрасываются
-    ЭЛЕМЕНТЫ, а не целые сэмплы. В ``metrics`` пишутся
-    ``luno_valid_percent`` (доля валидных элементов, %) и
-    ``luno_dropped_elements`` (число отброшенных). ``luno_rmse`` std не
-    использует -- считается по всем элементам.
+    Ни одна метрика не усредняет по каналам: у каналов разный масштаб и разное
+    поведение std, и общее число смешивало бы их. ``{канал}`` -- имя из
+    ``adapter.variable_names`` (при расхождении с числом выходов -- ``ch0..``),
+    ``{tt}`` -- момент времени, ``{bb}`` -- бин std.
 
-    ``luno_chi2`` -- глобальное среднее chi2 по валидным элементам всех сэмплов.
-    ``luno_sqrt_chi2_*`` -- статистики приведённого sqrt(chi2) = sqrt(chi2 /
-    n_valid) (RMS стандартизованного остатка, ~1 при идеальной калибровке),
-    посчитанные по каждому сэмплу: перцентили p5/p25/p50/p75/p95 и среднее.
+    По каналу (среднее по сэмплам):
 
-    ``luno_spearman_std_resid`` -- коэффициент корреляции Спирмена между
-    ``std_raw`` и остатком ``|mean_raw - target|`` ПО ВАЛИДНЫМ элементам одного
-    сэмпла (все каналы склеены), усреднённый по сэмплам. Показывает, растёт ли
-    неопределённость там, где ошибка большая: 1 -- идеальный монотонный рост,
-    0 -- связи нет, < 0 -- неопределённость антагонична ошибке. Сэмпл с
-    вырожденным (константным) std или остатком даёт nan и в среднее не входит
-    (в логе это видно как ``spearman_valid=k/n``).
+    * ``luno_nll_{канал}`` -- гауссов NLL на элемент. Единственная метрика с
+      фильтром по std: элементы с ``std < STD_REL_FLOOR * RMS(target канала)``
+      (и неконечным остатком/std) отбрасываются, иначе ``log std`` и
+      ``остаток²/std²`` уходят в бесконечность. Сколько отброшено --
+      ``luno_valid_percent_{канал}`` и ``luno_dropped_elements_{канал}``;
+    * ``luno_rmse_{канал}`` -- RMSE среднего (raw), среднее по сэмплам;
+    * ``luno_std_mean_{канал}`` -- средний предсказанный std (raw) --
+      резкость; без него калибровку можно "купить" раздуванием std;
+    * ``luno_sqrt_chi2_{канал}_p{q}`` -- квантили ``|остаток|/std`` по всем
+      пикселям и моментам канала, ``q`` из ``PER_CHANNEL_PCT``; ориентиры
+      гаусса -- ``GAUSS_ABS_QUANTILES``;
+    * ``luno_ence_{канал}``, ``luno_ause_{канал}`` -- среднее по времени
+      значений ниже;
+    * метрики точности из ``metrics_config`` -- ``{имя}_{канал}``, посчитанные
+      на срезе одного канала.
 
-    ``luno_sqrt_chi2_{канал}_p{q}`` и ``luno_sqrt_chi2_chmean_p{q}`` -- {q}-й
-    перцентиль ЭЛЕМЕНТНОГО sqrt(chi2) = |mean - target| / std для каждого
-    уровня ``q`` из ``PER_CHANNEL_PCT = (80, 90, 99)``, взятый внутри одного
-    канала (16384 элементов при 128x128), затем усреднённый по сэмплам.
-    По одному ключу на канал (имена из ``adapter.variable_names``, при
-    расхождении с числом выходов -- ``ch0..``) плюс сводный: среднее по
-    каналам внутри сэмпла, потом по сэмплам. Это НЕ то же самое, что
-    ``luno_sqrt_chi2_p*`` выше: там -- RMS приведённого sqrt(chi2) на сэмпл и
-    перцентили между сэмплами, здесь -- хвосты распределения остатка по
-    элементам каждого поля. При хорошо откалиброванном гауссе ориентиры
-    |N(0,1)|: p80 ~ 1.28, p90 ~ 1.64, p99 ~ 2.58. Сэмпл, где в канале нет
-    конечных значений, даёт nan и в среднее по этому каналу не входит
-    (``p{q}_valid=k/n`` в логе, свой счётчик на каждый уровень).
+    По (канал, t): ``luno_sqrt_chi2_{канал}_t{tt}_p{q}``,
+    ``luno_ence_{канал}_t{tt}``, ``luno_ause_{канал}_t{tt}`` и кривые
+    надёжности ``luno_reliability_{канал}_t{tt}_b{bb}_{logratio|rmv|rmse}``.
 
-    ``save_images=False`` -- не писать PNG (диагностику смотрим только на
-    валидации, на тесте это лишняя работа).
-    ``diag_probes`` -- число проб Хатчинсона для ``diag(J Sigma J^T)`` (вся
-    конгруэнция, не только ``diag(J J^T)``); 0 -- точный обратный режим.
-    Калибровка, val и test берут одно значение ``--diag-hutchinson``: смещение
-    оценщика зависит только от числа проб (``~2/n_probe`` на chi2), поэтому
-    держать его разным ради "эталонности" не нужно.
+    Кроме NLL фильтра по std нет: ``std == 0`` при ненулевой ошибке даёт
+    ``+inf`` (квантили, ENCE), ``0/0`` отбрасывается; AUSE зависит только от
+    порядка std. В лог идёт по строке на канал, таблицы по (канал, t) -- только
+    в возвращаемый словарь (дальше -- в pkl).
+
+    ``save_images=False`` -- не писать PNG. ``diag_probes`` -- число проб
+    Хатчинсона для ``diag(J Sigma J^T)``; 0 -- точный обратный режим.
     """
-    cov = create_luno_cov(low_rank, prior_args)
-    nll_sum = torch.tensor(0.0, dtype=torch.float64)
-    rmse_sum = torch.tensor(0.0, dtype=DTYPE)
-    chi2_sum = torch.tensor(0.0, dtype=torch.float64)
-    sqrt_chi2_samples = []
-    spearman_samples = []  # по одному rho на сэмпл; nan на вырожденных
-    ch_p99_samples = []  # по сэмплу список (n_levels x C); nan на пустых каналах
-    cfg_sums = {}
-    n_elements = 0
-    n_elements_valid = 0
-    n_dropped = 0
+    if kfac is not None:
+        if diag_probes <= 0:
+            raise SystemExit("--ggn-method kfac требует --diag-hutchinson > 0.")
+        cov = (low_rank, prior_args["prior_prec"])
+    else:
+        cov = create_luno_cov(low_rank, prior_args)
+
+    # Поканальные накопители создаются на первом сэмпле (число каналов
+    # известно только по выходу). Суммы по сэмплам -- float64 на CPU.
+    ch = None  # dict накопителей
+    ch_p_samples = []  # по сэмплу: по уровням PER_CHANNEL_PCT список длины C
+    ause_samples = []  # по сэмплу список (C x T) нормированной AUSE
+    ch_t_pct_samples = []  # по сэмплу: по уровням список (C x T)
+    # Накопленные по сэмплам суммы для ENCE: (C, T, ENCE_BINS) каждая.
+    rel_std2 = rel_err2 = rel_count = None
+    cfg_sums = {}  # {(имя, c): сумма по сэмплам}
     n_samples = 0
 
     output_prefix = None
@@ -1301,165 +1635,198 @@ def evaluate_luno(args, loader, model_fn, w0, low_rank, prior_args, wrapper,
         output_prefix.mkdir(parents=True, exist_ok=True)
         output_prefix = Path.joinpath(output_prefix, "luno_")
 
-    # Без no_grad аккумуляторы nll_sum/rmse_sum/chi2_sum -- не-leaf тензоры,
-    # и каждый следующий плюс цепляется к предыдущему через grad_fn. Граф каждого
-    # eval-сэмпла тогда живёт до конца цикла (до .item() ниже), и память растёт
-    # линейно по числу сэмплов: на rank=20 это ~12 ГиБ при одном лишь --vjp-chunk,
-    # от которого эффект нулевой. Графы здесь не нужны вообще.
+    # Графы здесь не нужны: без no_grad накопители цеплялись бы через grad_fn,
+    # и граф каждого eval-сэмпла жил бы до конца цикла.
     with torch.no_grad():
         for sample in iter_samples(loader, max_samples):
             sample = preprocess_sample(data_processor, sample)
             x = sample[0]["x"]
             target_raw = sample[0]["y"]
-            target = target_raw.reshape(-1)
+            out_shape = target_raw.shape
             mean_raw, std_raw = _batch_predictive_stats(
                 model_fn, w0, cov, x, out_normalizer, wrapper.num_output_channels,
                 affine=affine, mode=mode, fwd_batch=fwd_batch, vjp_chunk=args.vjp_chunk,
                 diag_probes=diag_probes, jacobian_cls=jacobian_cls,
+                bind=bind, out_shape=out_shape, kfac=kfac,
             )
-            # Фильтр по std: std==0/nan и near-zero std (std < STD_REL_FLOOR *
-            # RMS(|target|) этого поля) дают гигантские chi2/nll даже на
-            # считанных пикселях и топят средние. Отбрасываем ЭЛЕМЕНТЫ (пиксели),
-            # а не целые сэмплы, и считаем chi2/nll/spearman/sqrt_chi2 только по
-            # валидным. rmse std не использует -- остаётся по всем элементам.
-            scale = torch.sqrt(torch.mean(target.double() ** 2))
-            valid = std_valid_mask(std_raw, scale)
-            sr = standardized_residual(mean_raw, std_raw, target)
-            valid = valid & torch.isfinite(sr)
-            n_valid = int(valid.sum())
-            n_elem_sample = target.numel()
-            n_dropped += n_elem_sample - n_valid
+            n_ch = out_shape[1]
+            m_c = mean_raw.reshape(n_ch, -1).double()
+            s_c = std_raw.reshape(n_ch, -1).double()
+            y_c = target_raw.reshape(n_ch, -1).double()
+            if ch is None:
+                zeros = lambda: torch.zeros(n_ch, dtype=torch.float64)
+                ch = {k: zeros() for k in
+                      ("nll", "n_valid", "n_elem", "rmse", "std_mean")}
 
-            rmse_sum = rmse_sum + torch.sqrt(torch.mean((mean_raw - target) ** 2))
-            if n_valid:
-                sr_v = sr[valid].double()
-                std_v = std_raw[valid].double()
-                chi2_sum = chi2_sum + (sr_v ** 2).sum()
-                nll_sum = nll_sum + (
-                    0.5 * sr_v ** 2
-                    + std_v.log()
-                    + 0.5 * math.log(2.0 * math.pi)
-                ).sum()
-                n_elements_valid += n_valid
-                sqrt_chi2_samples.append(
-                    float(torch.sqrt((sr_v ** 2).sum() / n_valid))
-                )
-            # Корреляция Спирмена std_raw <-> |остаток| по валидным элементам
-            # сэмпла (все каналы склеены): один rho на сэмпл, среднее -- в конце.
-            spearman_samples.append(
-                spearman_corr(std_raw[valid], (mean_raw - target).abs()[valid])
-            )
-            n_elements += n_elem_sample
+            # NLL по каналу -- с фильтром по std относительно RMS target ЭТОГО
+            # канала (каналы разного масштаба, общий RMS резал бы мелкие).
+            scale = torch.sqrt(torch.mean(y_c ** 2, dim=1, keepdim=True))
+            sr = (m_c - y_c).abs() / s_c
+            valid = std_valid_mask(s_c, scale) & torch.isfinite(sr)
+            nll_el = 0.5 * sr ** 2 + torch.log(s_c) + 0.5 * math.log(2.0 * math.pi)
+            ch["nll"] += torch.where(valid, nll_el, torch.zeros_like(nll_el)).sum(dim=1).cpu()
+            ch["n_valid"] += valid.sum(dim=1).double().cpu()
+            ch["n_elem"] += y_c.shape[1]
+            ch["rmse"] += torch.sqrt(torch.mean((m_c - y_c) ** 2, dim=1)).cpu()
+            ch["std_mean"] += torch.nanmean(s_c, dim=1).cpu()
             n_samples += 1
 
-            out_shape = target_raw.shape
             pred = {0: mean_raw.reshape(out_shape)}
             band = {0: std_raw.reshape(out_shape)}
             target_dict = {0: target_raw}
 
-            # 99-й перцентиль элементного sqrt(chi2) по каждому каналу отдельно
-            # (хвосты остатка по полям); усреднение -- после цикла.
-            ch_p99_samples.append(
-                per_channel_p99(pred[0], band[0], target_dict[0])
+            # Квантили sqrt(chi2) по каналу (по всем пикселям и моментам).
+            ch_p_samples.append(per_channel_p99(pred[0], band[0], target_dict[0]))
+            # Sparsification внутри каждого поля (канал, t).
+            ause_samples.append(
+                ause_by_channel_time(pred[0], band[0], target_dict[0])
             )
+            # Хвосты sqrt(chi2) внутри каждого поля (канал, t).
+            ch_t_pct_samples.append(
+                per_channel_time_sqrt_chi2(pred[0], band[0], target_dict[0])
+            )
+            # ENCE: суммы std² / err² по бинам std внутри (канал, t). Копим
+            # суммы, а не логарифмы на сэмпл: так меньше шума.
+            s2, e2, cnt = reliability_by_channel_time(
+                pred[0], band[0], target_dict[0]
+            )
+            # Поле с неконечным std/ошибкой у этого сэмпла в суммы не входит
+            # (иначе один nan отравил бы пару (канал, t) для всех сэмплов).
+            bad = torch.isnan(s2) | torch.isnan(e2)
+            s2[bad], e2[bad], cnt[bad] = 0.0, 0.0, 0.0
+            if rel_std2 is None:
+                rel_std2, rel_err2, rel_count = s2, e2, cnt
+            else:
+                rel_std2 += s2
+                rel_err2 += e2
+                rel_count += cnt
 
             if output_prefix is not None:
                 save_luno_images(pred, band, target_dict, output_prefix, n_samples - 1)
 
             if metrics_config:
-                batch_metrics = rmi.compute_batch_metrics(
-                    pred,
-                    band,
-                    target_dict,
-                    metrics_config=metrics_config,
-                    task_name=task_name,
-                )
-                for name, value in batch_metrics[0].items():
-                    cfg_sums[name] = cfg_sums.get(name, 0.0) + float(value)
+                # Метрики точности из конфига сворачивают ось канала, поэтому
+                # считаются на срезе каждого канала отдельно.
+                for c in range(n_ch):
+                    sl = slice(c, c + 1)
+                    batch_metrics = rmi.compute_batch_metrics(
+                        {0: pred[0][:, sl]},
+                        {0: band[0][:, sl]},
+                        {0: target_dict[0][:, sl]},
+                        metrics_config=metrics_config,
+                        task_name=task_name,
+                    )
+                    for name, value in batch_metrics[0].items():
+                        cfg_sums[(name, c)] = cfg_sums.get((name, c), 0.0) + float(value)
 
-    nll = (nll_sum / n_elements_valid).item() if n_elements_valid else float("nan")
-    rmse = (rmse_sum / n_samples).item() if n_samples else float("nan")
-    chi2 = (chi2_sum / n_elements_valid).item() if n_elements_valid else float("nan")
-    valid_percent = 100.0 * n_elements_valid / n_elements if n_elements else float("nan")
+    if ch is None:
+        raise SystemExit(f"[eval:{task_name}] в loader нет ни одного сэмпла.")
+    n_ch = ch["nll"].numel()
+    keys = channel_key_names(channel_names, n_ch)
 
-    # Перцентили приведённого sqrt(chi2) по сэмплам.
-    sqrt_chi2_pct = {}
-    if sqrt_chi2_samples:
-        vals = torch.tensor(sqrt_chi2_samples, dtype=torch.float64)
-        levels = torch.tensor(
-            [q / 100.0 for q in SQRT_CHI2_PERCENTILES], dtype=torch.float64
-        )
-        for q, v in zip(SQRT_CHI2_PERCENTILES, torch.quantile(vals, levels).tolist()):
-            sqrt_chi2_pct[f"luno_sqrt_chi2_p{q}"] = v
-        sqrt_chi2_pct["luno_sqrt_chi2_mean"] = vals.mean().item()
+    base = {}
+    for c, key in enumerate(keys):
+        n_valid = float(ch["n_valid"][c])
+        n_elem = float(ch["n_elem"][c])
+        base[f"luno_nll_{key}"] = (float(ch["nll"][c]) / n_valid
+                                   if n_valid else float("nan"))
+        base[f"luno_rmse_{key}"] = float(ch["rmse"][c]) / n_samples
+        base[f"luno_std_mean_{key}"] = float(ch["std_mean"][c]) / n_samples
+        base[f"luno_valid_percent_{key}"] = 100.0 * n_valid / n_elem
+        base[f"luno_dropped_elements_{key}"] = int(n_elem - n_valid)
 
-    # Спирмен std_raw <-> |остаток|: одно среднее по сэмплам, невырожденные
-    # (конечные) rho. Если выпавших сэмплов нет -- без суффикса в логе.
-    spearman = mean_finite(spearman_samples)
-    n_spearman_valid = sum(1 for v in spearman_samples if math.isfinite(v))
-
-    # Перцентили элементного sqrt(chi2) по каналам: для КАЖДОГО уровня из
-    # PER_CHANNEL_PCT -- одно среднее по сэмплам на канал плюс сводное (внутри
-    # сэмпла среднее по каналам, потом по сэмплам). Сэмпл считается валидным
-    # для уровня, если конечны значения этого уровня по ВСЕМ каналам сразу.
+    # Квантили sqrt(chi2) по каналу: среднее по сэмплам (inf сохраняется, nan
+    # пропускается, см. mean_non_nan).
     ch_pct = {}
-    n_ch_valid = {}
-    if ch_p99_samples:
-        keys = channel_key_names(channel_names, len(ch_p99_samples[0][0]))
-        for li, q in enumerate(PER_CHANNEL_PCT):
-            # row[li] -- список длины C значений уровня q для одного сэмпла.
-            rows = [row[li] for row in ch_p99_samples]
-            for c, key in enumerate(keys):
-                ch_pct[f"luno_sqrt_chi2_{key}_p{q}"] = mean_finite(
-                    row[c] for row in rows
-                )
-            ch_pct[f"luno_sqrt_chi2_chmean_p{q}"] = mean_finite(
-                mean_finite(row) for row in rows
-            )
-            n_ch_valid[q] = sum(
-                1 for row in rows if all(math.isfinite(v) for v in row)
+    for li, q in enumerate(PER_CHANNEL_PCT):
+        for c, key in enumerate(keys):
+            ch_pct[f"luno_sqrt_chi2_{key}_p{q}"] = mean_non_nan(
+                smp[li][c] for smp in ch_p_samples
             )
 
-    cfg_metrics = {name: value / n_samples for name, value in cfg_sums.items()}
+    # Нормированная AUSE: по (канал, t) и среднее по времени на канал.
+    ause = {}
+    if ause_samples:
+        n_t = len(ause_samples[0][0])
+        for c, key in enumerate(keys):
+            per_t = [
+                mean_finite(smp[c][t] for smp in ause_samples) for t in range(n_t)
+            ]
+            for t, v in enumerate(per_t):
+                ause[f"luno_ause_{key}_t{t:02d}"] = v
+            ause[f"luno_ause_{key}"] = mean_finite(per_t)
+
+    # Перцентили sqrt(chi2) по (канал, t): среднее по сэмплам для каждого уровня.
+    ch_t_pct = {}
+    if ch_t_pct_samples:
+        n_t = len(ch_t_pct_samples[0][0][0])
+        for li, q in enumerate(PER_CHANNEL_PCT):
+            for c, key in enumerate(keys):
+                for t in range(n_t):
+                    ch_t_pct[f"luno_sqrt_chi2_{key}_t{t:02d}_p{q}"] = mean_non_nan(
+                        smp[li][c][t] for smp in ch_t_pct_samples
+                    )
+
+    # ENCE = средний по бинам |log(RMSE/RMV)| для каждой пары (канал, t) и
+    # среднее по времени на канал. Кривая надёжности -- для каждой пары
+    # (канал, t): бин b -- b-я доля самых уверенных пикселей этого поля.
+    ence = {}
+    if rel_std2 is not None:
+        _, n_t, n_bins = rel_std2.shape
+        lr = log_rmse_over_rmv(rel_err2, rel_std2)  # (C, T, B)
+        for c, key in enumerate(keys):
+            per_t = [mean_non_nan(lr[c, t].abs().tolist()) for t in range(n_t)]
+            for t, v in enumerate(per_t):
+                ence[f"luno_ence_{key}_t{t:02d}"] = v
+            ence[f"luno_ence_{key}"] = mean_non_nan(per_t)
+            curves = lr[c].tolist()  # (T, B)
+            rmv = torch.sqrt(rel_std2[c] / rel_count[c]).tolist()
+            rmse_b = torch.sqrt(rel_err2[c] / rel_count[c]).tolist()
+            for t in range(n_t):
+                for b in range(n_bins):
+                    pre = f"luno_reliability_{key}_t{t:02d}_b{b:02d}"
+                    ence[f"{pre}_logratio"] = curves[t][b]
+                    ence[f"{pre}_rmv"] = rmv[t][b]
+                    ence[f"{pre}_rmse"] = rmse_b[t][b]
+
+    cfg_metrics = {
+        f"{name}_{keys[c]}": value / n_samples
+        for (name, c), value in cfg_sums.items()
+    }
     metrics = {
         **cfg_metrics,
-        **sqrt_chi2_pct,
+        **base,
         **ch_pct,
-        "luno_nll": nll,
-        "luno_rmse": rmse,
-        "luno_chi2": chi2,
-        "luno_spearman_std_resid": spearman,
-        "luno_valid_percent": valid_percent,
-        "luno_dropped_elements": n_dropped,
+        **ch_t_pct,
+        **ause,
+        **ence,
         "samples": n_samples,
     }
-    cfg_str = " ".join(f"{k}={v:.6e}" for k, v in cfg_metrics.items())
-    pct_str = " ".join(f"{k}={v:.6e}" for k, v in sqrt_chi2_pct.items())
-    valid_str = (
-        f" spearman_valid={n_spearman_valid}/{n_samples}"
-        if n_spearman_valid != n_samples else ""
-    )
-    print(f"[eval:{task_name}] luno_nll={nll:.6e} luno_rmse={rmse:.6e} "
-          f"luno_chi2={chi2:.6e} luno_spearman_std_resid={spearman:.6e} "
-          f"luno_valid_percent={valid_percent:.6e} "
-          f"luno_dropped_elements={n_dropped} "
-          f"{pct_str} {cfg_str} "
-          f"(samples={n_samples}, elements={n_elements}{valid_str})")
-    if ch_pct:
-        # По одной строке на перцентиль: сначала значения каналов уровня q,
-        # затем сводное chmean и valid-счётчик этого уровня.
-        for q in PER_CHANNEL_PCT:
-            level_items = [
-                (k, v) for k, v in ch_pct.items() if k.endswith(f"_p{q}")
-            ]
-            ch_pct_str = " ".join(f"{k}={v:.6e}" for k, v in level_items)
-            n_valid = n_ch_valid.get(q, 0)
-            ch_valid_str = (
-                f" p{q}_valid={n_valid}/{n_samples}"
-                if n_valid != n_samples else ""
-            )
-            print(f"[eval:{task_name}] sqrt_chi2_p{q} по каналам "
-                  f"(среднее по {n_samples} сэмплам): {ch_pct_str}{ch_valid_str}")
+
+    # Лог: по строке на канал; таблицы по (канал, t), кривые надёжности и
+    # метрики точности из конфига -- только в файл.
+    refs = " ".join(f"p{q}={GAUSS_ABS_QUANTILES[q]}" for q in PER_CHANNEL_PCT
+                    if q in GAUSS_ABS_QUANTILES)
+    print(f"[eval:{task_name}] {n_samples} сэмплов; по каналам (sqrt_chi2 -- "
+          f"квантили |остаток|/std, гаусс: {refs}; ENCE, AUSE -- среднее по времени):")
+    for key in keys:
+        pct = " ".join(f"p{q}={ch_pct[f'luno_sqrt_chi2_{key}_p{q}']:.3f}"
+                       for q in PER_CHANNEL_PCT)
+        extra = ""
+        if ence:
+            extra += f" | ENCE={ence[f'luno_ence_{key}']:.4f}"
+        if ause:
+            extra += f" AUSE={ause[f'luno_ause_{key}']:.4f}"
+        print(f"[eval:{task_name}]   {key}: nll={base[f'luno_nll_{key}']:.4e} "
+              f"rmse={base[f'luno_rmse_{key}']:.4e} "
+              f"std_mean={base[f'luno_std_mean_{key}']:.4e} "
+              f"valid={base[f'luno_valid_percent_{key}']:.2f}% | "
+              f"sqrt_chi2 {pct}{extra}")
+    print(f"[eval:{task_name}] только в файле: по (канал, t) -- "
+          f"luno_sqrt_chi2_{{канал}}_t{{tt}}_p{{q}}, luno_ence_{{канал}}_t{{tt}}, "
+          f"luno_ause_{{канал}}_t{{tt}}, "
+          f"luno_reliability_{{канал}}_t{{tt}}_b{{bb}}_{{logratio|rmv|rmse}}"
+          + ("; метрики точности из конфига -- {имя}_{канал}" if cfg_metrics else ""))
     return metrics
 
 
@@ -1509,10 +1876,90 @@ def confirm_exact_diag(args, pipeline):
 # main
 # ----------------------------------------------------------------------------
 
+def uq_method(args) -> str:
+    """Метка метода UQ по эффективным настройкам задачи.
+
+    Лифтинг: ``lifting`` -- полная сэмплированная GGN, ``lifting_iso`` --
+    ``max_rank == 0`` (только изотропный prior). Последний блок:
+    ``lastblock_{kfac|iso|lowrank}`` (``--ggn-method kfac``, ``max_rank == 0``
+    или низкоранговая GGN; её фактический ранг -- в ``ggn_rank`` результатов,
+    он может прийти из ``ggn_checkpoint``).
+    """
+    if args.ggn_target == "lifting":
+        return "lifting_iso" if args.max_rank == 0 else "lifting"
+    target = "lastblock"
+    if args.ggn_method == "kfac":
+        method = "kfac"
+    elif args.max_rank == 0:
+        method = "iso"
+    else:
+        method = "lowrank"
+    return f"{target}_{method}"
+
+
+def run_method_label(args, selected) -> str:
+    """Метка метода для имени папки прогона.
+
+    Метод определяют in_distr-задачи: остальные наследуют их GGN и prior_prec,
+    а их собственные GGN-ключи (``max_rank`` и т.п.) игнорируются. Если
+    in_distr-задач среди выбранных нет -- по глобальным аргументам. Разные
+    методы у разных in_distr-задач склеиваются через ``+``.
+    """
+    in_distr = [cfg for _, cfg in selected if is_in_distr(cfg)]
+    labels = ([uq_method(apply_task_overrides(args, cfg)) for cfg in in_distr]
+              if in_distr else [uq_method(args)])
+    return "+".join(dict.fromkeys(labels))
+
+
+def method_from_terms(target: str, terms) -> str:
+    """Метка метода по реально использованной кривизне (см. :func:`uq_method`).
+
+    Для задач, унаследовавших GGN (из кэша in_distr-соседа или из
+    ``ggn_checkpoint``), настройки самой задачи ничего не говорят -- метод
+    определяется содержимым: ``KFACTerms`` -> kfac, ``U`` с нулём столбцов ->
+    iso, иначе lowrank.
+    """
+    t = "lifting" if target == "lifting" else "lastblock"
+    if isinstance(terms, KFACTerms):
+        return f"{t}_kfac"
+    if terms.U.shape[1] == 0:
+        return f"{t}_iso"
+    if terms.U.shape[1] == terms.U.shape[0]:
+        return "lifting" if t == "lifting" else f"{t}_full"
+    return f"{t}_lowrank"
+
+
+def iso_low_rank(w0: torch.Tensor) -> LowRankTerms:
+    """Пустая кривизна для метода Iso: ``U`` формы ``(d, 0)``.
+
+    Тогда ``create_luno_cov`` даёт ковариацию ``I / prior_prec`` -- чистый
+    изотропный prior в пространстве весов, а предиктивная дисперсия --
+    ``diag(J J^T) / prior_prec``.
+    """
+    return LowRankTerms(
+        U=torch.zeros(w0.numel(), 0, dtype=w0.dtype, device=w0.device),
+        S=torch.zeros(0, dtype=w0.dtype, device=w0.device),
+        scalar=0.0,
+    )
+
+
 def resolve_low_rank(args, w0, model_fn, pipeline, data_processor, affine, task_idx,
                      output_dir, run_prefix, asset_cache,
-                     matvec_cls=GGNMatvec, artifact_prefix="low_rank_terms"):
+                     matvec_cls=GGNMatvec, artifact_prefix="low_rank_terms",
+                     bind=None, kfac=None, iso=False, full_sampled=False,
+                     jacobian_cls=None, allow_compute=True):
     """Возвращает (low_rank, ggn_source, ggn_checkpoint) для одной задачи.
+
+    ``iso=True`` (in_distr-задача с ``max_rank == 0``): GGN не строится и
+    ``ggn_checkpoint`` не читается -- возвращается пустая кривизна
+    (:func:`iso_low_rank`), ``ggn_source = "iso"``. Артефакт с ``U`` формы
+    ``(d, 0)`` всё равно сохраняется, чтобы OOD-задачи могли унаследовать его
+    через ``ggn_checkpoint``, как и низкоранговую GGN.
+
+    ``full_sampled=True`` (лифтинг): GGN полная, ``d x d`` (см.
+    :func:`compute_sampled_ggn`). Низкоранговый чекпойнт (``U`` меньше ``d``
+    столбцов, например от прежнего метода) для неё не годится -- он
+    игнорируется с предупреждением, и GGN считается заново.
 
     В ``args.ggn_checkpoint`` уже лежит эффективный путь: собственный
     ``luno.ggn_checkpoint`` in_distr-задачи, унаследованный от неё checkpoint
@@ -1525,6 +1972,20 @@ def resolve_low_rank(args, w0, model_fn, pipeline, data_processor, affine, task_
     ``artifact_prefix``/``matvec_cls`` выбираются по ``--ggn-target``:
     last-block использует старые имена, lifting -- ``lifting_low_rank_terms``.
     """
+    if iso:
+        if args.ggn_checkpoint:
+            print(f"[GGN] max_rank=0 (метод Iso): ggn_checkpoint "
+                  f"{args.ggn_checkpoint} игнорируется -- кривизна не нужна.")
+        print("[GGN] метод Iso: GGN не строится, ковариация -- изотропный prior "
+              "I / prior_prec.")
+        low_rank = iso_low_rank(w0)
+        terms_path = output_dir / f"{run_prefix}_{artifact_prefix}.pkl"
+        with open(terms_path, "wb") as f:
+            pickle.dump(LowRankTerms(U=low_rank.U.cpu(), S=low_rank.S.cpu(),
+                                     scalar=0.0), f)
+        print(f"[save] {artifact_prefix} (Iso, U=(d, 0)) -> {terms_path}")
+        return low_rank, "iso", None
+
     ggn_path = None
     if args.ggn_checkpoint:
         raw = rmi.resolve_path(args.ggn_checkpoint)
@@ -1551,18 +2012,43 @@ def resolve_low_rank(args, w0, model_fn, pipeline, data_processor, affine, task_
             low_rank = asset_cache[cache_key]
             print(f"[GGN] из кэша (task_idx={task_idx}): {ggn_path}")
         else:
-            low_rank = load_low_rank_ggn(ggn_path, w0)
+            low_rank = (load_kfac_terms(ggn_path, w0) if kfac is not None
+                        else load_low_rank_ggn(ggn_path, w0))
+            if (low_rank is not None and full_sampled
+                    and low_rank.U.shape[1] < w0.numel()):
+                print(f"[GGN] чекпойнт {ggn_path} низкоранговый "
+                      f"(ранг {low_rank.U.shape[1]} < d={w0.numel()}): для "
+                      f"лифтинга нужна полная GGN -- чекпойнт игнорируется, "
+                      f"считаю заново.")
+                low_rank = None
             if low_rank is not None:
                 asset_cache[cache_key] = low_rank
 
     ggn_loaded = low_rank is not None
-    if not ggn_loaded:
+    if not ggn_loaded and not allow_compute:
+        # Задача без in_distr-соседа: считать GGN на её собственных данных
+        # нельзя (это была бы кривизна другой задачи) -- нужен чекпойнт.
+        return None, "missing", None
+    if not ggn_loaded and kfac is not None:
+        low_rank = compute_kfac_terms(
+            args, kfac, pipeline["train_loader"], data_processor
+        )
+        low_rank_cpu = low_rank.to(device="cpu")
+    elif not ggn_loaded and full_sampled:
+        low_rank = compute_sampled_ggn(
+            args, model_fn, w0, pipeline["train_loader"], data_processor,
+            jacobian_cls, fwd_batch=args.fwd_batch, bind=bind,
+        )
+        low_rank_cpu = LowRankTerms(
+            U=low_rank.U.detach().to("cpu"), S=low_rank.S.detach().to("cpu"),
+            scalar=low_rank.scalar,
+        )
+    elif not ggn_loaded:
         low_rank = compute_low_rank_ggn(
             args, model_fn, w0, pipeline["train_loader"], data_processor, affine,
             mode=args.jv_mode, fwd_batch=args.fwd_batch,
-            matvec_cls=matvec_cls,
+            matvec_cls=matvec_cls, bind=bind,
         )
-
         # U имеет форму (d, rank) -- при d = 27.6M и rank = 50 это 5.15 ГиБ. Пишем
         # артефакт с CPU-копией: сам pickle всё равно такой размер, но GPU-копия
         # продолжает жить в low_rank для калибровки и метрик. При загрузке из
@@ -1571,6 +2057,7 @@ def resolve_low_rank(args, w0, model_fn, pipeline, data_processor, affine, task_
             U=low_rank.U.detach().to("cpu"), S=low_rank.S.detach().to("cpu"),
             scalar=low_rank.scalar,
         )
+    if not ggn_loaded:
         terms_path = output_dir / f"{run_prefix}_{artifact_prefix}.pkl"
         with open(terms_path, "wb") as f:
             pickle.dump(low_rank_cpu, f)
@@ -1636,31 +2123,35 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
     wrapper = setup.wrapper
     affine = setup.affine
 
-    # Стартовый гейт: Jv выбранного режима против reverse-строк на ОДНОМ батче.
-    # Эталон -- обратный режим (AD не трогает спектральный conv "изнутри"); при
-    # расхождении падаем явно, а не молча считаем кривую кривизну. Допуск зависит
-    # от точности: float32 набирает ошибку суммирования по 28M элементам, float64 --
-    # на три порядка точнее (см. default_check_tol).
-    # probe = preprocess_sample(
-    #     data_processor, next(iter_samples(pipeline["train_loader"], 1))
-    # )
-    # ok, rel = check_jacobian(
-    #     model_fn, probe[0]["x"], w0,
-    #     affine=affine, mode=args.jv_mode, fwd_batch=args.fwd_batch,
-    #     num_probes=args.check_probes, tol=args.check_tol,
-    # )
-    # tol_used = args.check_tol if args.check_tol is not None else default_check_tol(w0.dtype)
-    # print(f"[{args.jv_mode}-JV] self-check vs reverse rows на 1 батче: "
-    #       f"{'OK' if ok else 'FAILED'} (max rel err={rel:.3e}, tol={tol_used:.1e}, "
-    #       f"dtype={w0.dtype}, torch={torch.__version__})")
-    # if not ok:
-    #     raise RuntimeError(
-    #         f"Jv в режиме '{args.jv_mode}' не совпал с reverse-строками "
-    #         f"(max rel err={rel:.3e} > tol={tol_used:.1e}). Проверьте структуру "
-    #         "последнего FNO-блока (conv/skip/norm/transform), точность весов и "
-    #         "то, что complex-веса не потеряли мнимую часть при кастинге."
-    #     )
-    # _print_mem("after_jv_check", device)
+    # Стартовый гейт (--jacobian-check): Jv выбранного режима против
+    # reverse-строк на ОДНОМ сэмпле. Эталон -- обратный режим; при расхождении
+    # падаем явно, а не молча считаем кривую кривизну. Для нового ядра это
+    # главная проверка, что forward-mode AD через него вообще работает. Допуск
+    # зависит от точности (см. default_check_tol).
+    if getattr(args, "jacobian_check", False):
+        probe = preprocess_sample(
+            data_processor, next(iter_samples(pipeline["train_loader"], 1))
+        )
+        ok, rel = check_jacobian(
+            model_fn, probe[0]["x"], w0,
+            affine=affine, mode=args.jv_mode, fwd_batch=args.fwd_batch,
+            num_probes=args.check_probes, tol=args.check_tol,
+            jacobian_cls=setup.jacobian_cls,
+        )
+        tol_used = (args.check_tol if args.check_tol is not None
+                    else default_check_tol(w0.dtype))
+        print(f"[jacobian-check] target={setup.target}, mode={args.jv_mode}: "
+              f"{'OK' if ok else 'FAILED'} (max rel err={rel:.3e}, "
+              f"tol={tol_used:.1e}, dtype={w0.dtype}, torch={torch.__version__})")
+        if not ok:
+            raise RuntimeError(
+                f"Jv (target={setup.target}, mode={args.jv_mode}) не совпал с "
+                f"reverse-строками (max rel err={rel:.3e} > tol={tol_used:.1e}). "
+                "Для нового ядра: проверьте, что все его операции поддерживают "
+                "forward-mode AD (attention-бэкенды, кастомные CUDA-ядра, "
+                "checkpointing)."
+            )
+        _print_mem("after_jacobian_check", device)
 
     # --- low-rank GGN + prior_prec: либо считаем сами (in_distr), либо берём ---
     # --- от in_distr-соседа того же task_idx (кэш/чекпойнт), либо падаем.    ---
@@ -1671,12 +2162,15 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
     ggn_label = ("лифтинга" if setup.target == "lifting"
                  else "последнего фурье-слоя")
     if in_distr:
-        print(f"\n[GGN] low-rank аппроксимация GGN {ggn_label} "
+        print(f"\n[GGN] метод {uq_method(args)}: GGN {ggn_label} "
               f"(target={setup.target}):")
         low_rank, ggn_source, ggn_checkpoint = resolve_low_rank(
             args, w0, model_fn, pipeline, data_processor, affine, task_idx,
             output_dir, run_prefix, asset_cache,
             matvec_cls=setup.matvec_cls, artifact_prefix=setup.artifact_prefix,
+            bind=setup.bind, kfac=setup.kfac,
+            iso=setup.kfac is None and args.max_rank == 0,
+            full_sampled=setup.full_sampled, jacobian_cls=setup.jacobian_cls,
         )
 
         # --- калибровка на сэмплах калибровочной части val (доля --val-calib-frac) ---
@@ -1689,6 +2183,8 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
             data_processor.out_normalizer, pipeline["calib_loader"], affine,
             objective_name=args.calib_objective, mode=args.jv_mode,
             fwd_batch=args.fwd_batch, jacobian_cls=setup.jacobian_cls,
+            bind=setup.bind, kfac=setup.kfac,
+            temperature=setup.full_sampled and args.max_rank != 0,
         )
         shared[shared_key] = (low_rank, prior_args)
     elif shared_key in shared:
@@ -1718,12 +2214,15 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
                 f"--prior-prec-source (есть: {bool(args.prior_prec_source)}). "
                 f"Либо добавьте in_distr-задачу task_idx={task_idx} в --tasks."
             )
-        print("\n[GGN] низкоранговый GGN из luno.ggn_checkpoint/"
-              "--ggn-checkpoint (in_distr-соседа в прогоне нет):")
+        print("\n[GGN] GGN из luno.ggn_checkpoint/--ggn-checkpoint "
+              "(in_distr-соседа в прогоне нет):")
         low_rank, ggn_source, ggn_checkpoint = resolve_low_rank(
             args, w0, model_fn, pipeline, data_processor, affine, task_idx,
             output_dir, run_prefix, asset_cache,
             matvec_cls=setup.matvec_cls, artifact_prefix=setup.artifact_prefix,
+            bind=setup.bind, kfac=setup.kfac,
+            full_sampled=setup.full_sampled, jacobian_cls=setup.jacobian_cls,
+            allow_compute=False,
         )
         if ggn_checkpoint is None:
             raise TaskSkipped(
@@ -1732,7 +2231,7 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
                 f"этого task_idx, а in_distr-соседа в прогоне нет. "
                 f"Задача пропускается."
             )
-        prec = load_prior_prec_from_results(
+        prec, temperature = load_prior_prec_from_results(
             args.prior_prec_source, task_idx, ggn_target=setup.target
         )
         prior_args = {
@@ -1743,6 +2242,8 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
             "samples": 0,
             "diag_probes": args.diag_hutchinson,
         }
+        if temperature is not None:
+            prior_args["temperature"] = temperature
         prior_prec_source = "results.pkl"
         ggn_reused = True
 
@@ -1765,6 +2266,7 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
         mode=args.jv_mode, fwd_batch=args.fwd_batch,
         save_images=True, diag_probes=args.diag_hutchinson,
         channel_names=channel_names, jacobian_cls=setup.jacobian_cls,
+        bind=setup.bind, kfac=setup.kfac,
     )
     test_metrics = evaluate_luno(
         args, pipeline["test_loader"], model_fn, w0, low_rank, prior_args, wrapper,
@@ -1775,6 +2277,7 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
         mode=args.jv_mode, fwd_batch=args.fwd_batch,
         save_images=False, diag_probes=args.diag_hutchinson,
         channel_names=channel_names, jacobian_cls=setup.jacobian_cls,
+        bind=setup.bind, kfac=setup.kfac,
     )
 
     results = {
@@ -1784,8 +2287,14 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
         "task_type": cfg.get("task_type"),
         "in_distr": in_distr,
         "ggn_target": setup.target,
+        # Метод UQ: у in_distr -- по своим настройкам, у остальных -- метод
+        # in_distr-задачи, от которой унаследованы GGN и prior_prec.
+        "uq_method": method_from_terms(setup.target, low_rank),
         "w0_dim": int(w0.numel()),
         "prior_prec": prior_args["prior_prec"].item(),
+        # Температура (только полная GGN лифтинга): Sigma = T (prec I + G)^{-1}.
+        "temperature": (float(prior_args["temperature"])
+                        if prior_args.get("temperature") is not None else None),
         "prior_prec_source": prior_prec_source,
         "ggn_reused": ggn_reused,
         "shared_from_task_idx": shared_from,
@@ -1806,7 +2315,8 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
         # max_rank остаётся значением CLI, чтобы не ломать сравнение с ранами.
         "ggn_source": ggn_source,
         "ggn_checkpoint": ggn_checkpoint,
-        "ggn_rank": int(low_rank.U.shape[1]),
+        "ggn_rank": (int(low_rank.U.shape[1])
+                     if isinstance(low_rank, LowRankTerms) else None),
         "diag_hutchinson": args.diag_hutchinson,
         "max_eval_samples": len(pipeline["val_eval_loader"].dataset),
         "max_test_samples": len(pipeline["test_loader"].dataset),
@@ -1856,8 +2366,11 @@ def main():
     in_distr_by_task_idx = build_in_distr_task_map(task_configs)
 
     # --- core общий для всех задач: загрузка и перенос на device ОДИН раз ---
+    _install_pickle_compat()
     print("Загрузка core (torch.load + dill):")
-    core = rmi.load_from_dir(args.core_checkpoint)[0]
+    # Сначала на CPU (чекпойнт может быть сохранён с CUDA-тензорами), на
+    # нужное устройство ядро переносится сразу ниже.
+    core = rmi.load_from_dir(args.core_checkpoint, {"map_location": "cpu"})[0]
 
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
     core = core.to(device=device)
@@ -1887,41 +2400,57 @@ def main():
         else output_config.get("root", "runs")
     )
     run_prefix = args.run_name if args.run_name is not None else config_path.stem
-    run_name = f"{run_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # Метка метода UQ в имени папки: {prefix}_{время}_{target}_{iso|lowrank|kfac}.
+    method_label = run_method_label(args, selected)
+    run_name = (f"{run_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                f"_{method_label}")
+    print(f"[method] {method_label}")
     output_dir = rmi.resolve_path(output_root) / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"output_dir: {output_dir}")
 
-    # --- сплит: last FNO block core -> w0 (один раз, core общий) ---
-    wrapper = TorchFNOWrapper(core, dtype=DTYPE)
-    _, w0 = split_wrapper(wrapper)
-    print(f"[split] w0: d={w0.numel()}, dtype={w0.dtype}, device={w0.device}")
+    # --- сплит ядра: нужен только для --ggn-target last-block ---
+    # Для лифтинга ядро -- чёрный ящик (TorchLiftingWrapper вызывает core(z)),
+    # поэтому никаких предположений о FNO здесь нет: подходит любое ядро с
+    # поддержкой forward-mode AD.
+    n_core = sum(p.numel() for p in core.parameters())
+    print(f"[core] {type(core).__module__}.{type(core).__qualname__}, "
+          f"параметров={n_core:,}")
+    # FNO-сплит нужен, если хотя бы одна выбранная задача (с учётом её
+    # luno.ggn_target) считает GGN по последнему блоку.
+    wrapper, w0 = None, None
+    targets = {apply_task_overrides(args, cfg).ggn_target for _, cfg in selected}
+    print(f"[ggn] target по задачам: {sorted(targets)}")
+    if "last-block" in targets:
+        wrapper = TorchFNOWrapper(core, dtype=DTYPE)
+        _, w0 = split_wrapper(wrapper)
+        print(f"[split] w0: d={w0.numel()}, dtype={w0.dtype}, device={w0.device}")
 
-    keys = discover_last_block_keys(core)
-    print("\n[последний фурье-слой core]:")
-    for label in ("R", "W", "b"):
-        path, cls, attr = _resolve_key_owner(core, keys[label])
-        print(f"    {label}: layer='{path}' ({cls}, attr='{attr}')")
-    R, W, b = ref_state_dict(core, keys)
-    print(f"    R: {tuple(R.shape)} (complex -> R.real | R.imag)")
-    print(f"    W: {tuple(W.shape)}")
-    print(f"    b: {tuple(b.shape) if b is not None else None}")
-    assert torch.is_complex(R), (
-        "Спектральный вес R стал некомплексным (мнимая часть потеряна из-за "
-        "core.to(dtype=...)). Не кастать core целиком в float64; см. комментарий"
-        " к переносу core на device в main."
-    )
+        keys = discover_last_block_keys(core)
+        print("\n[последний фурье-слой core]:")
+        for label in ("R", "W", "b"):
+            path, cls, attr = _resolve_key_owner(core, keys[label])
+            print(f"    {label}: layer='{path}' ({cls}, attr='{attr}')")
+        R, W, b = ref_state_dict(core, keys)
+        print(f"    R: {tuple(R.shape)} (complex -> R.real | R.imag)")
+        print(f"    W: {tuple(W.shape)}")
+        print(f"    b: {tuple(b.shape) if b is not None else None}")
+        assert torch.is_complex(R), (
+            "Спектральный вес R стал некомплексным (мнимая часть потеряна из-за "
+            "core.to(dtype=...)). Не кастать core целиком в float64; см. комментарий"
+            " к переносу core на device в main."
+        )
 
-    # Верификация сплита (реконструкция весов core из w0).
-    base = wrapper._base_state_dict()
-    recon = wrapper.reconstruct(w0)
-    max_diff = max(
-        (recon[k] - base[k]).abs().max().item()
-        for k in base
-    )
-    status = "SPLIT OK" if max_diff == 0 else f"SPLIT NOT OK (max diff={max_diff:.3e})"
-    print(f"    [проверка] max |reconstruct(w0) - base| = {max_diff:.3e} -> {status}")
-    _print_mem("after_split_w0", device)
+        # Верификация сплита (реконструкция весов core из w0).
+        base = wrapper._base_state_dict()
+        recon = wrapper.reconstruct(w0)
+        max_diff = max(
+            (recon[k] - base[k]).abs().max().item()
+            for k in base
+        )
+        status = "SPLIT OK" if max_diff == 0 else f"SPLIT NOT OK (max diff={max_diff:.3e})"
+        print(f"    [проверка] max |reconstruct(w0) - base| = {max_diff:.3e} -> {status}")
+        _print_mem("after_split_w0", device)
 
     asset_cache = {}
     # Общий кэш значений in_distr-задач:

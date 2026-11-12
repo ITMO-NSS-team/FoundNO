@@ -28,9 +28,19 @@ def create_luno_cov(curv_est: LowRankTerms, prior_args: dict, params=None):
     if not isinstance(prec, dict):
         if not isinstance(prec, torch.Tensor):
             prec = torch.tensor(prec, dtype=U.dtype, device=U.device)
-        return linverse(
+        cov = linverse(
             IsotropicScalingPlusSymmetricLowRank(prec.to(U), U, S.to(U.dtype))
         )
+        # Температура T: Sigma = T * (prec I + U S U^T)^{-1}. При полной
+        # кривизне prior_prec влияет только на слабо определённые направления, и
+        # общий масштаб std задаёт T (см. calibrate_prior_prec). U не копируется.
+        temp = prior_args.get("temperature")
+        if temp is not None:
+            temp = torch.as_tensor(temp, dtype=U.dtype, device=U.device)
+            cov = IsotropicScalingPlusSymmetricLowRank(
+                cov.scalar * temp, cov.U, cov.S * temp
+            )
+        return cov
 
     if params is None:
         raise ValueError("Params required for block-diagonal prior")

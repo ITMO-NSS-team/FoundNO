@@ -387,3 +387,62 @@ class BoundAffine:
         for j in range(k):
             out[:, j] = self.jv(weights[:, j])
         return out
+
+
+class LastBlockSuffix:
+    """Срез замороженного префикса: ``f(x, w) = suffix(state(x), w)``.
+
+    От весов последнего блока ``w = (R, W, b)`` зависит только хвост сети::
+
+        z     = [лифтинг + fno_blocks 0..nl-1](x)          # от w не зависит
+        s     = conv(z; R, b) + transform(skip(z; W))
+        f     = projection(core_tail(channel_mlp(s) + channel_mlp_skip(z)))
+
+    Поэтому ``z`` и ``channel_mlp_skip(z)`` считаются ОДИН раз на сэмпл
+    (:meth:`bind`), а все ``J v`` / ``J^T u`` дифференцируют только
+    :meth:`suffix_fn` -- один блок плюс проекции вместо всей сети. Это тот же
+    якобиан, а не приближение: ``suffix_fn(state, w) == model_fn(x, w)`` для
+    любого ``w`` (в отличие от ``mode="affine"``, здесь conv по-прежнему
+    дифференцирует AD, меняется только точка входа).
+
+    Использование: ``fn, state = suffix.bind(x)`` и дальше
+    ``LastFNOBlockWeightJacobian(fn, state, w0, ...)`` -- класс якобиана
+    получает ``state`` на месте ``x`` и ничего не знает о срезе.
+
+    Применимость проверяет :class:`AffineLastBlock` (та же структура блока), а
+    на каждом сэмпле -- гейты ``BoundAffine._capture``.
+    """
+
+    def __init__(self, affine: AffineLastBlock, model_fn, w0: torch.Tensor):
+        self.p = affine
+        self._model_fn = model_fn
+        self._w0 = w0
+
+    def suffix_fn(self, state, w: torch.Tensor) -> torch.Tensor:
+        z, cskip = state
+        p = self.p
+        n_r, n_w = p.n_r, p.n_w
+        R = torch.complex(
+            w[:n_r].reshape(p.R_shape), w[n_r: 2 * n_r].reshape(p.R_shape)
+        )
+        params = {p._R_key: R}
+        if p._b_key is not None:
+            params[p._b_key] = w[2 * n_r + n_w:].reshape(p.b_shape)
+        W = w[2 * n_r: 2 * n_r + n_w].reshape(p.W_shape)
+        s = functional_call(p.conv, params, (z,)) + p.conv.transform(
+            functional_call(p.skip, {p._W_key: W}, (z,)), output_shape=None
+        )
+        return p.projection(p.core_tail(p.cmlp(s) + cskip))
+
+    def bind(self, x: torch.Tensor):
+        """Один forward префикса на сэмпл: ``(suffix_fn, (z, cskip))``."""
+        bound = BoundAffine(self.p, x, self._model_fn, self._w0)
+        state = (bound.z, bound.cskip)
+        with torch.no_grad():
+            rel = _rel_err(self.suffix_fn(state, self._w0), bound.fx)
+        if rel > 1e-4:
+            raise AffineLastBlockError(
+                f"suffix_fn не воспроизводит модель (rel={rel:.3e}): структура "
+                "последнего блока отличается от ожидаемой."
+            )
+        return self.suffix_fn, state

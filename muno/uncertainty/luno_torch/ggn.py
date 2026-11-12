@@ -6,7 +6,9 @@ import torch
 
 from .jacobian import LastFNOBlockWeightJacobian, LiftingWeightJacobian
 from .lino_ops import LinearOperator
-from .progress import tqdm
+import time
+
+from .progress import tqdm, write
 
 @dataclass
 class LowRankTerms:
@@ -54,7 +56,15 @@ class GGNMatvec(LinearOperator):
         num_output_channels: int | None = None,
         vjp_chunk: int = 64,
         sample_batch_size: int = 1,
+        bind: callable | None = None,
     ):
+        # Подпись внутреннего прогресс-бара; randomized_eigh пишет сюда номер
+        # прохода ("[GGN] проход 2/3"), чтобы было видно, где идёт расчёт.
+        self.progress_label = "[GGN]"
+        # ``bind(x) -> (model_fn, state)``: необязательная пер-сэмпловая привязка.
+        # Для last-block это срез замороженного префикса (лифтинг + блоки до
+        # последнего считаются один раз на сэмпл, см. affine.LastBlockSuffix).
+        self._bind_fn = bind
         self._model_fn = model_fn
         self._w0 = w0
         self._affine = affine
@@ -91,26 +101,44 @@ class GGNMatvec(LinearOperator):
     def device(self) -> torch.device:
         return self._w0.device
 
-    def _accum(self, vv: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-        """Суммирует по сэмплам ``sum_s J_s^T (2 J_s v)`` для блока направлений ``vv``."""
-        out.zero_()
-        bar = tqdm(
-            total=len(self._xs_cpu), desc="[GGN] сэмплы", unit="smp",
-            leave=False, position=0,
-        )
+    def _bind(self, x: torch.Tensor):
+        """``(model_fn, x)`` для одного сэмпла; ``bind`` может срезать замороженный префикс."""
+        if self._bind_fn is None:
+            return self._model_fn, x
+        return self._bind_fn(x)
+
+    def _matmul(self, v: torch.Tensor) -> torch.Tensor:
+        """``G v`` или ``G @ V`` (``V`` формы ``(d, k)``) за ОДИН проход по сэмплам.
+
+        Сэмпл -- снаружи, чанки колонок -- внутри: на сэмпл строится один якобиан
+        и один обратный граф, который переиспользуется для всех ``k`` колонок.
+        Порядок "чанк снаружи, сэмплы внутри" строил бы граф заново на каждую
+        пару (сэмпл, чанк), то есть ``k / fwd_batch`` раз на сэмпл.
+        """
+        v = v.to(self._w0)
+        squeeze = v.dim() == 1
+        V = v.unsqueeze(-1) if squeeze else v
+        d = self._w0.numel()
+        k = V.shape[-1]
         device = self._w0.device
-        step_dir = max(1, int(self._fwd_batch))
-        for batch_start in range(0, len(self._xs_cpu), self._sample_batch_size):
-            batch_end = min(batch_start + self._sample_batch_size, len(self._xs_cpu))
-            x_batch_cpu = self._xs_cpu[batch_start:batch_end]
-            x_batch_gpu = []
-            for x_c in x_batch_cpu:
-                x_g = x_c.to(device=device)
-                x_batch_gpu.append(x_g)
-            for x_g in x_batch_gpu:
+        out = torch.zeros(d, k, dtype=self._w0.dtype, device=device)
+        step = max(1, int(self._fwd_batch))
+        n_smp = len(self._xs_cpu)
+        n_chunks = -(-k // step)
+        # Единица работы -- чанк колонок одного сэмпла (JVP + VJP на fwd_batch
+        # колонок). Так бар двигается и внутри сэмпла, и видно, сколько колонок
+        # ранга уже посчитано.
+        bar = tqdm(
+            total=n_smp * n_chunks, desc=f"{self.progress_label} колонки",
+            unit="chunk", leave=False, position=1,
+        )
+        try:
+            for i_smp, x_c in enumerate(self._xs_cpu):
+                x_g = x_c.to(device=device) if torch.is_tensor(x_c) else x_c
+                fn, state = self._bind(x_g)
                 jac = self.jacobian_cls(
-                    self._model_fn,
-                    x_g,
+                    fn,
+                    state,
                     self._w0,
                     affine=self._affine,
                     mode=self._mode,
@@ -118,33 +146,25 @@ class GGNMatvec(LinearOperator):
                     num_output_channels=self._num_output_channels,
                     vjp_chunk=self._vjp_chunk,
                 )
-                Jv = jac._matmul(vv)
-                jac._ensure_vjp()
-                gv = jac._vjp_cols(Jv)
-                del Jv
-                out.add_(gv)
-                del gv
-                jac._release_vjp()
-                del jac, x_g
-                bar.update(1)
-            del x_batch_gpu
-        bar.close()
+                try:
+                    jac._ensure_vjp()
+                    for c0 in range(0, k, step):
+                        c1 = min(c0 + step, k)
+                        Jv = jac._matmul(V[:, c0:c1])
+                        out[:, c0:c1].add_(jac._vjp_cols(Jv))
+                        del Jv
+                        bar.set_postfix_str(
+                            f"сэмпл {i_smp + 1}/{n_smp}, колонки {c1}/{k}",
+                            refresh=False,
+                        )
+                        bar.update(1)
+                finally:
+                    jac._release_vjp(collect=False)
+                del jac, fn, state, x_g
+        finally:
+            bar.close()
         out *= 2.0 * self._factor
-        return out
-
-    def _matmul(self, v: torch.Tensor) -> torch.Tensor:
-        v = v.to(self._w0)
-        d = self._w0.numel()
-        if v.dim() == 1:
-            out = torch.empty(d, 1, dtype=self._w0.dtype, device=self._w0.device)
-            self._accum(v.unsqueeze(-1), out)
-            return out.squeeze(-1)
-        k = v.shape[-1]
-        out = torch.empty(d, k, dtype=self._w0.dtype, device=self._w0.device)
-        step = max(1, int(self._fwd_batch))
-        for c0 in range(0, k, step):
-            self._accum(v[..., c0:c0 + step], out[..., c0:c0 + step])
-        return out
+        return out.squeeze(-1) if squeeze else out
 
 
 class LiftingGGNMatvec(GGNMatvec):
@@ -190,6 +210,74 @@ def _orthonormalize(Y: torch.Tensor) -> torch.Tensor:
     return Y @ M
 
 
+def _nystrom_eigh(
+    Q: torch.Tensor, Y: torch.Tensor, rank: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Собственное разложение ранга ``rank`` по скетчу ``Y = A Q`` (Nystrom).
+
+    Для PSD-оператора ``A`` и ортонормированного ``Q`` приближение
+    ``A ~= Y (Q^T Y)^+ Y^T`` не требует ещё одного умножения на ``A``: проекция
+    Рэлея-Ритца ``Q^T A Q`` стоила бы отдельного прохода по всем сэмплам, а
+    здесь ``Q^T Y`` -- это уже посчитанное ``Q^T A Q``.
+
+    Как в Tropp et al. (2017, алг. 3): сдвиг ``nu`` стабилизирует обращение
+    ``Q^T Y`` и вычитается из собственных значений в конце. Все разложения --
+    над матрицами ``(q, q)`` в float64; полноразмерные операции -- два Gram'а и
+    один GEMM ``Y @ M``. ``Q`` и ``Y`` потребляются (``Y`` сдвигается на месте).
+    """
+    q = Y.shape[1]
+    f64 = torch.float64
+    nu = float(torch.finfo(Y.dtype).eps) * float(torch.linalg.matrix_norm(Y))
+    Y.add_(Q, alpha=nu)
+    B = (Q.T @ Y).to(f64)
+    del Q
+    B = 0.5 * (B + B.T)
+    # Псевдообратный корень B через eigh: Cholesky падает, как только ранг A
+    # меньше q (хвост спектра B уходит в шум округления).
+    lam_b, V_b = torch.linalg.eigh(B)
+    keep = lam_b > lam_b.max().clamp_min(0.0) * q * torch.finfo(Y.dtype).eps
+    M1 = V_b[:, keep] / torch.sqrt(lam_b[keep])
+    W = (Y.T @ Y).to(f64)
+    W = M1.T @ (0.5 * (W + W.T)) @ M1
+    sig2, V = torch.linalg.eigh(0.5 * (W + W.T))
+    order = torch.argsort(sig2, descending=True)[:rank]
+    sig2 = sig2[order].clamp_min(torch.finfo(f64).tiny)
+    M = (M1 @ V[:, order]) / torch.sqrt(sig2)
+    U = Y @ M.to(Y.dtype)
+    S = (sig2 - nu).clamp_min(0.0).to(Y.dtype)
+    if U.shape[1] < rank:
+        # Ранг A меньше запрошенного: дополняем нулевыми направлениями, чтобы
+        # форма (d, rank) не зависела от данных (S там равно нулю).
+        pad = rank - U.shape[1]
+        U = torch.cat([U, U.new_zeros(U.shape[0], pad)], dim=1)
+        S = torch.cat([S, S.new_zeros(pad)])
+    return U, S
+
+
+def _nystrom_values(Q: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Собственные значения Nystrom-приближения ``Y (Q^T Y)^+ Y^T`` по убыванию.
+
+    Та же арифметика, что в :func:`_nystrom_eigh` (сдвиг ``nu``, обрезка
+    вырожденного хвоста ``Q^T Y``), но без полноразмерных буферов: только
+    матрицы ``(q, q)``; ``Y`` не меняется.
+    """
+    q = Y.shape[1]
+    f64 = torch.float64
+    eps = torch.finfo(Y.dtype).eps
+    nu = float(eps) * float(torch.linalg.matrix_norm(Y))
+    QtY = (Q.T @ Y).to(f64)
+    B = 0.5 * (QtY + QtY.T) + nu * torch.eye(q, dtype=f64, device=QtY.device)
+    lam_b, V_b = torch.linalg.eigh(B)
+    keep = lam_b > lam_b.max().clamp_min(0.0) * q * eps
+    M1 = V_b[:, keep] / torch.sqrt(lam_b[keep])
+    # (Y + nu Q)^T (Y + nu Q) = Y^T Y + nu (Q^T Y + Y^T Q) + nu^2 I
+    G = (Y.T @ Y).to(f64)
+    G = 0.5 * (G + G.T) + nu * (QtY + QtY.T) + nu ** 2 * torch.eye(q, dtype=f64, device=G.device)
+    W = M1.T @ G @ M1
+    sig2 = torch.linalg.eigvalsh(0.5 * (W + W.T)).flip(0)
+    return (sig2 - nu).clamp_min(0.0)
+
+
 def randomized_eigh(
     mv: LinearOperator,
     n: int,
@@ -201,6 +289,15 @@ def randomized_eigh(
     """Randomized symmetric eigendecomposition (Halko) with power iterations.
 
     Returns ``(U, S)`` with orthonormal columns, ``U diag(S) U^T ~= A``.
+
+    Стоит ``power_iter + 1`` умножений на ``A`` (проходов по данным): финальная
+    проекция берётся из того же скетча в форме Nystrom, см.
+    :func:`_nystrom_eigh`. ``A`` предполагается симметричным PSD (GGN).
+    ``power_iter=2`` (по умолчанию) даёт подпространство ``A^3 Omega`` -- как
+    прежняя схема Рэлея-Ритца, которой на это нужно было 4 прохода, а здесь 3.
+    ``power_iter=1`` -- 2 прохода; ведущие, хорошо отделённые собственные пары
+    остаются точными, но в плоском хвосте спектра ошибка значений растёт до
+    процентов (см. tests/test_luno_fast.py).
     """
     q = min(rank + oversample, n)
     gen = None
@@ -210,26 +307,77 @@ def randomized_eigh(
         gen = torch.Generator(device=mv.device)
     gen.manual_seed(seed)
 
-    Q = torch.randn(n, q, dtype=mv.dtype, device=mv.device, generator=gen)
-    for _ in range(power_iter):
-        Y = mv._matmul(Q)
-        del Q
-        Q = _orthonormalize(Y)
-        del Y
-    Y = mv._matmul(Q)
-    del Q
-    Q = _orthonormalize(Y)
-    del Y
+    n_pass = power_iter + 1
+    write(f"[GGN] скетч: rank={rank}, q=rank+oversample={q}, d={n:,}, "
+          f"проходов по сэмплам={n_pass} (power_iter={power_iter} + Nystrom)")
+    progress = _SketchProgress(mv, rank, n_pass)
 
-    T = mv._matmul(Q)
-    B = Q.T @ T
-    del T
-    B = (B + B.T) / 2.0
-    evals, evecs = torch.linalg.eigh(B)
-    order = torch.argsort(evals, descending=True)
-    U = Q @ evecs[:, order[:rank]]
-    S = evals[order[:rank]]
-    return U, S
+    Q = _orthonormalize(
+        torch.randn(n, q, dtype=mv.dtype, device=mv.device, generator=gen)
+    )
+    try:
+        for _ in range(power_iter):
+            Y = progress.matmul(Q)
+            del Q
+            Q = _orthonormalize(Y)
+            del Y
+        Y = progress.matmul(Q)
+    finally:
+        progress.close()
+    return _nystrom_eigh(Q, Y, rank)
+
+
+class _SketchProgress:
+    """Прогресс скетча: бар по проходам + строка с оценкой спектра после каждого.
+
+    После каждого прохода ``Y = A Q`` печатаются собственные значения
+    Nystrom-приближения ``Y (Q^T Y)^+ Y^T`` -- ровно то, что вернёт
+    :func:`_nystrom_eigh`, если остановиться на этом проходе (на последнем они
+    совпадают с итоговым ``S``). Стоит один Gram ``(q, q)`` по ``Y``.
+    Относительное изменение ведущих ``rank`` значений между проходами
+    показывает, сошёлся ли скетч. Оценки Ритца ``eig(Q^T Y)`` здесь не годятся:
+    на первом проходе ``Q`` -- случайное подпространство, и они занижены на
+    порядки. Матвек ``mv`` -- любой ``LinearOperator``; подпись внутреннего
+    бара выставляется, только если у него есть ``progress_label``.
+    """
+
+    def __init__(self, mv, rank: int, n_pass: int):
+        self.mv, self.rank, self.n_pass = mv, rank, n_pass
+        self.i = 0
+        self.prev = None
+        self.t0 = time.perf_counter()
+        self.bar = tqdm(total=n_pass, desc="[GGN] проходы скетча", unit="pass",
+                        leave=False, position=0)
+
+    def matmul(self, Q: torch.Tensor) -> torch.Tensor:
+        self.i += 1
+        if hasattr(self.mv, "progress_label"):
+            self.mv.progress_label = f"[GGN] проход {self.i}/{self.n_pass}"
+        t = time.perf_counter()
+        Y = self.mv._matmul(Q)
+        dt = time.perf_counter() - t
+        self.bar.update(1)
+        self._log(Q, Y, dt)
+        return Y
+
+    def _log(self, Q: torch.Tensor, Y: torch.Tensor, dt: float) -> None:
+        ev = _nystrom_values(Q, Y)[: self.rank].cpu()
+        shown = ", ".join(f"{v:.3e}" for v in ev[:5].tolist())
+        more = f" ... {ev[-1].item():.3e}" if ev.numel() > 5 else ""
+        conv = ""
+        if self.prev is not None and self.prev.numel() == ev.numel():
+            rel = ((ev - self.prev).abs() / ev.clamp_min(1e-30)).max().item()
+            conv = f"; max отн. изменение за проход={rel:.1e}"
+        self.prev = ev
+        elapsed = time.perf_counter() - self.t0
+        left = (self.n_pass - self.i) * dt
+        write(f"[GGN] проход {self.i}/{self.n_pass}: {dt:.0f} с "
+              f"(всего {elapsed:.0f} с, осталось ~{left:.0f} с); "
+              f"собств. значения GGN (Nystrom, {self.rank} шт.): "
+              f"{shown}{more}{conv}")
+
+    def close(self) -> None:
+        self.bar.close()
 
 
 def skerch_low_rank(
@@ -528,6 +676,127 @@ def low_rank_lifting_ggn(
         plan=plan,
         strict=strict,
     )
+
+
+def auto_ggn_mc(d: int, n_samples: int, fwd_batch: int = 1, oversample: float = 1.1) -> int:
+    """Число случайных котангенсов на сэмпл, чтобы ``n_samples * n_mc >= 1.1 d``.
+
+    Ранг сэмплированной GGN не больше ``n_samples * n_mc``; меньший ранг
+    оставил бы часть направлений весов без кривизны (там работал бы только
+    prior). Округляется вверх до кратного ``fwd_batch`` (котангенсы идут
+    чанками), минимум 8.
+    """
+    n_mc = max(8, -(-int(oversample * d) // max(1, n_samples)))
+    step = max(1, int(fwd_batch))
+    return -(-n_mc // step) * step
+
+
+def _eigh_psd_full(G: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``eigh`` симметричной PSD-матрицы ``d x d`` по убыванию; ``(U, S)``.
+
+    На GPU ``syevd`` держит матрицу, собственные векторы и рабочий буфер
+    (~3-4 матрицы); при нехватке памяти разложение уходит на CPU, а векторы
+    возвращаются на исходное устройство. Используется нижний треугольник ``G``,
+    симметризация не нужна. Отрицательный шум округления обрезается до 0.
+    """
+    device = G.device
+    try:
+        S, U = torch.linalg.eigh(G)
+    except torch.cuda.OutOfMemoryError:
+        write(f"[GGN] eigh {tuple(G.shape)} не помещается в GPU -- считаю на CPU.")
+        G_cpu = G.cpu()
+        del G
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        S, U = torch.linalg.eigh(G_cpu)
+        del G_cpu
+        U = U.to(device)
+        S = S.to(device)
+    return U.flip(1), S.flip(0).clamp_min(0.0)
+
+
+def sampled_full_ggn(
+    model_fn: callable,
+    w0: torch.Tensor,
+    xs: list,
+    jacobian_cls,
+    n_mc: int,
+    fwd_batch: int = 2,
+    vjp_chunk: int = 16,
+    bind: callable | None = None,
+    factor: float = 1.0,
+    seed: int = 0,
+) -> LowRankTerms:
+    """Полная GGN ``d x d`` сэмплированием выхода и её собственное разложение.
+
+    ``G = factor * sum_s J_s^T (2I) J_s`` (MSE, как в :class:`GGNMatvec`)
+    оценивается несмещённо::
+
+        G ~= factor * sum_s (1/n_mc) sum_j g_sj g_sj^T,
+        g_sj = J_s^T eps_j,  eps_j ~ N(0, 2 I)
+
+    т.к. ``E[J^T eps eps^T J] = 2 J^T J``. На сэмпл -- один forward под
+    обратный граф и ``n_mc / fwd_batch`` обратных проходов; ни одного JVP и ни
+    одной строки ``J`` (выход ``m ~ 1e6`` точек не перебирается). Ранг оценки --
+    ``min(d, N * n_mc)``, поэтому для полной кривизны нужно ``N * n_mc >= d``
+    (см. :func:`auto_ggn_mc`).
+
+    Возвращает ``LowRankTerms(U, S)`` с ПОЛНЫМ базисом: ``U`` -- ``(d, d)``,
+    ``S`` -- все ``d`` собственных значений. Дальше пайплайн не отличает его от
+    низкорангового: ``(prior_prec I + U S U^T)^{-1}`` точна, так как базис
+    полный. Память -- две матрицы ``d x d`` (накопление и векторы), для
+    лифтинга (``d ~ 3e4``) это ~3.5 ГБ каждая во float32.
+    """
+    d = w0.numel()
+    device, dtype = w0.device, w0.dtype
+    if d > 60000:
+        raise ValueError(
+            f"sampled_full_ggn: d={d} слишком велико для матрицы d x d "
+            f"({d * d * 4 / 1024 ** 3:.0f} ГБ во float32); метод -- для лифтинга."
+        )
+    G = torch.zeros(d, d, dtype=dtype, device=device)
+    gen = torch.Generator(device=device).manual_seed(seed)
+    step = max(1, int(fwd_batch))
+    n_chunks = -(-n_mc // step)
+    alpha = float(factor) / n_mc
+    write(f"[GGN] полная сэмплированная GGN: d={d:,}, сэмплов={len(xs)}, "
+          f"n_mc={n_mc} (ранг оценки <= {len(xs) * n_mc:,}), "
+          f"обратных проходов={len(xs) * n_mc:,}")
+    bar = tqdm(total=len(xs) * n_chunks, desc="[GGN] сэмпл. котангенсы",
+               unit="chunk", leave=False, position=0)
+    t0 = time.perf_counter()
+    try:
+        for i_smp, x in enumerate(xs):
+            x = x.to(device=device) if torch.is_tensor(x) else x
+            fn, state = bind(x) if bind is not None else (model_fn, x)
+            jac = jacobian_cls(fn, state, w0, fwd_batch=fwd_batch, vjp_chunk=vjp_chunk)
+            try:
+                jac._ensure_vjp()
+                m = jac._m
+                for c0 in range(0, n_mc, step):
+                    c = min(step, n_mc - c0)
+                    eps = torch.randn(m, c, dtype=dtype, device=device, generator=gen)
+                    eps.mul_(2.0 ** 0.5)
+                    g = jac._vjp_cols(eps)  # (d, c) = J^T eps
+                    G.addmm_(g, g.transpose(0, 1), alpha=alpha)
+                    del eps, g
+                    bar.set_postfix_str(f"сэмпл {i_smp + 1}/{len(xs)}", refresh=False)
+                    bar.update(1)
+            finally:
+                jac._release_vjp(collect=False)
+            del jac, fn, state, x
+    finally:
+        bar.close()
+    write(f"[GGN] накопление: {time.perf_counter() - t0:.0f} с; eigh {d}x{d}...")
+    t1 = time.perf_counter()
+    U, S = _eigh_psd_full(G)
+    del G
+    tiny = float(S[0]) * d * torch.finfo(dtype).eps if S.numel() else 0.0
+    n_pos = int((S > tiny).sum())
+    write(f"[GGN] eigh: {time.perf_counter() - t1:.0f} с; собств. значения "
+          f"{float(S[0]):.3e} .. {float(S[min(n_pos, d) - 1]):.3e}, "
+          f"значимых {n_pos:,} из {d:,}")
+    return LowRankTerms(U=U, S=S, scalar=0.0)
 
 
 def to_dense(mv: LinearOperator) -> torch.Tensor:

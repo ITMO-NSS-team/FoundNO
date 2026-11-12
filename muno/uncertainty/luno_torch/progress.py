@@ -30,6 +30,9 @@ class _NullBar:
     def set_postfix(self, *a, **k):
         pass
 
+    def set_postfix_str(self, *a, **k):
+        pass
+
 
 def set_enabled(value: bool):
     """Глобальный выключатель прогресс-баров (--no-progress)."""

@@ -83,3 +83,108 @@ def compute_uq_metrics(pred, band, target, metric_configs=None):
             results[name] = float(value.detach().cpu())
 
     return results
+
+def normalized_ause(std: torch.Tensor, err2: torch.Tensor) -> torch.Tensor:
+    """Нормированная AUSE (sparsification error) по строкам ``(G, n)``.
+
+    Для каждой группы из ``n`` пикселей строятся две кривые «RMSE оставшихся
+    пикселей после удаления доли ``f`` пикселей»:
+
+    * по ``std`` -- удаляем самые неуверенные (по убыванию ``std``);
+    * оракул -- удаляем пиксели с наибольшей реальной ошибкой.
+
+    ``AUSE`` -- площадь между ними (``f`` от 0 до 1 с шагом ``1/n``). Нормировка
+    на площадь между случайным удалением (RMSE не меняется -- горизонтальная
+    линия на уровне полного RMSE) и оракулом делает метрику безразмерной::
+
+        0  -- std ранжирует пиксели как сама ошибка (идеал);
+        ~1 -- не лучше случайного порядка;
+        >1 -- хуже случайного (std больше там, где ошибка меньше).
+
+    Метрика зависит только от ПОРЯДКА ``std``: ни масштаб (prior_prec), ни
+    околонулевые значения ``std`` на неё не влияют, фильтр не нужен. Группа с
+    неконечным ``std`` или с нулевым знаменателем (все ошибки равны) даёт nan.
+
+    ``std`` и ``err2`` (квадрат ошибки) -- одной формы ``(G, n)``; возвращает
+    ``(G,)`` в float64. Стоимость -- две сортировки и два ``cumsum`` по строке.
+    """
+    if std.shape != err2.shape or std.dim() != 2:
+        raise ValueError(
+            f"normalized_ause: ожидались std и err2 формы (G, n), получено "
+            f"{tuple(std.shape)} и {tuple(err2.shape)}"
+        )
+    std = std.double()
+    err2 = err2.double()
+    n = std.shape[1]
+    counts = torch.arange(n, 0, -1, dtype=torch.float64, device=std.device)
+
+    def remaining_rmse(order_key):
+        # Сортировка по возрастанию ключа: удаление k худших оставляет первые
+        # n - k элементов, их RMSE -- из префиксной суммы.
+        idx = torch.argsort(order_key, dim=1)
+        cs = torch.cumsum(torch.gather(err2, 1, idx), dim=1)  # (G, n)
+        # r = n, n-1, ..., 1 оставшихся пикселей
+        return torch.sqrt(cs.flip(1) / counts)
+
+    by_std = remaining_rmse(std)
+    oracle = remaining_rmse(err2)
+    full = by_std[:, :1]
+    ause = (by_std - oracle).mean(dim=1)
+    denom = (full - oracle).mean(dim=1)
+    tiny = torch.finfo(torch.float64).tiny
+    ratio = torch.where(denom > tiny, ause / denom.clamp_min(tiny),
+                        torch.full_like(ause, float("nan")))
+    bad = ~torch.isfinite(std).all(dim=1) | ~torch.isfinite(err2).all(dim=1)
+    return torch.where(bad, torch.full_like(ratio, float("nan")), ratio)
+
+
+def reliability_bin_sums(
+    std: torch.Tensor, err2: torch.Tensor, n_bins: int = 10
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Суммы ``std²`` и ``err²`` по бинам предсказанного std, для строк ``(G, n)``.
+
+    Внутри каждой группы пиксели сортируются по ``std`` и делятся на ``n_bins``
+    бинов с одинаковым числом точек (бин ``b`` -- ``b``-я доля самых уверенных).
+    Бины строятся по ``std``, а не по ошибке: отбор по исходу смещает картину
+    даже у идеально откалиброванной модели (регрессия к среднему).
+
+    Возвращает ``(sum_std2, sum_err2, count)`` формы ``(G, n_bins)`` в float64.
+    Суммы аддитивны, поэтому их можно копить по сэмплам и только потом брать
+    ``RMV = sqrt(sum_std2 / count)``, ``RMSE = sqrt(sum_err2 / count)``. Группа
+    с неконечным ``std`` или ``err2`` получает nan во всех бинах.
+    """
+    if std.shape != err2.shape or std.dim() != 2:
+        raise ValueError(
+            f"reliability_bin_sums: ожидались std и err2 формы (G, n), получено "
+            f"{tuple(std.shape)} и {tuple(err2.shape)}"
+        )
+    g, n = std.shape
+    if n < n_bins:
+        raise ValueError(f"reliability_bin_sums: {n} пикселей меньше, чем {n_bins} бинов")
+    std = std.double()
+    err2 = err2.double()
+    idx = torch.argsort(std, dim=1)
+    s_std2 = torch.gather(std, 1, idx) ** 2
+    s_err2 = torch.gather(err2, 1, idx)
+    bin_of = (torch.arange(n, device=std.device) * n_bins) // n  # равные доли
+    sum_std2 = torch.zeros(g, n_bins, dtype=torch.float64, device=std.device)
+    sum_err2 = torch.zeros_like(sum_std2)
+    sum_std2.index_add_(1, bin_of, s_std2)
+    sum_err2.index_add_(1, bin_of, s_err2)
+    count = torch.bincount(bin_of, minlength=n_bins).to(sum_std2).expand(g, -1).clone()
+    bad = ~torch.isfinite(std).all(dim=1) | ~torch.isfinite(err2).all(dim=1)
+    sum_std2[bad] = float("nan")
+    sum_err2[bad] = float("nan")
+    return sum_std2, sum_err2, count
+
+
+def log_rmse_over_rmv(sum_err2: torch.Tensor, sum_std2: torch.Tensor) -> torch.Tensor:
+    """``log(RMSE / RMV)`` по накопленным суммам одного и того же набора точек.
+
+    Счётчики сокращаются: ``RMSE / RMV = sqrt(sum_err2 / sum_std2)``. 0 --
+    идеально, ``> 0`` -- std занижен (самоуверенность), ``< 0`` -- завышен;
+    ``±0.69`` -- ошибка в 2 раза. ``std = 0`` при ненулевой ошибке даёт
+    ``+inf``, ``0/0`` -- nan.
+    """
+    with torch.no_grad():
+        return 0.5 * torch.log(sum_err2 / sum_std2)

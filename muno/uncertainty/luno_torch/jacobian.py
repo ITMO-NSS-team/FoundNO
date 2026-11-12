@@ -123,9 +123,10 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         self._ensure_flat()
         if self._vjp_fn is not None:
             return self
-        with torch.no_grad():
-            self._fx = self._flat_fn(self._w0).detach()
-        self._vjp_fn = torch.func.vjp(self._flat_fn, self._w0)[1]
+        # Primal-выход vjp и есть f(x, w0): отдельный forward ради fx не нужен.
+        fx, self._vjp_fn = torch.func.vjp(self._flat_fn, self._w0)
+        self._fx = fx.detach()
+        self._m = self._fx.numel()
         self._vjp_rows = torch.vmap(
             lambda c: self._vjp_fn(c, create_graph=False)[0], in_dims=0
         )
@@ -145,8 +146,15 @@ class LastFNOBlockWeightJacobian(LinearOperator):
             self._bound = self._affine.bind(self._x, self._model_fn, self._w0)
         return self._bound
 
-    def _release_vjp(self):
-        """Освобождает удержанный forward-граф и аффинное состояние; следующий вызов пересчитает."""
+    def _release_vjp(self, collect: bool = True):
+        """Освобождает удержанный forward-граф и аффинное состояние; следующий вызов пересчитает.
+
+        ``collect=False`` пропускает ``gc.collect()`` и ``empty_cache()``: ссылки
+        на граф обнуляются явно, поэтому память и так возвращается в пул
+        аллокатора сразу. В горячем цикле GGN (тысячи сэмплов на проход) сами эти
+        два вызова стоят заметного времени, а освобождённые блоки тут же нужны
+        следующему сэмплу того же размера.
+        """
         self._fx = None
         self._m = None
         self._diag_JJT_cache = None
@@ -154,6 +162,8 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         self._vjp_rows = None
         self._vjp_cols = None
         self._bound = None
+        if not collect:
+            return self
         try:
             import gc
 
@@ -233,8 +243,9 @@ class LastFNOBlockWeightJacobian(LinearOperator):
         if k == 0:
             m = self._fx_numel()
             return torch.zeros(m, 0, dtype=w0.dtype, device=w0.device)
-        m = self._fx_numel()
-        out = torch.empty(m, k, dtype=w0.dtype, device=w0.device)
+        # Буфер выделяется по форме первого чанка: m известно из самого jvp,
+        # отдельный forward ради размера выхода не нужен.
+        out = None
         step = max(1, self._fwd_batch)
         for c0 in range(0, k, step):
             c1 = min(c0 + step, k)
@@ -244,6 +255,9 @@ class LastFNOBlockWeightJacobian(LinearOperator):
                     lambda t: torch.func.jvp(flat_fn, (w0,), (t,))[1],
                     in_dims=0, out_dims=0,
                 )(tangents)
+            if out is None:
+                self._m = outs.shape[1]
+                out = torch.empty(self._m, k, dtype=w0.dtype, device=w0.device)
             out[:, c0:c1] = outs.transpose(0, 1).detach()
             del tangents, outs
         return out
@@ -525,6 +539,7 @@ def _var_of_congruence_hutchinson(
     J: LastFNOBlockWeightJacobian,
     Sigma: IsotropicScalingPlusSymmetricLowRank,
     n_probe: int,
+    Z: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Оценка Хатчинсона для ``diag(J Sigma J^T)`` целиком, прямым режимом.
 
@@ -544,15 +559,42 @@ def _var_of_congruence_hutchinson(
     построению, а относительная ошибка ``~sqrt(2/n_probe)`` относится к самому
     ``var_i``, а не к большому ``scalar*diag_i``.
 
-    Стоимость прежняя: один ``J @ U`` (нужен и точному пути) плюс ``n_probe``
-    прямых проходов на ``J @ Z``; ``U^T Z`` и ``(k, c)``-умножения пренебрежимо дёшевы.
-
-    Обёртка над :func:`sample_congruence_probes` + :func:`var_from_congruence_probes`:
-    ради переиспользования проб на гриде ``prior_prec`` они вынесены наружу, а сами
-    оценки для одного и того же ``Z`` совпадают байт-в-байт.
+    Стоимость -- ровно ``n_probe`` прямых проходов: ``Sigma^{1/2}`` применяется
+    к ``Z`` в пространстве весов (``Z + U diag(coeff) U^T Z``, два GEMM'а
+    ``(d, k)``), и через сеть идёт уже готовое ``Sigma^{1/2} Z``. Отдельный
+    ``J @ U`` (ещё ``k`` проходов на сэмпл) здесь не нужен: он окупается только
+    на гриде ``prior_prec``, где пробы переиспользуются между кандидатами --
+    для этого есть :func:`sample_congruence_probes` +
+    :func:`var_from_congruence_probes`. Для одного и того же ``Z`` обе формы
+    дают одну и ту же оценку.
     """
-    A, B, W = sample_congruence_probes(J, Sigma.U, n_probe)
-    return var_from_congruence_probes(A, B, W, Sigma)
+    if n_probe < 1:
+        raise ValueError(f"n_probe должен быть >= 1, получено {n_probe}")
+    # ``Z`` (d, n_probe) можно передать готовым: один и тот же шум для разных
+    # Sigma (common random numbers на гриде калибровки). Сам Z не меняется.
+    if Z is not None and Z.shape[1] != n_probe:
+        raise ValueError(f"Z.shape[1]={Z.shape[1]} != n_probe={n_probe}")
+    scale, U, coeff = _cov_sqrt_isotropic_lowrank(Sigma)
+    w0 = J._w0
+    dtype, device = w0.dtype, w0.device
+    U = U.to(dtype=dtype, device=device)
+    coeff = coeff.to(dtype=dtype, device=device).unsqueeze(-1)
+    acc = None
+    step = max(1, J._fwd_batch)
+    for c0 in range(0, n_probe, step):
+        c = min(step, n_probe - c0)
+        # Bernoulli in-place -> {-1, +1} без второго буфера под Z.
+        if Z is None:
+            Zc = torch.empty(w0.numel(), c, dtype=dtype, device=device)
+            Zc.bernoulli_(0.5).mul_(2).sub_(1)
+        else:
+            Zc = Z[:, c0:c0 + c].to(dtype=dtype, device=device).clone()
+        # Zc <- (I + U diag(coeff) U^T) Zc на месте, без временного (d, c).
+        Zc.addmm_(U, coeff * (U.transpose(0, 1) @ Zc))
+        sq = (J._matmul(Zc) ** 2).sum(dim=1)
+        acc = sq if acc is None else acc.add_(sq)
+        del Zc
+    return acc * (scale.to(acc) ** 2 / n_probe)
 
 
 def var_of_congruence(

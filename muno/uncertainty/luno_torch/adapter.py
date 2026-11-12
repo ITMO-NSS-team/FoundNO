@@ -198,6 +198,12 @@ class TorchFNOWrapper:
 class TorchLiftingWrapper:
     """Split a Muno model into (lifting weights) / (fixed core+projection).
 
+    Архитектура ядра не важна: ``core`` вызывается как чёрный ящик
+    ``core(z)``, поэтому подходит FNO, трансформер, CNO и т.п. Требование одно --
+    ядро должно поддерживать forward-mode AD (``torch.func.jvp``) и, при
+    ``fwd_batch > 1``, ``torch.vmap`` над ним. Проверка для конкретного ядра --
+    ``--jacobian-check`` в ``run_luno_ggn_calibrate.py``.
+
     The linearized parameters are *all* parameters of the lifting module (for a
     neuralop ``ChannelMLP`` that is every ``fcs.<i>.weight`` / ``fcs.<i>.bias``),
     flattened into ``w0`` in ``named_parameters()`` order. The core and the
@@ -261,6 +267,13 @@ class TorchLiftingWrapper:
                 self.projection.eval()
             except Exception:
                 pass
+        # Лифтинг тоже в eval: в нём может быть dropout / шумовые аугментации
+        # (например, LiftingFeatureDropout у PostLiftMambaLifting), а якобиан
+        # должен считаться по детерминированной сети.
+        try:
+            self.lifting.eval()
+        except Exception:
+            pass
 
         params = list(lifting.named_parameters())
         if not params:
@@ -286,11 +299,14 @@ class TorchLiftingWrapper:
         self._total_numel = offset
 
         self.device = params[0][1].device
+        # Выход модели -- это выход проекции. out_channels ядра здесь не годится:
+        # в архитектуре адаптер-ядро-адаптер это скрытая ширина (например, 60
+        # вместо 4 физических полей).
         self.num_output_channels = (
             num_output_channels
             if num_output_channels is not None
-            else getattr(core, "out_channels", None)
-            or getattr(projection, "out_channels", None)
+            else getattr(projection, "out_channels", None)
+            or getattr(core, "out_channels", None)
         )
 
     def param_layout(self) -> list[tuple[str, tuple[int, ...], int, int]]:
