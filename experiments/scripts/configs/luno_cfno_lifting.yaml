@@ -1,0 +1,566 @@
+# LUNO для ядра CFNO (weights/cfno_9_11), обученного на смеси shear flow
+# (Re 1e4/1e5 x Schmidt 1e-1, 2e-1, 5e-1, 1e0, 5e0, 1e1; 30 кадров, 128x128,
+# Reynolds и Schmidt -- доп. входные каналы). Одна физика -> task_idx: 0.
+#
+# in_distr  -- та же смесь, что в обучении: строит GGN (lifting) и калибрует.
+# out_distr -- только оценка с GGN и prior_prec in_distr-задачи этого прогона
+#              (метод и калибровочные ключи у них не задаются):
+#   Re5e4_Sc1e0  -- Reynolds между обученными (интерполяция);
+#   Re5e5_Sc1e0  -- Reynolds выше обученных (экстраполяция);
+#   Re1e4_Sc2e0  -- Schmidt между обученными (интерполяция);
+#   time         -- Re1e4 Sc1e0, горизонт x2 (кадры через один, те же 30);
+#   space        -- Re1e4 Sc1e0, сетка 256x256 вместо 128x128.
+
+output:
+  root: /workspace/fno_uq_runs
+
+seed:
+  value: 42
+  deterministic: false
+
+inspections:
+  enabled: true
+
+tasks:
+  # Обучающая смесь (тот же список файлов, что при обучении).
+  - name: thewell_shear_flow_mix
+    task_idx: 0
+    task_type: in_distr
+    luno:
+      # Метод UQ: полная GGN лифтинга (d x d) сэмплированием выхода;
+      # калибруются prior_prec и температура. Лифтинг CFNO (2 слоя, 6 -> 90)
+      # -- d порядка 1e4: матрица d x d ~0.4 ГБ, eigh -- секунды.
+      ggn_target: lifting
+      jv_mode: forward
+      # Выход 4 x 30 x 128 x 128 (~2M) вдвое больше CFD: по 1 котангенсу/пробе
+      # за проход, чтобы обратный граф CFNO уместился в 15 ГБ.
+      fwd_batch: 1
+      vjp_chunk: 16
+      # GGN по всему train смеси (~330 сэмплов); ggn_mc: 0 -- авто, сэмплов x
+      # ggn_mc >= 1.1 d (~30): ~1e4 обратных проходов, ~1 ч.
+      max_num_samples: 400
+      ggn_mc: 0
+      val_calib_frac: 0.8
+      # Сэмплов в val/test мало (десятки): 32 пробы, шум std ~12 %. Одно число
+      # на всех задачах и в Iso-конфиге -- метрики сравнимы.
+      diag_hutchinson: 32
+      # При полном базисе дисперсия считается отдельными пробами на каждого
+      # кандидата: 25 x 32 = 800 JVP на сэмпл (~5 мин) -> 12 сэмплов (~1 ч);
+      # для двух скаляров (prior_prec, температура) хватает. Грид как в
+      # luno_turbo_inf.yaml: масштаб std задаёт температура.
+      calib_max_samples: 12
+      calib_grid_min: -2.0
+      calib_grid_max: 10.0
+      calib_grid_size: 25
+      calib_objective: nll
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/TheWell/shear_flow/hf_cache
+      field_groups:
+        t0_fields: [tracer, pressure]
+        t1_fields: [velocity]
+        t2_fields: []
+      axis_selection:
+        0:
+          slice: [0, 30, 1]
+        1:
+          slice: [0, 256, 2]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e-1.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e-1.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e-1.hdf5
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e1.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e1.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e1.hdf5
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_2e-1.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_2e-1.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_2e-1.hdf5
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_5e-1.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_5e-1.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_5e-1.hdf5
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_5e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_5e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_5e0.hdf5
+        - filename: data/train/shear_flow_Reynolds_1e5_Schmidt_1e-1.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e5_Schmidt_1e-1.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e5_Schmidt_1e-1.hdf5
+        - filename: data/train/shear_flow_Reynolds_1e5_Schmidt_1e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e5_Schmidt_1e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e5_Schmidt_1e0.hdf5
+        - filename: data/train/shear_flow_Reynolds_1e5_Schmidt_1e1.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e5_Schmidt_1e1.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e5_Schmidt_1e1.hdf5
+        - filename: data/train/shear_flow_Reynolds_1e5_Schmidt_2e-1.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e5_Schmidt_2e-1.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e5_Schmidt_2e-1.hdf5
+        - filename: data/train/shear_flow_Reynolds_1e5_Schmidt_5e-1.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e5_Schmidt_5e-1.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e5_Schmidt_5e-1.hdf5
+        - filename: data/train/shear_flow_Reynolds_1e5_Schmidt_5e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e5_Schmidt_5e0.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+      # Ядро обучено с Reynolds и Schmidt как константными входными каналами.
+      extra_channels:
+        - name: reynolds_from_data
+          type: constant
+          source: metadata
+          key: Reynolds
+          target: x
+        - name: schmidt_from_data
+          type: constant
+          source: metadata
+          key: Schmidt
+          target: x
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: false
+      val:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_shear_flow_Re5e4_Sc1e0
+    task_idx: 0
+    task_type: out_distr
+    luno:
+      jv_mode: forward
+      fwd_batch: 2
+      diag_hutchinson: 32
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/TheWell/shear_flow/hf_cache
+      field_groups:
+        t0_fields: [tracer, pressure]
+        t1_fields: [velocity]
+        t2_fields: []
+      axis_selection:
+        0:
+          slice: [0, 30, 1]
+        1:
+          slice: [0, 256, 2]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: data/train/shear_flow_Reynolds_5e4_Schmidt_1e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_5e4_Schmidt_1e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_5e4_Schmidt_1e0.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+      # Ядро обучено с Reynolds и Schmidt как константными входными каналами.
+      extra_channels:
+        - name: reynolds_from_data
+          type: constant
+          source: metadata
+          key: Reynolds
+          target: x
+        - name: schmidt_from_data
+          type: constant
+          source: metadata
+          key: Schmidt
+          target: x
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: false
+      val:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_shear_flow_Re5e5_Sc1e0
+    task_idx: 0
+    task_type: out_distr
+    luno:
+      jv_mode: forward
+      fwd_batch: 2
+      diag_hutchinson: 32
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/TheWell/shear_flow/hf_cache
+      field_groups:
+        t0_fields: [tracer, pressure]
+        t1_fields: [velocity]
+        t2_fields: []
+      axis_selection:
+        0:
+          slice: [0, 30, 1]
+        1:
+          slice: [0, 256, 2]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: data/train/shear_flow_Reynolds_5e5_Schmidt_1e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_5e5_Schmidt_1e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_5e5_Schmidt_1e0.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+      # Ядро обучено с Reynolds и Schmidt как константными входными каналами.
+      extra_channels:
+        - name: reynolds_from_data
+          type: constant
+          source: metadata
+          key: Reynolds
+          target: x
+        - name: schmidt_from_data
+          type: constant
+          source: metadata
+          key: Schmidt
+          target: x
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: false
+      val:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_shear_flow_Re1e4_Sc2e0
+    task_idx: 0
+    task_type: out_distr
+    luno:
+      jv_mode: forward
+      fwd_batch: 2
+      diag_hutchinson: 32
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/TheWell/shear_flow/hf_cache
+      field_groups:
+        t0_fields: [tracer, pressure]
+        t1_fields: [velocity]
+        t2_fields: []
+      axis_selection:
+        0:
+          slice: [0, 30, 1]
+        1:
+          slice: [0, 256, 2]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_2e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_2e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_2e0.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+      # Ядро обучено с Reynolds и Schmidt как константными входными каналами.
+      extra_channels:
+        - name: reynolds_from_data
+          type: constant
+          source: metadata
+          key: Reynolds
+          target: x
+        - name: schmidt_from_data
+          type: constant
+          source: metadata
+          key: Schmidt
+          target: x
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: false
+      val:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_shear_flow_time
+    task_idx: 0
+    task_type: out_distr
+    luno:
+      jv_mode: forward
+      fwd_batch: 2
+      diag_hutchinson: 32
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/TheWell/shear_flow/hf_cache
+      field_groups:
+        t0_fields: [tracer, pressure]
+        t1_fields: [velocity]
+        t2_fields: []
+      axis_selection:
+        0:
+          slice: [0, 60, 2]
+        1:
+          slice: [0, 256, 2]
+        2:
+          slice: [0, 512, 4]
+      files:
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+      # Ядро обучено с Reynolds и Schmidt как константными входными каналами.
+      extra_channels:
+        - name: reynolds_from_data
+          type: constant
+          source: metadata
+          key: Reynolds
+          target: x
+        - name: schmidt_from_data
+          type: constant
+          source: metadata
+          key: Schmidt
+          target: x
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: false
+      val:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+  - name: thewell_shear_flow_space
+    task_idx: 0
+    task_type: out_distr
+    luno:
+      jv_mode: forward
+      # Сетка 256x256 -- вчетверо больше точек.
+      fwd_batch: 1
+      diag_hutchinson: 32
+    source:
+      location: huggingface
+      format: concat_thewell_hdf5
+      repo_id: polymathic-ai/shear_flow
+      cache_dir: /workspace/data/TheWell/shear_flow/hf_cache
+      field_groups:
+        t0_fields: [tracer, pressure]
+        t1_fields: [velocity]
+        t2_fields: []
+      axis_selection:
+        0:
+          slice: [0, 30, 1]
+        1:
+          slice: [0, 256, 1]
+        2:
+          slice: [0, 512, 2]
+      files:
+        - filename: data/train/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/valid/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+        - filename: data/test/shear_flow_Reynolds_1e4_Schmidt_1e0.hdf5
+    adapter:
+      type: temporal
+      variable_name: data
+      data_order: TCHW
+      temporal_mode: initial_to_trajectory
+      input_time_index: 0
+      output_time_indices: all
+      flatten_time_to_channels: false
+      benchmark_name: TheWell
+      physics_name: shear_flow
+      # Ядро обучено с Reynolds и Schmidt как константными входными каналами.
+      extra_channels:
+        - name: reynolds_from_data
+          type: constant
+          source: metadata
+          key: Reynolds
+          target: x
+        - name: schmidt_from_data
+          type: constant
+          source: metadata
+          key: Schmidt
+          target: x
+    split:
+      type: ratios
+      train: 0.7
+      val: 0.1
+      test: 0.2
+    loaders:
+      train:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: true
+        drop_last: false
+      val:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+      test:
+        batch_size: 1
+        num_workers: 0
+        pin_memory: false
+        shuffle: false
+        drop_last: false
+
+normalization:
+  enabled: true
+  normalize_x: true
+  normalize_y: true
+  device: cuda
+  max_fit_batches: 400
+
+# Ядро, лифтинг и проекция грузятся из чекпойнтов; блок нужен для сборки
+# адаптер-ядро-адаптер (как при обучении cfno_9_11).
+model:
+  type: adapted_cfno_no_mamba
+  n_dim: 3
+  hidden_channels: 90
+  lifting_layers: 2
+  projection_layers: 2
+  n_modes:
+    t: 12
+    x: 24
+
+metrics:
+  names:
+    - mse
+    - mae
+    - rmse
+    - nrmse
+    - vrmse
+    - relative_l2
+    - balanced_relative_l2
+    - nmae_range
+    - r2_score
+    - mean_linf_error
+    - max_linf_error
+  physical:
+    - name: spectral_mse
+      tasks: all
+    - name: spectral_nrmse
+      tasks: all
+    - name: band_spectral_mse_2d
+      tasks: all
+    - name: band_spectral_nrmse_2d
+      tasks: all

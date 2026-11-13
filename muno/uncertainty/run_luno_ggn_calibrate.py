@@ -2288,7 +2288,8 @@ def plan_tasks(args, selected):
         )
     for plan in plans:
         if plan.in_distr:
-            origin = ("GGN из " + plan.args.ggn_checkpoint
+            origin = ("GGN нет (Iso)" if plan.method.endswith("_iso")
+                      else "GGN из " + plan.args.ggn_checkpoint
                       if plan.args.ggn_checkpoint else "GGN считается")
             origin += ", калибровка"
         elif plan.source == "run":
