@@ -34,7 +34,8 @@ tasks:
       # Для лифтинга низкоранговый чекпойнт (как этот, ранг 25) игнорируется,
       # и GGN считается заново; новый полный артефакт (~3.5 ГБ) пишется в папку
       # задачи. Остальные задачи task_idx наследуют GGN in_distr-задачи.
-      #ggn_checkpoint: weights/pdebench_2d_cfd/luno_turbo_inf_lifting_low_rank_terms.pkl
+      prior_prec_source: weights/luno_turbo_inf_20261112_122819_lifting/pdebench_2d_cfd
+      ggn_checkpoint: weights/luno_turbo_inf_20261112_122819_lifting/pdebench_2d_cfd/luno_turbo_inf_lifting_low_rank_terms.pkl
       val_calib_frac: 0.8
       # Одно число проб на всех задачах CFD: шум оценки std (~1/sqrt(2*16),
       # около 18 %) одинаков, и метрики задач сравнимы между собой.
@@ -237,6 +238,8 @@ tasks:
       # GGN и prior_prec наследуются от in_distr-задачи pdebench_2d_cfd (тот же
       # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
       # должен совпадать с in_distr-задачей.
+      prior_prec_source: weights/luno_turbo_inf_20261112_122819_lifting/pdebench_2d_cfd
+      ggn_checkpoint: weights/luno_turbo_inf_20261112_122819_lifting/pdebench_2d_cfd/luno_turbo_inf_lifting_low_rank_terms.pkl
       ggn_target: lifting
       jv_mode: forward
       fwd_batch: 2
