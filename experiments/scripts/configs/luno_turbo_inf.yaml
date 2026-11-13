@@ -8,6 +8,18 @@ seed:
 inspections:
   enabled: true
 
+# task_type обязателен у каждой задачи:
+#   in_distr  -- строит GGN и калибрует prior_prec; только здесь задаются метод
+#                (ggn_target, max_rank, ggn_method) и ключи GGN/калибровки.
+#                Одна in_distr-задача на task_idx в прогоне.
+#   out_distr -- только оценка. luno: jv_mode, fwd_batch, vjp_chunk,
+#                diag_hutchinson и, по желанию, источник:
+#                  prior_prec_source: папка in_distr-задачи (luno_results.pkl)
+#                  ggn_checkpoint:    её GGN-артефакт; метод берётся из файла,
+#                                     без него -- Iso (только калибровка).
+#                Если in_distr-задача того же task_idx есть в прогоне, берутся
+#                её GGN и калибровка (пути игнорируются); иначе -- пути;
+#                нет ни того, ни другого -- ошибка до старта.
 tasks:
 ### CFD ###
   - name: pdebench_2d_cfd
@@ -31,11 +43,9 @@ tasks:
       # Оценка ~1.7 ч + eigh 29640x29640 (на GPU, при нехватке памяти -- на CPU).
       max_num_samples: 1000
       ggn_mc: 0
-      # Для лифтинга низкоранговый чекпойнт (как этот, ранг 25) игнорируется,
-      # и GGN считается заново; новый полный артефакт (~3.5 ГБ) пишется в папку
-      # задачи. Остальные задачи task_idx наследуют GGN in_distr-задачи.
-      prior_prec_source: weights/luno_turbo_inf_20261112_122819_lifting/pdebench_2d_cfd
-      ggn_checkpoint: weights/luno_turbo_inf_20261112_122819_lifting/pdebench_2d_cfd/luno_turbo_inf_lifting_low_rank_terms.pkl
+      # ggn_checkpoint: <файл полной GGN лифтинга> -- взять готовую GGN вместо
+      # расчёта (калибровка всё равно выполняется). Новый артефакт (~3.5 ГБ)
+      # пишется в папку задачи.
       val_calib_frac: 0.8
       # Одно число проб на всех задачах CFD: шум оценки std (~1/sqrt(2*16),
       # около 18 %) одинаков, и метрики задач сравнимы между собой.
@@ -104,14 +114,10 @@ tasks:
 
   - name: pdebench_2d_cfd_M1.0
     task_idx: 0
+    task_type: out_distr
     luno:
-      # GGN и prior_prec наследуются от in_distr-задачи pdebench_2d_cfd (тот же
-      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
-      # должен совпадать с in_distr-задачей.
-      ggn_target: lifting
       jv_mode: forward
       fwd_batch: 2
-      val_calib_frac: 0.8
       diag_hutchinson: 16
     source:
       location: local
@@ -167,14 +173,10 @@ tasks:
 
   - name: pdebench_2d_cfd_Eta1e-08
     task_idx: 0
+    task_type: out_distr
     luno:
-      # GGN и prior_prec наследуются от in_distr-задачи pdebench_2d_cfd (тот же
-      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
-      # должен совпадать с in_distr-задачей.
-      ggn_target: lifting
       jv_mode: forward
       fwd_batch: 2
-      val_calib_frac: 0.8
       diag_hutchinson: 16
     source:
       location: local
@@ -234,16 +236,13 @@ tasks:
 
   - name: pdebench_2d_cfd_time
     task_idx: 0
+    task_type: out_distr
     luno:
-      # GGN и prior_prec наследуются от in_distr-задачи pdebench_2d_cfd (тот же
-      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
-      # должен совпадать с in_distr-задачей.
+      # Используется, только если pdebench_2d_cfd нет в прогоне.
       prior_prec_source: weights/luno_turbo_inf_20261112_122819_lifting/pdebench_2d_cfd
       ggn_checkpoint: weights/luno_turbo_inf_20261112_122819_lifting/pdebench_2d_cfd/luno_turbo_inf_lifting_low_rank_terms.pkl
-      ggn_target: lifting
       jv_mode: forward
       fwd_batch: 2
-      val_calib_frac: 0.8
       diag_hutchinson: 16
     source:
       location: local
@@ -387,14 +386,10 @@ tasks:
 
   - name: thewell_shear_flow_1e4_Schmidt_1e1
     task_idx: 4
+    task_type: out_distr
     luno:
-      # GGN и prior_prec наследуются от in_distr-задачи thewell_shear_flow (тот же
-      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
-      # должен совпадать с in_distr-задачей.
-      ggn_target: lifting
       jv_mode: forward
       fwd_batch: 2
-      val_calib_frac: 0.8
       diag_hutchinson: 50
     source:
       location: huggingface
@@ -455,14 +450,10 @@ tasks:
 
   - name: thewell_shear_flow_1e5_Schmidt_1e0
     task_idx: 4
+    task_type: out_distr
     luno:
-      # GGN и prior_prec наследуются от in_distr-задачи thewell_shear_flow (тот же
-      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
-      # должен совпадать с in_distr-задачей.
-      ggn_target: lifting
       jv_mode: forward
       fwd_batch: 2
-      val_calib_frac: 0.8
       diag_hutchinson: 50
     source:
       location: huggingface
@@ -523,14 +514,10 @@ tasks:
 
   - name: thewell_shear_flow_1e5_Schmidt_1e1
     task_idx: 4
+    task_type: out_distr
     luno:
-      # GGN и prior_prec наследуются от in_distr-задачи thewell_shear_flow (тот же
-      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
-      # должен совпадать с in_distr-задачей.
-      ggn_target: lifting
       jv_mode: forward
       fwd_batch: 2
-      val_calib_frac: 0.8
       diag_hutchinson: 50
     source:
       location: huggingface
@@ -558,7 +545,6 @@ tasks:
       type: temporal
       variable_name: data
       data_order: TCHW
-      temporal_mode: window
       temporal_mode: initial_to_trajectory
       input_time_index: 0
       output_time_indices: all
@@ -592,14 +578,10 @@ tasks:
 
   - name: thewell_shear_flow_1e4_Schmidt_1e-1
     task_idx: 4
+    task_type: out_distr
     luno:
-      # GGN и prior_prec наследуются от in_distr-задачи thewell_shear_flow (тот же
-      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
-      # должен совпадать с in_distr-задачей.
-      ggn_target: lifting
       jv_mode: forward
       fwd_batch: 2
-      val_calib_frac: 0.8
       diag_hutchinson: 50
     source:
       location: huggingface
@@ -627,7 +609,6 @@ tasks:
       type: temporal
       variable_name: data
       data_order: TCHW
-      temporal_mode: window
       temporal_mode: initial_to_trajectory
       input_time_index: 0
       output_time_indices: all
@@ -661,14 +642,10 @@ tasks:
 
   - name: thewell_shear_flow_time
     task_idx: 4
+    task_type: out_distr
     luno:
-      # GGN и prior_prec наследуются от in_distr-задачи thewell_shear_flow (тот же
-      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
-      # должен совпадать с in_distr-задачей.
-      ggn_target: lifting
       jv_mode: forward
       fwd_batch: 2
-      val_calib_frac: 0.8
       diag_hutchinson: 50
     source:
       location: huggingface
@@ -696,7 +673,6 @@ tasks:
       type: temporal
       variable_name: data
       data_order: TCHW
-      temporal_mode: window
       temporal_mode: initial_to_trajectory
       input_time_index: 0
       output_time_indices: all
@@ -730,15 +706,11 @@ tasks:
 
   - name: thewell_shear_flow_space
     task_idx: 4
+    task_type: out_distr
     luno:
-      # GGN и prior_prec наследуются от in_distr-задачи thewell_shear_flow (тот же
-      # task_idx); GGN- и calib-ключи здесь игнорировались бы. ggn_target
-      # должен совпадать с in_distr-задачей.
-      ggn_target: lifting
       jv_mode: forward
       # Полное разрешение 256x512: в прошлом прогоне OOM при fwd_batch 4.
       fwd_batch: 1
-      val_calib_frac: 0.8
       diag_hutchinson: 50
     source:
       location: huggingface
@@ -766,7 +738,6 @@ tasks:
       type: temporal
       variable_name: data
       data_order: TCHW
-      temporal_mode: window
       temporal_mode: initial_to_trajectory
       input_time_index: 0
       output_time_indices: all

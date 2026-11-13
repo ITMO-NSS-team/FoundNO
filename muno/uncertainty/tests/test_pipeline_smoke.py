@@ -128,15 +128,100 @@ def test_method_labels():
     assert run.uq_method(ns(ggn_target="last-block")) == "lastblock_lowrank"
     assert run.uq_method(ns(ggn_target="last-block", ggn_method="kfac")) == "lastblock_kfac"
 
-    # Метку задают in_distr-задачи; max_rank: 0 у OOD-задач игнорируется.
-    cfgs = [(0, {"name": "a", "task_type": "in_distr", "luno": {"max_rank": 25}}),
-            (1, {"name": "b", "luno": {"max_rank": 0}})]
-    assert run.run_method_label(ns(), cfgs) == "lifting"
-    cfgs[0][1]["luno"]["max_rank"] = 0
-    assert run.run_method_label(ns(), cfgs) == "lifting_iso"
-    cfgs.append((2, {"name": "c", "task_type": "in_distr", "luno": {"max_rank": 5}}))
-    assert run.run_method_label(ns(), cfgs) == "lifting_iso+lifting"
-    assert run.run_method_label(ns(max_rank=0), [(0, {"name": "x"})]) == "lifting_iso"
+    # Метку задают in_distr-задачи; out_distr наследует их метод.
+    plan = lambda in_distr, method: types.SimpleNamespace(in_distr=in_distr, method=method)
+    assert run.run_method_label([plan(True, "lifting"), plan(False, "lifting")]) == "lifting"
+    assert run.run_method_label(
+        [plan(True, "lifting_iso"), plan(True, "lifting"), plan(False, "x")]
+    ) == "lifting_iso+lifting"
+    # Без in_distr -- по источникам out_distr.
+    assert run.run_method_label([plan(False, "lastblock_kfac")]) == "lastblock_kfac"
+
+
+def _plan_args(**kw):
+    base = dict(ggn_target="lifting", jv_mode="forward", ggn_method="randomized",
+                max_rank=10, ggn_checkpoint=None, prior_prec_source=None,
+                diag_hutchinson=16, fwd_batch=2, vjp_chunk=16)
+    return argparse.Namespace(**{**base, **kw})
+
+
+def _results(path, **kw):
+    import pickle
+    path.mkdir(parents=True, exist_ok=True)
+    res = {"task_idx": 0, "in_distr": True, "prior_prec": 2.0, "ggn_target": "lifting",
+           "temperature": 1.5, "calib_objective": "nll", **kw}
+    pickle.dump(res, open(path / "luno_results.pkl", "wb"))
+    return path
+
+
+def test_plan_tasks_config_errors():
+    cfgs = [
+        (0, {"name": "no_type", "task_idx": 0}),
+        (1, {"name": "bad_key", "task_idx": 0, "task_type": "out_distr",
+             "luno": {"ggn_target": "lifting", "calib_grid_size": 5}}),
+        (2, {"name": "id_pps", "task_idx": 1, "task_type": "in_distr",
+             "luno": {"prior_prec_source": "x"}}),
+        (3, {"name": "orphan", "task_idx": 7, "task_type": "out_distr"}),
+    ]
+    with pytest.raises(SystemExit) as exc:
+        run.plan_tasks(_plan_args(), cfgs)
+    msg = str(exc.value)
+    for needle in ("no_type", "luno.ggn_target", "id_pps", "orphan"):
+        assert needle in msg
+
+
+def test_plan_tasks_two_in_distr_same_idx():
+    cfgs = [(0, {"name": "a", "task_idx": 0, "task_type": "in_distr"}),
+            (1, {"name": "b", "task_idx": 0, "task_type": "in_distr"})]
+    with pytest.raises(SystemExit, match="несколько in_distr"):
+        run.plan_tasks(_plan_args(), cfgs)
+
+
+def test_plan_tasks_out_distr_from_run():
+    cfgs = [(0, {"name": "a", "task_idx": 0, "task_type": "in_distr",
+                 "luno": {"ggn_target": "last-block", "ggn_method": "kfac"}}),
+            (1, {"name": "b", "task_idx": 0, "task_type": "out_distr",
+                 "luno": {"fwd_batch": 1}})]
+    plans = run.plan_tasks(_plan_args(), cfgs)
+    b = plans[1]
+    assert b.source == "run" and b.peer == "a" and b.method == "lastblock_kfac"
+    assert b.args.ggn_target == "last-block" and b.args.ggn_method == "kfac"
+    assert b.args.fwd_batch == 1
+
+
+def test_plan_tasks_out_distr_from_files(tmp_path):
+    import pickle
+    d = 5
+    lr = run.LowRankTerms(U=torch.zeros(d, d), S=torch.ones(d), scalar=0.0)
+    ck = tmp_path / "id" / "run_lifting_low_rank_terms.pkl"
+    _results(tmp_path / "id", uq_method="lifting", ggn_rank=d)
+    pickle.dump(lr, open(ck, "wb"))
+    cfg = {"name": "b", "task_idx": 0, "task_type": "out_distr",
+           "luno": {"prior_prec_source": str(tmp_path / "id"),
+                    "ggn_checkpoint": str(tmp_path / "id")}}
+    # Вместе с in_distr прогона: она приоритетнее явных путей.
+    plans = run.plan_tasks(_plan_args(), [
+        (0, {"name": "a", "task_idx": 0, "task_type": "in_distr"}), (1, cfg)])
+    assert plans[1].source == "run" and plans[1].peer == "a"
+    (b,) = run.plan_tasks(_plan_args(), [(1, cfg)])
+    assert b.source == "files" and b.method == "lifting" and b.ggn_path == str(ck)
+    assert b.args.ggn_target == "lifting" and b.calib["temperature"] == 1.5
+
+    # Без ggn_checkpoint это Iso -- а калибровка сделана с GGN: ошибка.
+    cfg_iso = {**cfg, "luno": {"prior_prec_source": str(tmp_path / "id")}}
+    with pytest.raises(SystemExit, match="Iso"):
+        run.plan_tasks(_plan_args(), [(0, cfg_iso)])
+    _results(tmp_path / "iso", uq_method="lifting_iso", ggn_rank=0, temperature=None)
+    cfg_iso["luno"] = {"prior_prec_source": str(tmp_path / "iso")}
+    (p,) = run.plan_tasks(_plan_args(), [(0, cfg_iso)])
+    assert p.method == "lifting_iso" and p.terms is None
+
+    # Чекпойнт без калибровки -- ошибка; чужой ранг -- ошибка.
+    with pytest.raises(SystemExit, match="prior_prec_source"):
+        run.plan_tasks(_plan_args(), [(0, {**cfg, "luno": {"ggn_checkpoint": str(ck)}})])
+    _results(tmp_path / "id", uq_method="lifting_lowrank", ggn_rank=3)
+    with pytest.raises(SystemExit, match="одной in_distr"):
+        run.plan_tasks(_plan_args(), [(0, cfg)])
 
 
 def test_iso_runs_end_to_end(tiny, env, tmp_path):

@@ -171,18 +171,16 @@ def parse_args():
                         "считаются прямым режимом (--jv-mode), без строк J.")
     p.add_argument("--max-rank", type=int, default=10, help="Low-rank rank для GGN.")
     p.add_argument("--prior-prec-source", type=str, default=None,
-                   help="Папка прогона in_distr-задачи (та же, что --output-root/"
-                        "run-name), из которой берётся prior_prec для одиночного "
-                        "запуска НЕ-in_distr задачи: ищется luno_results.pkl с "
-                        "совпадающим task_idx. Используется только когда задача "
-                        "не in_distr и её in_distr-сосед не был выбран в этом "
-                        "прогоне (соседа нет -- задача пропускается).")
+                   help="Значение по умолчанию для luno.prior_prec_source "
+                        "out_distr-задач: папка in_distr-задачи (или прогона) с "
+                        "luno_results.pkl того же task_idx. Используется, только "
+                        "если in_distr-задачи этого task_idx нет в прогоне.")
     p.add_argument("--ggn-checkpoint", type=str, default=None,
-                   help="Глобальный fallback-путь к pickle с LowRankTerms (артефакт "
-                        "*_low_rank_terms.pkl из прошлого прогона). Если у in_distr "
-                        "задачи задан luno.ggn_checkpoint, он приоритетнее; "
-                        "НЕ-in_distr задачи наследуют checkpoint своей in_distr "
-                        "задачи. Если файл найден и валиден -- расчёт GGN "
+                   help="Значение по умолчанию для luno.ggn_checkpoint (файл или "
+                        "папка с *_low_rank_terms.pkl / *_kfac_terms.pkl). "
+                        "out_distr: кривизна для оценки, метод определяется "
+                        "файлом (нет файла -- Iso). in_distr: "
+                        "если файл найден и валиден -- расчёт GGN "
                         "пропускается целиком (сбор сэмплов, GGNMatvec, скетч), "
                         "артефакт в новый ранг не пишется, а --max-rank/--ggn-method/"
                         "--ggn-oversample/--max-num-samples игнорируются: авторитетен "
@@ -275,7 +273,10 @@ def _optional_str(value):
 # в yaml. Сюда НЕ входят: общие флаги (config/device/dtype/...), пути-веса
 # (core/lift/proj/normalizers -- они берутся по task_idx) и аргументы
 # стартового self-check (--check-probes/--check-tol), которые остаются общими.
-# ggn_checkpoint -- исключение: это явный per-task путь, а не путь по task_idx.
+# ggn_checkpoint/prior_prec_source -- явные per-task пути, а не пути по task_idx.
+#
+# Какие ключи допустимы, зависит от task_type (см. TASK_TYPE_LUNO_KEYS):
+# GGN и калибровку настраивает только in_distr, out_distr лишь оценивается.
 PER_TASK_LUNO_KEYS = {
     "ggn_target": str,
     "jv_mode": str,
@@ -290,6 +291,7 @@ PER_TASK_LUNO_KEYS = {
     "max_num_samples": int,
     "ggn_sample_batch": int,
     "ggn_checkpoint": _optional_str,
+    "prior_prec_source": _optional_str,
     "val_calib_frac": float,
     "diag_hutchinson": int,
     "calib_max_samples": int,
@@ -297,6 +299,21 @@ PER_TASK_LUNO_KEYS = {
     "calib_grid_max": float,
     "calib_grid_size": int,
     "calib_objective": str,
+}
+
+TASK_TYPES = ("in_distr", "out_distr")
+
+# Настройки оценки (прямые произведения и Хатчинсон) -- общие для обоих типов.
+_EVAL_LUNO_KEYS = {"jv_mode", "fwd_batch", "vjp_chunk", "diag_hutchinson"}
+
+TASK_TYPE_LUNO_KEYS = {
+    # in_distr строит GGN (или берёт её из своего ggn_checkpoint) и сам
+    # калибрует prior_prec, поэтому prior_prec_source ему не нужен.
+    "in_distr": set(PER_TASK_LUNO_KEYS) - {"prior_prec_source"},
+    # out_distr ничего не строит и не калибрует: метод (target, lifting/kfac/
+    # iso/...) берётся у источника -- in_distr-задачи этого прогона либо
+    # явных ggn_checkpoint + prior_prec_source.
+    "out_distr": _EVAL_LUNO_KEYS | {"ggn_checkpoint", "prior_prec_source"},
 }
 
 _LUNO_KEY_CHOICES = {
@@ -336,8 +353,25 @@ def select_tasks(task_configs, spec):
     return [(i, cfg) for i, cfg in enumerate(task_configs) if i in chosen]
 
 
+def task_type(cfg):
+    """``task_type`` задачи: ``in_distr`` или ``out_distr`` (обязателен)."""
+    value = cfg.get("task_type")
+    if value not in TASK_TYPES:
+        raise ValueError(
+            f"задача '{task_name(cfg, '?')}': task_type={value!r}; укажите "
+            f"один из {TASK_TYPES}."
+        )
+    return value
+
+
 def apply_task_overrides(args, cfg):
-    """Копия ``args`` c применённым блоком ``luno:`` задачи (валидация ключей)."""
+    """Копия ``args`` c применённым блоком ``luno:`` задачи (валидация ключей).
+
+    Допустимые ключи зависят от ``task_type`` (:data:`TASK_TYPE_LUNO_KEYS`):
+    ключ GGN или калибровки у out_distr -- ошибка, а не молчаливый игнор.
+    """
+    kind = task_type(cfg)
+    allowed = TASK_TYPE_LUNO_KEYS[kind]
     overrides = cfg.get("luno") or {}
     if not isinstance(overrides, dict):
         raise ValueError(
@@ -349,7 +383,20 @@ def apply_task_overrides(args, cfg):
         if key not in PER_TASK_LUNO_KEYS:
             raise ValueError(
                 f"задача '{task_name(cfg, '?')}': неизвестный ключ luno.{key}; "
-                f"допустимые: {sorted(PER_TASK_LUNO_KEYS)}"
+                f"допустимые для {kind}: {sorted(allowed)}"
+            )
+        if key not in allowed:
+            hint = (
+                "out_distr не строит GGN и не калибрует: метод и prior_prec "
+                "берутся у in_distr-задачи прогона или из ggn_checkpoint + "
+                "prior_prec_source"
+                if kind == "out_distr" else
+                "in_distr калибрует prior_prec сам"
+            )
+            raise ValueError(
+                f"задача '{task_name(cfg, '?')}' ({kind}): ключ luno.{key} "
+                f"здесь не применяется ({hint}); уберите его. Допустимые: "
+                f"{sorted(allowed)}"
             )
         caster = PER_TASK_LUNO_KEYS[key]
         try:
@@ -385,91 +432,42 @@ def resolve_task_idx(cfg, position):
 
 
 def is_in_distr(cfg):
-    """Задача -- источник калибровки для своего ``task_idx``?
+    """Задача -- источник GGN и калибровки для своего ``task_idx``?
 
-    Калибрует ``prior_prec`` и строит GGN только задача с
-    ``task_type: in_distr``. Все прочие задачи того же ``task_idx``
-    переиспользуют её значения.
+    Строит GGN и калибрует ``prior_prec`` только ``task_type: in_distr``.
+    ``out_distr``-задачи только оцениваются с чужими GGN и prior_prec.
     """
-    return cfg.get("task_type") == "in_distr"
-
-
-def build_in_distr_task_map(task_configs):
-    """Строит ``task_idx -> первая in_distr-задача`` по всему конфигу.
-
-    Карта нужна и для задач, выбранных в ``--tasks``, и для одиночного
-    запуска НЕ-in_distr-задачи: её checkpoint берётся из in_distr-соседа,
-    даже если сам сосед в этом прогоне не выбран. Если на один ``task_idx``
-    приходится несколько in_distr-задач, авторитетной считается первая в
-    порядке конфига -- так же, как стабильная сортировка запускает их раньше
-    остальных.
-    """
-    by_task_idx = {}
-    for position, cfg in enumerate(task_configs):
-        if not is_in_distr(cfg):
-            continue
-        task_idx = resolve_task_idx(cfg, position)
-        if task_idx in by_task_idx:
-            print(f"[ggn:warn] task_idx={task_idx}: несколько in_distr-задач; "
-                  f"checkpoint берётся у первой "
-                  f"'{task_name(by_task_idx[task_idx], '?')}', "
-                  f"а не у '{task_name(cfg, position)}'.")
-            continue
-        by_task_idx[task_idx] = cfg
-    return by_task_idx
-
-
-def effective_task_ggn_checkpoint(args, task_args, in_distr, in_distr_cfg):
-    """Checkpoint для задачи: свой у in_distr, наследство у остальных.
-
-    in_distr использует ``luno.ggn_checkpoint`` своей задачи. Остальные --
-    ``luno.ggn_checkpoint`` in_distr-задачи того же ``task_idx``; собственный
-    ключ не-in_distr-задачи игнорируется. Если ключа нет, сохраняется старый
-    fallback на глобальный ``--ggn-checkpoint``.
-    """
-    if in_distr:
-        checkpoint = getattr(task_args, "ggn_checkpoint", None)
-    else:
-        luno_cfg = (in_distr_cfg or {}).get("luno") or {}
-        checkpoint = (
-            luno_cfg.get("ggn_checkpoint") if isinstance(luno_cfg, dict) else None
-        )
-    return checkpoint if checkpoint is not None else args.ggn_checkpoint
+    return task_type(cfg) == "in_distr"
 
 
 class TaskSkipped(RuntimeError):
-    """Задача пропускается (нет in_distr-соседа и нет явных GGN/prior_prec).
+    """Источник GGN/калибровки для out_distr-задачи не найден или не годится.
 
-    Наследник ``RuntimeError``, поэтому ловится штатным ``except Exception`` в
-    ``main``: задача пишется в ``luno_results.pkl`` со статусом ``failed`` и
-    ошибкой пропуска, остальные продолжают работу.
+    Бросается при планировании (до запуска задач), см. :func:`plan_tasks`.
     """
 
 
-def load_prior_prec_from_results(directory, task_idx, ggn_target="last-block"):
-    """Читает ``prior_prec`` in_distr-задачи ``task_idx`` из папки прогона.
+def load_calibration_results(directory, task_idx):
+    """Читает результаты калибровки задачи ``task_idx`` (``luno_results.pkl``).
 
-    ``directory`` -- папка прогона (``<output-root>/<prefix>_<timestamp>``)
-    либо непосредственно папка in_distr-задачи. Внутри (рекурсивно, но не
-    глубже одного уровня вложенности) ищется ``luno_results.pkl`` с
-    ``task_idx`` этой задачи; берётся его ``prior_prec``. Ошибка -- если
-    файла нет или в нём нет совпадения/поля.
-
-    ``ggn_target`` должен совпадать с сохранённым в результатах: prior_prec
-    над весами последнего блока и над весами лифтинга -- разные величины.
-    Старые результаты без поля ``ggn_target`` считаются last-block.
+    ``directory`` -- папка in_distr-задачи, папка прогона
+    (``<output-root>/<prefix>_<timestamp>``, ищется на один уровень вглубь)
+    или сам файл ``luno_results.pkl``. Берётся запись с этим ``task_idx`` и
+    ``prior_prec``; при нескольких -- in_distr-задача (сама калибровавшая).
+    Возвращает ``(path, results)``; ``ggn_target`` старых результатов без поля
+    считается last-block.
     """
     root = rmi.resolve_path(directory)
     if not root.exists():
-        raise TaskSkipped(
-            f"--prior-prec-source: папка {root} не существует."
+        raise TaskSkipped(f"prior_prec_source: {root} не существует.")
+    if root.is_file():
+        files = [root]
+    else:
+        files = [root / "luno_results.pkl"] + sorted(
+            d / "luno_results.pkl" for d in root.iterdir() if d.is_dir()
         )
-    candidates = [root] if root.is_dir() else [root.parent]
-    if root.is_dir():
-        candidates += [d for d in root.iterdir() if d.is_dir()]
     found = []
-    for d in candidates:
-        p = d / "luno_results.pkl"
+    for p in files:
         if not p.is_file():
             continue
         try:
@@ -481,25 +479,15 @@ def load_prior_prec_from_results(directory, task_idx, ggn_target="last-block"):
             continue
         if results.get("prior_prec") is None:
             continue
-        saved_target = results.get("ggn_target", "last-block")
-        if saved_target != ggn_target:
-            continue
         found.append((p, results))
     if not found:
         raise TaskSkipped(
-            f"--prior-prec-source: в {root} нет luno_results.pkl с "
-            f"task_idx={task_idx}, ggn_target={ggn_target} и prior_prec. "
-            f"Укажите папку прогона in_distr-задачи этого task_idx."
+            f"prior_prec_source: в {root} нет luno_results.pkl с "
+            f"task_idx={task_idx} и prior_prec. Укажите папку in_distr-задачи "
+            f"этого task_idx."
         )
-    path, results = found[0]
-    temperature = results.get("temperature")
-    print(f"[prior_prec] из {path} (task_idx={task_idx}, "
-          f"ggn_target={ggn_target}): "
-          f"prior_prec={float(results['prior_prec']):.6e}"
-          + (f", temperature={float(temperature):.6e}" if temperature is not None else ""))
-    return float(results["prior_prec"]), (
-        float(temperature) if temperature is not None else None
-    )
+    found.sort(key=lambda pr: 0 if pr[1].get("in_distr") else 1)
+    return found[0]
 
 
 def find_indexed_file(directory, prefix, suffix, task_idx):
@@ -855,11 +843,14 @@ def load_task_adapters(args, task_idx, asset_cache):
     return lifting, projection
 
 
-def build_task_pipeline(args, cfg, task_idx, model_config, core, asset_cache):
+def build_task_pipeline(args, cfg, task_idx, model_config, core, asset_cache,
+                        in_distr=True):
     """Данные + лоадеры + модель для ОДНОЙ задачи (адаптер по task_idx).
 
     ``rmi.loadData([cfg])`` возвращает датасеты одной задачи, поэтому ключ
     в батчах снова ``0`` и весь per-task код продолжает работать с ``sample[0]``.
+    out_distr не калибруется, поэтому весь её val идёт на оценку
+    (``calib_loader = None``).
     """
     lifting, projection = load_task_adapters(args, task_idx, asset_cache)
 
@@ -870,7 +861,15 @@ def build_task_pipeline(args, cfg, task_idx, model_config, core, asset_cache):
         batch_size=1,
         shuffle=False,
     )
-    calib_loader, val_eval_loader = split_val_loaders(args, val_set)
+    if in_distr:
+        calib_loader, val_eval_loader = split_val_loaders(args, val_set)
+    else:
+        calib_loader = None
+        val_eval_loader = DataLoader(
+            dataset=MultiPhysicsDataset(list(val_set)), batch_size=1, shuffle=False
+        )
+        print(f"[split] out_distr: весь val ({len(val_eval_loader.dataset)} "
+              f"сэмплов) -> валидация, калибровки нет.")
     test_loader = DataLoader(
         dataset=MultiPhysicsDataset(list(test_set)), batch_size=1, shuffle=False
     )
@@ -1084,6 +1083,11 @@ def load_low_rank_ggn(path, w0):
         return None
     with open(p, "rb") as f:
         terms = pickle.load(f)
+    return low_rank_to(terms, w0, p)
+
+
+def low_rank_to(terms, w0, p):
+    """Проверяет LowRankTerms против ``w0`` и переносит на его device/dtype."""
     if not isinstance(terms, LowRankTerms):
         raise TypeError(
             f"GGN checkpoint: ожидался LowRankTerms, получен "
@@ -1846,7 +1850,8 @@ def confirm_exact_diag(args, pipeline):
     """
     if args.diag_hutchinson > 0:
         return
-    n_calib = len(pipeline["calib_loader"].dataset)
+    calib = pipeline["calib_loader"]
+    n_calib = len(calib.dataset) if calib is not None else 0
     n_val = len(pipeline["val_eval_loader"].dataset)
     n_test = len(pipeline["test_loader"].dataset)
     n_all = n_calib + n_val + n_test
@@ -1897,17 +1902,15 @@ def uq_method(args) -> str:
     return f"{target}_{method}"
 
 
-def run_method_label(args, selected) -> str:
-    """Метка метода для имени папки прогона.
+def run_method_label(plans) -> str:
+    """Метка метода для имени папки прогона (см. :func:`plan_tasks`).
 
-    Метод определяют in_distr-задачи: остальные наследуют их GGN и prior_prec,
-    а их собственные GGN-ключи (``max_rank`` и т.п.) игнорируются. Если
-    in_distr-задач среди выбранных нет -- по глобальным аргументам. Разные
-    методы у разных in_distr-задач склеиваются через ``+``.
+    Метод определяют in_distr-задачи; если их в прогоне нет -- источники
+    out_distr-задач (ggn_checkpoint/prior_prec_source). Разные методы
+    склеиваются через ``+``.
     """
-    in_distr = [cfg for _, cfg in selected if is_in_distr(cfg)]
-    labels = ([uq_method(apply_task_overrides(args, cfg)) for cfg in in_distr]
-              if in_distr else [uq_method(args)])
+    in_distr = [p.method for p in plans if p.in_distr]
+    labels = in_distr or [p.method for p in plans]
     return "+".join(dict.fromkeys(labels))
 
 
@@ -2069,42 +2072,272 @@ def resolve_low_rank(args, w0, model_fn, pipeline, data_processor, affine, task_
     return low_rank, ggn_source, ggn_checkpoint
 
 
-def _warn_ignored_ggn_keys(cfg, args, name):
-    """Предупреждает, если НЕ-in_distr задача переопределяет GGN-ключи.
+@dataclass
+class TaskPlan:
+    """Задача прогона с уже разрешёнными настройками и источником GGN.
 
-    Её GGN берётся у in_distr-авторитета того же ``task_idx``, поэтому
-    ``luno.{max_rank,ggn_method,ggn_oversample,max_num_samples,ggn_checkpoint}``
-    игнорируются.
+    ``source`` (только out_distr): ``"run"`` -- GGN и prior_prec берутся у
+    in_distr-задачи ``peer`` этого прогона; ``"files"`` -- из
+    ``ggn_checkpoint`` (``terms``, CPU; ``None`` -> метод Iso) и
+    ``prior_prec_source`` (``calib`` -- его ``luno_results.pkl``).
     """
-    keys = ("max_rank", "ggn_method", "ggn_oversample", "max_num_samples",
-            "ggn_checkpoint")
-    overrides = cfg.get("luno") or {}
-    conflicting = [k for k in keys if k in overrides]
-    if conflicting:
-        print(f"[shared:warn] задача '{name}' не in_distr, но задаёт "
-              f"luno.{conflicting}: значения игнорируются -- GGN берётся у "
-              f"in_distr-задачи того же task_idx (авторитетная).")
+    position: int
+    cfg: dict
+    name: str
+    task_idx: int
+    in_distr: bool
+    args: argparse.Namespace
+    method: str
+    source: str | None = None
+    peer: str | None = None
+    terms: object = None
+    ggn_path: str | None = None
+    calib: dict | None = None
+    calib_path: str | None = None
 
 
-def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
+def _ggn_artifact_target(stem):
+    """Target по имени GGN-артефакта (``None`` -- не GGN-артефакт)."""
+    if "lifting_low_rank_terms" in stem:
+        return "lifting"
+    if "kfac_terms" in stem or "low_rank_terms" in stem:
+        return "last-block"
+    return None
+
+
+def find_ggn_artifact(path, target, task_idx):
+    """Файл GGN для out_distr: сам ``path`` или артефакт ``target`` в папке."""
+    raw = rmi.resolve_path(path)
+    if raw.is_file():
+        return raw
+    if not raw.is_dir():
+        raise TaskSkipped(f"ggn_checkpoint: {raw} не существует.")
+    files = sorted(Path(f) for f in rmi.get_all_files(str(raw), ".pkl"))
+    cands = [f for f in files if _ggn_artifact_target(f.stem) == target]
+    by_idx = [f for f in cands if f.stem.endswith(f"_{task_idx}")]
+    if by_idx:
+        return by_idx[0]
+    if len(cands) == 1:
+        return cands[0]
+    raise TaskSkipped(
+        f"ggn_checkpoint: в {raw} нет однозначного GGN-артефакта "
+        f"(target={target}, task_idx={task_idx}); найдено: "
+        f"{[f.name for f in cands]}. Укажите файл явно."
+    )
+
+
+def resolve_out_distr_files(task_args, task_idx, terms_cache):
+    """Источник out_distr из явных путей: ``(method, terms, ggn_path, calib, calib_path)``.
+
+    ``prior_prec_source`` обязателен: без калибровки оценивать нечего.
+    ``ggn_checkpoint`` задаёт кривизну, и метод (lifting/lastblock,
+    kfac/lowrank/full) определяется её файлом; target -- по результатам
+    калибровки. Без ``ggn_checkpoint`` это метод Iso, и калибровка тоже должна
+    быть сделана для Iso -- иначе prior_prec не соответствует ковариации.
+    """
+    if not task_args.prior_prec_source:
+        raise TaskSkipped(
+            "задан ggn_checkpoint, но нет prior_prec_source: без калибровки "
+            "(prior_prec) оценивать нечего."
+        )
+    calib_path, calib = load_calibration_results(
+        task_args.prior_prec_source, task_idx
+    )
+    target = calib.get("ggn_target", "last-block")
+    saved_method = calib.get("uq_method")
+    saved_rank = calib.get("ggn_rank")
+    if not task_args.ggn_checkpoint:
+        is_iso = (saved_method.endswith("_iso") if saved_method
+                  else saved_rank == 0)
+        if not is_iso:
+            raise TaskSkipped(
+                f"ggn_checkpoint не задан (значит, метод Iso), но калибровка "
+                f"{calib_path} сделана с GGN (метод "
+                f"{saved_method or f'ранг {saved_rank}'}). Укажите "
+                f"ggn_checkpoint той же in_distr-задачи."
+            )
+        method = "lifting_iso" if target == "lifting" else "lastblock_iso"
+        return method, None, None, calib, str(calib_path)
+
+    ggn_path = find_ggn_artifact(task_args.ggn_checkpoint, target, task_idx)
+    key = str(ggn_path)
+    if key not in terms_cache:
+        with open(ggn_path, "rb") as f:
+            terms_cache[key] = pickle.load(f)
+    terms = terms_cache[key]
+    if not isinstance(terms, (LowRankTerms, KFACTerms)):
+        raise TaskSkipped(
+            f"ggn_checkpoint {ggn_path}: ожидались LowRankTerms или KFACTerms, "
+            f"получен {type(terms).__name__}."
+        )
+    if isinstance(terms, KFACTerms) and target != "last-block":
+        raise TaskSkipped(
+            f"ggn_checkpoint {ggn_path} -- KFAC (только last-block), а "
+            f"калибровка {calib_path} сделана для target={target}."
+        )
+    method = method_from_terms(target, terms)
+    if saved_method and saved_method != method:
+        raise TaskSkipped(
+            f"ggn_checkpoint {ggn_path} (метод {method}) не соответствует "
+            f"калибровке {calib_path} (метод {saved_method}): возьмите оба "
+            f"файла из одной in_distr-задачи."
+        )
+    if (isinstance(terms, LowRankTerms) and saved_rank is not None
+            and int(saved_rank) != int(terms.U.shape[1])):
+        raise TaskSkipped(
+            f"ggn_checkpoint {ggn_path} (ранг {terms.U.shape[1]}) не "
+            f"соответствует калибровке {calib_path} (ранг {saved_rank}): "
+            f"возьмите оба файла из одной in_distr-задачи."
+        )
+    return method, terms, str(ggn_path), calib, str(calib_path)
+
+
+def plan_tasks(args, selected):
+    """Проверяет конфиг и разрешает источники GGN/prior_prec ДО запуска задач.
+
+    * ``task_type`` обязателен: ``in_distr`` или ``out_distr``; ключи
+      ``luno:`` проверяются по типу (:func:`apply_task_overrides`).
+    * in_distr строит GGN (или берёт свой ``ggn_checkpoint``) и калибрует;
+      на один ``task_idx`` в прогоне -- не больше одной in_distr-задачи.
+    * out_distr: берёт GGN и калибровку у in_distr-задачи того же
+      ``task_idx`` этого прогона (приоритетно); если её нет -- из
+      ``ggn_checkpoint``/``prior_prec_source`` (в задаче или через CLI);
+      иначе -- ошибка.
+
+    Все ошибки собираются и выводятся разом (``SystemExit``): опечатка в
+    конфиге не должна всплыть после многочасовой in_distr-задачи.
+    """
+    errors = []
+    plans = []
+    for position, cfg in selected:
+        name = task_name(cfg, position)
+        try:
+            task_args = apply_task_overrides(args, cfg)
+            in_distr = is_in_distr(cfg)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        task_idx = resolve_task_idx(cfg, position)
+        plans.append(TaskPlan(
+            position=position, cfg=cfg, name=name, task_idx=task_idx,
+            in_distr=in_distr, args=task_args,
+            method=uq_method(task_args) if in_distr else "",
+        ))
+
+    peers = {}
+    for plan in plans:
+        if not plan.in_distr:
+            continue
+        if plan.task_idx in peers:
+            errors.append(
+                f"task_idx={plan.task_idx}: несколько in_distr-задач в прогоне "
+                f"('{peers[plan.task_idx].name}', '{plan.name}'); out_distr-"
+                f"задачам непонятно, чью калибровку брать. Оставьте одну."
+            )
+            continue
+        peers[plan.task_idx] = plan
+
+    terms_cache = {}
+    for plan in plans:
+        if plan.in_distr:
+            continue
+        a = plan.args
+        peer = peers.get(plan.task_idx)
+        try:
+            if peer is not None:
+                plan.source, plan.peer, plan.method = "run", peer.name, peer.method
+                a.ggn_target = peer.args.ggn_target
+                a.ggn_method = peer.args.ggn_method
+                a.max_rank = peer.args.max_rank
+                if a.ggn_checkpoint or a.prior_prec_source:
+                    print(f"[plan] '{plan.name}': in_distr-задача "
+                          f"'{peer.name}' есть в прогоне -- её GGN и "
+                          f"калибровка приоритетнее; ggn_checkpoint/"
+                          f"prior_prec_source игнорируются.")
+            elif a.ggn_checkpoint or a.prior_prec_source:
+                (plan.method, plan.terms, plan.ggn_path, plan.calib,
+                 plan.calib_path) = resolve_out_distr_files(
+                    a, plan.task_idx, terms_cache)
+                plan.source = "files"
+                a.ggn_target = plan.calib.get("ggn_target", "last-block")
+                a.ggn_method = ("kfac" if isinstance(plan.terms, KFACTerms)
+                                else "randomized")
+                a.max_rank = (int(plan.terms.U.shape[1])
+                              if isinstance(plan.terms, LowRankTerms)
+                              else 0 if plan.terms is None else a.max_rank)
+            else:
+                raise TaskSkipped(
+                    f"в прогоне нет in_distr-задачи task_idx={plan.task_idx}, "
+                    f"а ggn_checkpoint/prior_prec_source не заданы. Добавьте "
+                    f"in_distr-задачу в --tasks или пропишите в luno: "
+                    f"prior_prec_source (папка in_distr-задачи) и "
+                    f"ggn_checkpoint (без него -- метод Iso)."
+                )
+        except TaskSkipped as exc:
+            errors.append(f"задача '{plan.name}' (out_distr): {exc}")
+            continue
+        if a.ggn_target == "lifting" and a.jv_mode != "forward":
+            errors.append(
+                f"задача '{plan.name}': источник -- лифтинг, а он "
+                f"поддерживает только jv_mode: forward."
+            )
+
+    if errors:
+        raise SystemExit(
+            "Конфиг задач некорректен:\n  - " + "\n  - ".join(errors)
+        )
+    for plan in plans:
+        if plan.in_distr:
+            origin = ("GGN из " + plan.args.ggn_checkpoint
+                      if plan.args.ggn_checkpoint else "GGN считается")
+            origin += ", калибровка"
+        elif plan.source == "run":
+            origin = f"GGN и калибровка in_distr-задачи '{plan.peer}'"
+        else:
+            origin = (f"GGN {plan.ggn_path or '-- нет (Iso)'}, "
+                      f"калибровка {plan.calib_path}")
+        print(f"[plan] {plan.name} ({'in_distr' if plan.in_distr else 'out_distr'},"
+              f" task_idx={plan.task_idx}, {plan.method}): {origin}")
+    return plans
+
+
+def _out_distr_prior_args(plan, w0):
+    """prior_args из результатов калибровки (out_distr с source == "files")."""
+    calib = plan.calib
+    prior_args = {
+        "prior_prec": torch.as_tensor(
+            float(calib["prior_prec"]), dtype=DTYPE, device=w0.device
+        ),
+        "objective": calib.get("calib_objective"),
+        "samples": 0,
+        "diag_probes": plan.args.diag_hutchinson,
+    }
+    if calib.get("temperature") is not None:
+        prior_args["temperature"] = float(calib["temperature"])
+    print(f"[prior_prec] из {plan.calib_path}: "
+          f"prior_prec={float(calib['prior_prec']):.6e}"
+          + (f", temperature={prior_args['temperature']:.6e}"
+             if "temperature" in prior_args else ""))
+    return prior_args
+
+
+def run_one_task(plan, model_config, core, wrapper, w0,
                  output_dir, run_prefix, config_name, metrics_config, asset_cache,
-                 in_distr, shared=None):
+                 shared=None):
     """Полный LUNO-пайплайн одной задачи; результаты пишутся в output_dir.
 
-    ``in_distr`` -- задача калибрует prior_prec и строит GGN сама. Иначе
-    значения берутся из общего ``shared``-кэша (по
-    ``(task_idx, ggn_target)``), заполненного ранее отработавшей
-    in_distr-задачей того же ``task_idx``; если её в этом прогоне не было --
-    GGN читается из ``luno.ggn_checkpoint`` in_distr-соседа или глобального
-    ``--ggn-checkpoint``, а prior_prec из ``--prior-prec-source``. Если не
-    задано ни то, ни другое -- ``SystemExit`` (задача пропускается вызывающим
-    кодом с записью ошибки).
+    in_distr строит GGN и калибрует prior_prec сам, кладя результат в
+    ``shared[task_idx]``. out_distr берёт их из ``shared`` (``source="run"``)
+    или из файлов, найденных :func:`plan_tasks` (``source="files"``).
     """
-    name = cfg.get("name", f"task_idx{task_idx}")
+    args, cfg, task_idx = plan.args, plan.cfg, plan.task_idx
+    in_distr = plan.in_distr
+    name = plan.name
     if shared is None:
         shared = {}
 
-    pipeline = build_task_pipeline(args, cfg, task_idx, model_config, core, asset_cache)
+    pipeline = build_task_pipeline(args, cfg, task_idx, model_config, core,
+                                   asset_cache, in_distr=in_distr)
     confirm_exact_diag(args, pipeline)
 
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
@@ -2153,12 +2386,11 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
             )
         _print_mem("after_jacobian_check", device)
 
-    # --- low-rank GGN + prior_prec: либо считаем сами (in_distr), либо берём ---
-    # --- от in_distr-соседа того же task_idx (кэш/чекпойнт), либо падаем.    ---
+    # --- GGN + prior_prec: in_distr считает сам; out_distr берёт у in_distr- ---
+    # --- задачи прогона или из файлов (источник выбран в plan_tasks).       ---
     prior_prec_source = "calibrated"
     ggn_reused = False
     shared_from = None
-    shared_key = (task_idx, setup.target)
     ggn_label = ("лифтинга" if setup.target == "lifting"
                  else "последнего фурье-слоя")
     if in_distr:
@@ -2186,64 +2418,41 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
             bind=setup.bind, kfac=setup.kfac,
             temperature=setup.full_sampled and args.max_rank != 0,
         )
-        shared[shared_key] = (low_rank, prior_args)
-    elif shared_key in shared:
-        # Переиспользуем значения in_distr-задачи ЭТОГО прогона. Она --
-        # авторитет: GGN-ключи своей luno-секции игнорируем (предупреждаем,
-        # если они заданы и расходятся), калибровку не запускаем.
-        low_rank, prior_args = shared[shared_key]
+        shared[task_idx] = (low_rank, prior_args)
+    elif plan.source == "run":
+        # GGN и prior_prec in_distr-задачи ЭТОГО прогона (она шла раньше).
+        if task_idx not in shared:
+            raise RuntimeError(
+                f"in_distr-задача '{plan.peer}' (task_idx={task_idx}) не дала "
+                f"GGN и prior_prec (упала?) -- оценивать '{name}' не с чем."
+            )
+        low_rank, prior_args = shared[task_idx]
         shared_from = task_idx
         prior_prec_source = "shared"
         ggn_reused = True
         ggn_source, ggn_checkpoint = "shared-in_distr", None
-        _warn_ignored_ggn_keys(cfg, args, name)
-        print(f"[shared] task_idx={task_idx}, target={setup.target}: GGN и "
-              f"prior_prec взяты у in_distr-задачи этого прогона "
+        print(f"[shared] метод {plan.method}: GGN и prior_prec взяты у "
+              f"in_distr-задачи '{plan.peer}' этого прогона "
               f"(prior_prec={prior_args['prior_prec'].item():.6e})")
     else:
-        # Одиночный запуск НЕ-in_distr задачи без in_distr-соседа в прогоне:
-        # обязательны и GGN (luno.ggn_checkpoint/--ggn-checkpoint), и prior_prec
-        # (--prior-prec-source). Иначе -- пропуск с явной ошибкой.
-        _warn_ignored_ggn_keys(cfg, args, name)
-        if not args.ggn_checkpoint or not args.prior_prec_source:
-            raise TaskSkipped(
-                f"задача '{name}' (task_idx={task_idx}) не in_distr, а её "
-                f"in_distr-соседа в этом прогоне нет. Нужны ОБА источника: "
-                f"luno.ggn_checkpoint/--ggn-checkpoint "
-                f"(есть: {bool(args.ggn_checkpoint)}) и "
-                f"--prior-prec-source (есть: {bool(args.prior_prec_source)}). "
-                f"Либо добавьте in_distr-задачу task_idx={task_idx} в --tasks."
-            )
-        print("\n[GGN] GGN из luno.ggn_checkpoint/--ggn-checkpoint "
-              "(in_distr-соседа в прогоне нет):")
-        low_rank, ggn_source, ggn_checkpoint = resolve_low_rank(
-            args, w0, model_fn, pipeline, data_processor, affine, task_idx,
-            output_dir, run_prefix, asset_cache,
-            matvec_cls=setup.matvec_cls, artifact_prefix=setup.artifact_prefix,
-            bind=setup.bind, kfac=setup.kfac,
-            full_sampled=setup.full_sampled, jacobian_cls=setup.jacobian_cls,
-            allow_compute=False,
-        )
-        if ggn_checkpoint is None:
-            raise TaskSkipped(
-                f"задача '{name}' (task_idx={task_idx}): "
-                f"luno.ggn_checkpoint/--ggn-checkpoint не дал low_rank для "
-                f"этого task_idx, а in_distr-соседа в прогоне нет. "
-                f"Задача пропускается."
-            )
-        prec, temperature = load_prior_prec_from_results(
-            args.prior_prec_source, task_idx, ggn_target=setup.target
-        )
-        prior_args = {
-            "prior_prec": torch.as_tensor(
-                prec, dtype=DTYPE, device=w0.device
-            ),
-            "objective": args.calib_objective,
-            "samples": 0,
-            "diag_probes": args.diag_hutchinson,
-        }
-        if temperature is not None:
-            prior_args["temperature"] = temperature
+        # Явные файлы: ggn_checkpoint (нет -- Iso) и prior_prec_source.
+        print(f"\n[GGN] метод {plan.method}: из файлов (in_distr-задача "
+              f"не в этом прогоне или пути заданы явно).")
+        if plan.terms is None:
+            low_rank, ggn_source, ggn_checkpoint = iso_low_rank(w0), "iso", None
+            print("[GGN] ggn_checkpoint не задан -- метод Iso: ковариация "
+                  "I / prior_prec.")
+        else:
+            cache_key = ("ggn", plan.ggn_path)
+            if cache_key not in asset_cache:
+                asset_cache[cache_key] = (
+                    plan.terms.to(device=w0.device, dtype=w0.dtype)
+                    if isinstance(plan.terms, KFACTerms)
+                    else low_rank_to(plan.terms, w0, plan.ggn_path)
+                )
+            low_rank = asset_cache[cache_key]
+            ggn_source, ggn_checkpoint = "checkpoint", plan.ggn_path
+        prior_args = _out_distr_prior_args(plan, w0)
         prior_prec_source = "results.pkl"
         ggn_reused = True
 
@@ -2296,12 +2505,15 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
         "temperature": (float(prior_args["temperature"])
                         if prior_args.get("temperature") is not None else None),
         "prior_prec_source": prior_prec_source,
+        # Откуда out_distr взяла GGN и prior_prec: имя in_distr-задачи прогона
+        # или путь к её luno_results.pkl; у in_distr -- None.
+        "calib_from": plan.peer if plan.source == "run" else plan.calib_path,
         "ggn_reused": ggn_reused,
         "shared_from_task_idx": shared_from,
         "calib_objective": prior_args.get("objective", args.calib_objective),
         "calib_samples": prior_args["samples"],
         "calib_diag_probes": prior_args["diag_probes"],
-        "calib_max_samples": args.calib_max_samples,
+        "calib_max_samples": args.calib_max_samples if in_distr else None,
         "val": val_metrics,
         "test": test_metrics,
         "max_rank": args.max_rank,
@@ -2320,7 +2532,7 @@ def run_one_task(args, cfg, task_idx, model_config, core, wrapper, w0,
         "diag_hutchinson": args.diag_hutchinson,
         "max_eval_samples": len(pipeline["val_eval_loader"].dataset),
         "max_test_samples": len(pipeline["test_loader"].dataset),
-        "val_calib_frac": args.val_calib_frac,
+        "val_calib_frac": args.val_calib_frac if in_distr else None,
     }
     with open(output_dir / "metrics" / "val_metrics.pkl", "wb") as f:
         pickle.dump({"val": val_metrics}, f)
@@ -2360,10 +2572,9 @@ def main():
     print(f"[tasks] выбрано {len(selected)} из {len(task_configs)}: "
           f"{[task_name(cfg, i) for i, cfg in selected]}")
 
-    # Авторитетные in_distr-задачи по всему конфигу, не только по --tasks:
-    # НЕ-in_distr-задача берёт их luno.ggn_checkpoint даже при одиночном
-    # запуске, когда самого in_distr-соседа в --tasks нет.
-    in_distr_by_task_idx = build_in_distr_task_map(task_configs)
+    # Проверка конфига и выбор источников GGN/prior_prec для out_distr --
+    # до загрузки core: ошибка конфига видна сразу, а не через часы.
+    plans = plan_tasks(args, selected)
 
     # --- core общий для всех задач: загрузка и перенос на device ОДИН раз ---
     _install_pickle_compat()
@@ -2401,7 +2612,7 @@ def main():
     )
     run_prefix = args.run_name if args.run_name is not None else config_path.stem
     # Метка метода UQ в имени папки: {prefix}_{время}_{target}_{iso|lowrank|kfac}.
-    method_label = run_method_label(args, selected)
+    method_label = run_method_label(plans)
     run_name = (f"{run_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 f"_{method_label}")
     print(f"[method] {method_label}")
@@ -2416,10 +2627,10 @@ def main():
     n_core = sum(p.numel() for p in core.parameters())
     print(f"[core] {type(core).__module__}.{type(core).__qualname__}, "
           f"параметров={n_core:,}")
-    # FNO-сплит нужен, если хотя бы одна выбранная задача (с учётом её
-    # luno.ggn_target) считает GGN по последнему блоку.
+    # FNO-сплит нужен, если хотя бы одна выбранная задача (in_distr -- по
+    # luno.ggn_target, out_distr -- по источнику) работает с последним блоком.
     wrapper, w0 = None, None
-    targets = {apply_task_overrides(args, cfg).ggn_target for _, cfg in selected}
+    targets = {plan.args.ggn_target for plan in plans}
     print(f"[ggn] target по задачам: {sorted(targets)}")
     if "last-block" in targets:
         wrapper = TorchFNOWrapper(core, dtype=DTYPE)
@@ -2453,70 +2664,35 @@ def main():
         _print_mem("after_split_w0", device)
 
     asset_cache = {}
-    # Общий кэш значений in_distr-задач:
-    # {(task_idx, ggn_target): (low_rank, prior_args)}.
+    # Общий кэш значений in_distr-задач: {task_idx: (low_rank, prior_args)}.
     # in_distr-задачи обрабатываются первыми (см. сортировку ниже), поэтому к
-    # моменту запуска НЕ-in_distr соседа значения уже готовы.
+    # моменту запуска out_distr-задачи того же task_idx значения уже готовы.
     shared = {}
-    # in_distr-задача каждого task_idx должна идти ПЕРЕД своими соседями
-    # (кэш заполняется по ходу). Сортировка стабильная -- прочий порядок
-    # конфига сохраняется.
-    selected = sorted(
-        selected,
-        key=lambda pc: 0 if is_in_distr(pc[1]) else 1,
-    )
+    # Сортировка стабильная -- прочий порядок конфига сохраняется.
+    plans = sorted(plans, key=lambda plan: 0 if plan.in_distr else 1)
     computed = []
-    skipped = []
-    for position, cfg in selected:
-        name = task_name(cfg, position)
-        task_args = apply_task_overrides(args, cfg)
-        task_idx = resolve_task_idx(cfg, position)
-        in_distr = is_in_distr(cfg)
-
-        # in_distr: свой luno.ggn_checkpoint; остальные: тот же ключ у
-        # in_distr-задачи этого task_idx. Глобальный --ggn-checkpoint остаётся
-        # fallback, если ключа в конфиге нет.
-        peer_cfg = None if in_distr else in_distr_by_task_idx.get(task_idx)
-        task_args.ggn_checkpoint = effective_task_ggn_checkpoint(
-            args, task_args, in_distr, peer_cfg
-        )
-        if task_args.ggn_checkpoint:
-            origin = "own" if in_distr else f"in_distr task_idx={task_idx}"
-            print(f"[ggn] checkpoint ({origin}): {task_args.ggn_checkpoint}")
+    failed = []
+    for plan in plans:
+        name, task_idx, in_distr = plan.name, plan.task_idx, plan.in_distr
+        kind = "in_distr" if in_distr else "out_distr"
 
         task_dir = output_dir / name
         for d in (task_dir / "checkpoints", task_dir / "logs", task_dir / "metrics"):
             d.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n{'=' * 70}\n[task:{name}] старт (position={position}, "
-              f"task_idx={task_idx}, in_distr={in_distr}, "
-              f"ggn_target={task_args.ggn_target})\n{'=' * 70}")
+        print(f"\n{'=' * 70}\n[task:{name}] старт ({kind}, "
+              f"task_idx={task_idx}, метод {plan.method}, "
+              f"ggn_target={plan.args.ggn_target})\n{'=' * 70}")
         try:
             run_one_task(
-                task_args, cfg, task_idx, model_config, core, wrapper, w0,
+                plan, model_config, core, wrapper, w0,
                 task_dir, run_prefix, config_path.stem,
-                config.get("metrics", {}), asset_cache, in_distr, shared,
+                config.get("metrics", {}), asset_cache, shared,
             )
             computed.append(name)
             print(f"[task:{name}] ГОТОВО -> {task_dir}")
-        except TaskSkipped as exc:
-            skipped.append(name)
-            print(f"[task:{name}] ПРОПУЩЕНА: {exc}")
-            with open(task_dir / "luno_results.pkl", "wb") as f:
-                pickle.dump(
-                    {
-                        "config": config_path.stem,
-                        "task_name": cfg.get("name"),
-                        "task_idx": task_idx,
-                        "task_type": cfg.get("task_type"),
-                        "ggn_target": task_args.ggn_target,
-                        "in_distr": in_distr,
-                        "status": "skipped",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    },
-                    f,
-                )
         except Exception as exc:
+            failed.append(name)
             print(f"[task:{name}] ОШИБКА, задача пропущена: "
                   f"{type(exc).__name__}: {exc}")
             traceback.print_exc()
@@ -2524,9 +2700,11 @@ def main():
                 pickle.dump(
                     {
                         "config": config_path.stem,
-                        "task_name": cfg.get("name"),
+                        "task_name": name,
                         "task_idx": task_idx,
-                        "ggn_target": task_args.ggn_target,
+                        "task_type": kind,
+                        "in_distr": in_distr,
+                        "ggn_target": plan.args.ggn_target,
                         "status": "failed",
                         "error": f"{type(exc).__name__}: {exc}",
                         "traceback": traceback.format_exc(),
@@ -2539,7 +2717,7 @@ def main():
                 torch.cuda.empty_cache()
 
     print(f"\nГотово. Посчитаны задачи ({len(computed)}): {computed}. "
-          f"Пропущены ({len(skipped)}): {skipped}. "
+          f"Упали ({len(failed)}): {failed}. "
           f"Результаты: {output_dir}")
 
 
