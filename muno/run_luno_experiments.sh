@@ -78,9 +78,9 @@ run() {
 mkdir -p "$LOG_DIR"
 
 run h100_kfac "$CONFIGS/luno_turbo_inf_kfac.yaml" "${H100_ARGS[@]}"
-run h100_iso  "$CONFIGS/luno_turbo_inf_iso.yaml"  "${H100_ARGS[@]}"
-run cfno_lifting "$CONFIGS/luno_cfno_lifting.yaml" "${CFNO_ARGS[@]}"
-run cfno_iso     "$CONFIGS/luno_cfno_iso.yaml"     "${CFNO_ARGS[@]}"
+# run h100_iso  "$CONFIGS/luno_turbo_inf_iso.yaml"  "${H100_ARGS[@]}"
+# run cfno_lifting "$CONFIGS/luno_cfno_lifting.yaml" "${CFNO_ARGS[@]}"
+# run cfno_iso     "$CONFIGS/luno_cfno_iso.yaml"     "${CFNO_ARGS[@]}"
 
 echo
 echo "================================ ИТОГ ================================"

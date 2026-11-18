@@ -257,7 +257,7 @@ tasks:
       path: /workspace/data/PDEBench_data/2D_CFD/2D_CFD_Rand_M0.1_Eta0.01_Zeta0.01_periodic_128_Train.hdf5
       axis_selection:
         0:
-          linspace: [0, 60, 16]
+          linspace: [0, 20, 5]
 
     adapter:
       type: temporal

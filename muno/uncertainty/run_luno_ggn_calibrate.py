@@ -110,6 +110,10 @@ PER_CHANNEL_PCT = (50, 75, 80, 90, 99)
 # Число бинов предсказанного std для ENCE и кривой надёжности (равные доли
 # пикселей внутри каждой пары (канал, t); на поле 128x128 -- ~1600 точек на бин).
 ENCE_BINS = 10
+# Калибровка сравнивает только кандидатов prior_prec, у которых фильтр std
+# оставил не меньше этой доли от максимального по гриду числа валидных
+# элементов (см. calibrate_prior_prec).
+CALIB_MIN_VALID_FRAC = 0.99
 
 # Те же квантили для |N(0, 1)| -- ориентиры идеально откалиброванного гаусса.
 GAUSS_ABS_QUANTILES = {50: 0.674, 75: 1.150, 80: 1.282, 90: 1.645, 99: 2.576}
@@ -1349,12 +1353,33 @@ def calibrate_prior_prec(args, model_fn, w0, low_rank, wrapper, data_processor,
         objective = 0.5 + 0.5 * temps.log() + logstd_acc / n_valid_safe + half_log_2pi
     else:
         objective = (0.5 * chi2_acc + logstd_acc) / n_valid_safe + half_log_2pi
-    if not bool(torch.isfinite(objective).all()):
+    # Кандидаты, у которых фильтр std отбросил заметную часть элементов,
+    # нельзя сравнивать с остальными: их objective считается по другому
+    # (смещённому) набору точек, а при n_valid == 0 вырождается в константу
+    # (0.5·log 2π для NLL) и может «выиграть» у честных кандидатов с тяжёлым
+    # хвостом chi2. Сравниваем только кандидатов, сохранивших почти все
+    # элементы, которые сохраняет лучший по покрытию кандидат.
+    max_valid = float(n_valid_acc.max())
+    if max_valid <= 0:
+        raise SystemExit(
+            f"Калибровка: ни у одного кандидата prior_prec нет валидных по std "
+            f"элементов (std < {STD_REL_FLOOR:g}·RMS(target) везде). Сдвиньте "
+            f"calib_grid_min вниз."
+        )
+    eligible = n_valid_acc >= CALIB_MIN_VALID_FRAC * max_valid
+    n_excluded = int((~eligible).sum())
+    objective = torch.where(eligible, objective,
+                            torch.full_like(objective, float("inf")))
+    if not bool(torch.isfinite(objective[eligible]).all()):
         raise RuntimeError(
             f"Objective калибровки не конечен ({objective.tolist()}, "
             f"n_calib={n_calib}, n_probe={n_probe}): var неотрицателен по "
             f"построению при n_probe>0, поэтому дело в target или в std."
         )
+    if n_excluded:
+        print(f"[calibrate] исключено {n_excluded}/{n_grid} кандидатов: фильтр "
+              f"std отбросил у них > {100 * (1 - CALIB_MIN_VALID_FRAC):g}% "
+              f"элементов (обычно -- слишком большой prior_prec)")
     best_idx = int(objective.argmin())
     best_prec = grid[best_idx]
     out = {"prior_prec": best_prec, "objective": objective_name,

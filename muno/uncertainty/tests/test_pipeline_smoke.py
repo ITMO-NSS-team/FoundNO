@@ -280,3 +280,43 @@ def test_shipped_config_is_valid():
         a = run.apply_task_overrides(args, t)
         assert a.ggn_target == "lifting", t["name"]
     assert run.run_method_label(args, list(enumerate(tasks))) == "lifting"
+
+
+def test_calibration_ignores_candidates_dropped_by_std_filter(tiny, env, monkeypatch):
+    """Регрессия (KFAC shear, 14.11): кандидат prior_prec, у которого фильтр std
+    отбросил ВСЕ элементы, давал objective = 0.5·log 2π (константа) и выигрывал
+    у честных кандидатов, если их NLL > 0.92 (большая ошибка в сырых единицах).
+    Итог -- std ниже порога на всём тесте, valid 0 % и nll = nan."""
+    args, data_processor, out_normalizer = env
+    args = argparse.Namespace(**{**vars(args), "max_rank": 0,
+                                 "calib_grid_min": -4.0, "calib_grid_max": 16.0,
+                                 "calib_grid_size": 21})
+    setup = run.build_ggn_setup(
+        args, tiny.core, tiny.wrapper, tiny.w0, tiny.lifting, tiny.projection
+    )
+    terms = run.LowRankTerms(
+        U=torch.zeros(tiny.w0.numel(), 0, dtype=tiny.w0.dtype),
+        S=torch.zeros(0, dtype=tiny.w0.dtype),
+    )
+    # Шум 30 в сырых единицах: честный NLL ~ 0.5 + log 30 + 0.92 >> 0.92.
+    calib = _fake_pipeline(tiny, 2, seed=5)
+    g = torch.Generator().manual_seed(7)
+    for b in calib:
+        y = b[0]["y"]
+        b[0]["y"] = y + 30.0 * torch.randn(y.shape, dtype=y.dtype, generator=g)
+    prior = run.calibrate_prior_prec(
+        args, setup.model_fn, setup.w0, terms, setup.wrapper, data_processor,
+        out_normalizer, calib, setup.affine, objective_name="nll",
+        fwd_batch=args.fwd_batch, jacobian_cls=setup.jacobian_cls, bind=setup.bind,
+    )
+    x, y = calib[0][0]["x"], calib[0][0]["y"]
+    with torch.no_grad():
+        _, std = run._batch_predictive_stats(
+            setup.model_fn, setup.w0, run.create_luno_cov(terms, prior), x,
+            out_normalizer, setup.wrapper.num_output_channels, affine=setup.affine,
+            fwd_batch=args.fwd_batch, diag_probes=args.diag_hutchinson,
+            jacobian_cls=setup.jacobian_cls, bind=setup.bind, out_shape=y.shape,
+        )
+    scale = torch.sqrt(torch.mean(y.double() ** 2))
+    frac = float(run.std_valid_mask(std, scale).double().mean())
+    assert frac > 0.99, (float(prior["prior_prec"]), frac)

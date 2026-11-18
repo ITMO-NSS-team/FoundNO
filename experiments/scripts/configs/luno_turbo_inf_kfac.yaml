@@ -37,12 +37,14 @@ tasks:
       max_num_samples: 1000
       kfac_mc: 8
       # Дисперсия KFAC -- JVP только через хвост сети (channel MLP блока +
-      # проекция), fwd_batch проб за раз; хвост дешевле всей сети, 4 влезает.
-      fwd_batch: 4
+      # проекция), fwd_batch проб за раз. На CFD (16x128x128, 4 канала) при 4
+      # пробах калибровка упала по CUDA OOM на 15 ГБ (14.11) -- ставим 2.
+      fwd_batch: 2
       val_calib_frac: 0.8
       # Одно число проб на всех задачах CFD (как в lifting-конфиге): шум std
       # одинаков, метрики сравнимы между методами.
       diag_hutchinson: 16
+      ggn_checkpoint: weights/luno_turbo_inf_kfac_20261114_094951_lastblock_kfac/pdebench_2d_cfd/luno_turbo_inf_kfac_kfac_terms.pkl
       # Калибровка: на сэмпл n_grid x diag_hutchinson JVP хвоста (33 x 16 =
       # 528); для одного скаляра prior_prec 64 сэмпла достаточно (~0.5 ч).
       # Без температуры масштаб std задаёт только prior_prec, отсюда грид
@@ -300,6 +302,7 @@ tasks:
       kfac_mc: 8
       fwd_batch: 4
       val_calib_frac: 0.8
+      ggn_checkpoint: weights/luno_turbo_inf_kfac_20261114_094951_lastblock_kfac/thewell_shear_flow/luno_turbo_inf_kfac_kfac_terms.pkl
       # Задачи shear flow дешёвые (единицы сэмплов в val/test): больше проб --
       # меньше шума std; одно число на всех задачах shear flow.
       diag_hutchinson: 50
