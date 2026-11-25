@@ -1,0 +1,17 @@
+data/
+cache/
+pretrained/
+runs/
+gifs/
+__pycache__/
+*.py[cod]
+*.pt
+*.pth
+*.npy
+*.npz
+*.hdf5
+*.h5
+*.gif
+*.png
+*.log
+*.tmp

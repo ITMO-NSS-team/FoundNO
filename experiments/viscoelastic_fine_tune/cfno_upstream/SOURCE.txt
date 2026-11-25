@@ -1,0 +1,5 @@
+https://github.com/ITMO-NSS-team/FoundNO
+branch: dimension_conv_exp
+commit: ca5078f270bbec1a42394361ddf34e3adffe8432
+Minimal module subset; package __init__ files are empty to avoid unrelated training imports.
+Trailing whitespace was removed when packaging this experiment; executable operations are unchanged.
