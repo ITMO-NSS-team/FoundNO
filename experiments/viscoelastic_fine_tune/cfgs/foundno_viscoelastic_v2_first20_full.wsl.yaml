@@ -1,0 +1,32 @@
+seed: 42
+data:
+  root: /mnt/d/the_well/datasets/viscoelastic_instability_v2
+  resolution: 128
+  time_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  cache_dir: /mnt/d/FoundNO/viscoelastic_v2/cache_first20_128
+  split: official_the_well_unchanged
+model:
+  pretrained_core_path: /mnt/c/Users/Nikita/Documents/cfno_9_11/core.pt
+  original_lifting_tensors: /mnt/d/CFNO/viscoelastic_setup/original_lifting_tensors.pth
+  pretrained_projection_path: /mnt/c/Users/Nikita/Documents/cfno_9_11/proj_0.pt
+  lifting_backend: mamba
+  freeze_core: false
+output:
+  run_dir: /mnt/d/FoundNO/runs/foundno_cfno9_11_viscoelastic_v2_first20_full_20261122
+training:
+  epochs: 200
+  batch_size: 1
+  finetune_mode: full
+  core_lr: 0.0001
+  adapter_lr: 0.001
+  weight_decay: 0.0001
+  loss: normalized_mse_all20
+  scheduler_monitor: validation_normalized_mse_all20
+  scheduler_patience: 12
+  early_stopping_patience: 0
+  gradient_clip_norm: 1.0
+  gpu_memory_fraction: 0.85
+validation:
+  every_epochs: 1
+  vrmse: official_the_well_spatial_variance_unbiased_eps_1e-7
+  metric_time_indices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
